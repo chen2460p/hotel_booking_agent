@@ -1,0 +1,43 @@
+# ===== 密钥与环境配置（切勿提交）=====
+.env
+.env.*
+!.env.example
+
+# ===== Python 缓存与编译产物 =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== 打包与分发 =====
+build/
+dist/
+*.egg-info/
+*.egg
+
+# ===== 日志与临时文件 =====
+*.log
+*.tmp
+*.bak
+*.swp
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+
+# ===== 操作系统文件 =====
+.DS_Store
+Thumbs.db
+desktop.ini
