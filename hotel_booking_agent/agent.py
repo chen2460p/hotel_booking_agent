@@ -13,7 +13,8 @@ from models import AgentState, BookingParams, Hotel, Order
 from tools import (
     search_hotels, get_hotel_detail, calculate_total_price,
     create_order, create_real_order, pay_order, cancel_order,
-    get_order_status, format_hotel_list
+    get_order_status, format_hotel_list,
+    list_history_orders, format_order_rows,
 )
 from llm import LLMClient
 import rollinggo_book as rlg
@@ -79,7 +80,7 @@ class HotelBookingAgent:
         if intent == "book" or intent == "search":
             return self._handle_booking_flow(user_input)
         elif intent == "order_query":
-            return self._handle_order_query(extracted)
+            return self._handle_order_query(extracted, user_input)
         elif intent == "cancel":
             return self._handle_cancel(extracted)
         else:
@@ -183,38 +184,36 @@ class HotelBookingAgent:
         except ValueError:
             return 0
 
-    def _handle_order_query(self, extracted: dict) -> str:
+    # 订单状态筛选：用户说法 → 统一状态桶
+    _FILTER_WORDS = {
+        "PENDING": ("待支付", "未支付", "未付款", "没付款", "没支付", "待付款"),
+        "CANCELLED": ("已取消", "取消过", "退订的", "退款的"),
+        "FINISHED": ("已完成", "完成的", "已支付", "已付款", "付过款", "已入住", "住过的"),
+    }
+    _FILTER_NAMES = {
+        "PENDING": "待支付", "FINISHED": "已完成/已支付", "CANCELLED": "已取消",
+    }
+
+    def _detect_order_filter(self, extracted: dict, raw_text: str) -> str:
+        """从 LLM 提取结果或原文识别订单状态筛选，识别不出默认 ALL。"""
+        flt = str(extracted.get("order_status") or "").upper()
+        if flt in ("ALL", "PENDING", "FINISHED", "CANCELLED"):
+            return flt
+        text = raw_text or ""
+        for bucket, words in self._FILTER_WORDS.items():
+            if any(w in text for w in words):
+                return bucket
+        return "ALL"
+
+    def _handle_order_query(self, extracted: dict, raw_text: str = "") -> str:
         """处理订单查询（售后场景）：优先本地库，道旅账号已登录时联动远程真实订单"""
         order_id = extracted.get("order_id")
 
-        # 无订单号：列出道旅远程订单（已登录）或本地模拟订单
+        # 无订单号：展示历史订单列表（道旅远程 + 本地补充，可按状态筛选）
         if not order_id:
-            if rlg.is_logged_in():
-                try:
-                    raw = rlg.list_orders("ALL")
-                    response = "你在道旅的订单：\n\n" + self._format_remote_orders(raw)
-                    self.state.conversation_history.append(f"助手：{response}")
-                    return response
-                except rlg.RollingGoAuthError as e:
-                    response = f"查询道旅订单失败：{e}"
-                except rlg.RollingGoApiError as e:
-                    response = f"查询道旅订单失败：{e}"
-                self.state.conversation_history.append(f"助手：{response}")
-                return response
-            from tools import ORDER_DB
-            local = [o for o in ORDER_DB.values() if o.source != "rollinggo"]
-            if local:
-                lines = ["你的本地模拟订单："]
-                for o in local:
-                    lines.append(
-                        f"- {o.order_id} {o.hotel_name} "
-                        f"{o.check_in}→{o.check_out} 状态：{o.status}"
-                    )
-                lines.append("\n回复订单号可查详情。")
-                response = "\n".join(lines)
-                self.state.conversation_history.append(f"助手：{response}")
-                return response
-            return "请提供订单号，我帮你查询订单状态（模拟订单格式 ORDXXXXXXXX）。"
+            response = self._handle_order_list(extracted, raw_text)
+            self.state.conversation_history.append(f"助手：{response}")
+            return response
 
         order = get_order_status(order_id)
 
@@ -222,9 +221,12 @@ class HotelBookingAgent:
         if not order and rlg.is_logged_in():
             try:
                 detail = rlg.get_order_detail(order_id)
-                response = f"道旅订单信息：\n\n" + self._format_remote_orders(detail, single=True)
-                self.state.conversation_history.append(f"助手：{response}")
-                return response
+                rows = rlg.parse_orders(detail)
+                if rows:
+                    response = "道旅订单信息：\n" + format_order_rows(rows)
+                    self.state.conversation_history.append(f"助手：{response}")
+                    return response
+                return f"未获取到订单 {order_id} 的详情。"
             except (rlg.RollingGoAuthError, rlg.RollingGoApiError) as e:
                 return f"未找到订单号 {order_id}（道旅查询：{e}）"
 
@@ -238,14 +240,14 @@ class HotelBookingAgent:
         }
 
         # 道旅真实订单：尽量用远程最新状态刷新
-        remote_status = None
+        status_text = status_map.get(order.status, order.status)
         if order.source == "rollinggo" and rlg.is_logged_in():
             try:
-                detail = rlg.get_order_detail(order_id)
-                remote_status = rlg._find_key(detail, ["orderStatus", "status"])
+                rows = rlg.parse_orders(rlg.get_order_detail(order_id))
+                if rows and rows[0].get("status_text"):
+                    status_text = rows[0]["status_text"]
             except (rlg.RollingGoAuthError, rlg.RollingGoApiError):
                 pass
-        status_text = str(remote_status) if remote_status else status_map.get(order.status, order.status)
 
         response = (
             f"{'【道旅真实】' if order.source == 'rollinggo' else ''}订单信息：\n"
@@ -265,56 +267,44 @@ class HotelBookingAgent:
         self.state.conversation_history.append(f"助手：{response}")
         return response
 
-    def _format_remote_orders(self, raw, single: bool = False) -> str:
-        """尽力归一化道旅订单列表/详情的展示文本（字段名以实际响应为准）"""
-        body = rlg._unwrap(raw)
-        rows = body if isinstance(body, list) else None
-        if rows is None and isinstance(body, dict):
-            # 实测订单列表在 orderList 字段（可能为空列表，空也是有效结果）
-            if isinstance(body.get("orderList"), list):
-                rows = body["orderList"]
-            else:
-                # 在嵌套结构里找第一个 dict 列表
-                def find_list(node):
-                    if isinstance(node, list) and all(isinstance(x, dict) for x in node):
-                        return node
-                    if isinstance(node, dict):
-                        for v in node.values():
-                            found = find_list(v)
-                            if found is not None:
-                                return found
-                    return None
-                rows = find_list(body)
-        if rows is None and isinstance(body, dict) and body and single:
-            rows = [body]
-        if not rows:
-            return "没有查询到订单。"
+    def _handle_order_list(self, extracted: dict, raw_text: str) -> str:
+        """无订单号时的历史订单列表：道旅账号订单为主，本地订单补充，支持状态筛选。"""
+        flt = self._detect_order_filter(extracted, raw_text)
+        result = list_history_orders(flt)
+        rows = result["rows"]
+        flt_name = self._FILTER_NAMES.get(flt, "")
+        scope = "道旅账号" if result["logged_in"] else "本次会话"
+        title = f"你的{scope}订单" + (f"（{flt_name}）" if flt_name else "") + "："
 
-        lines = []
-        for it in rows:
-            order_no = rlg._find_key(it, ["orderNo", "order_no", "bookingNo"])
-            hotel = rlg._find_key(it, ["hotelName", "hotel"])
-            room = rlg._find_key(it, ["roomName", "room"])
-            status = rlg._find_key(it, ["orderStatus", "status"])
-            total = rlg._find_key(it, ["totalPrice", "totalAmount", "total"])
-            check_in = rlg._find_key(it, ["checkInDate", "checkIn"])
-            check_out = rlg._find_key(it, ["checkOutDate", "checkOut"])
-            pay = rlg._find_key(it, ["paymentUrl", "payUrl", "cashierUrl"])
-            parts = [f"订单号：{order_no or '未知'}"]
-            if hotel:
-                parts.append(f"酒店：{hotel}")
-            if room:
-                parts.append(f"房型：{room}")
-            if check_in or check_out:
-                parts.append(f"入住：{check_in or '?'} → {check_out or '?'}")
-            if total is not None:
-                parts.append(f"总价：{total}")
-            parts.append(f"状态：{status or '未知'}")
-            status_s = str(status or "").upper()
-            if pay and ("PAY" in status_s or status_s in ("PENDING", "WAIT_PAY", "UNPAID")):
-                parts.append(f"支付链接：{pay}")
-            lines.append("\n".join(parts))
-        return "\n\n".join(lines) if lines else "没有查询到订单。"
+        blocks = [title]
+        if result.get("remote_error"):
+            blocks.append(f"⚠️ 道旅订单查询失败：{result['remote_error']}")
+
+        if rows:
+            blocks.append(format_order_rows(rows))
+            tail = "\n回复订单号可查询单笔详情。"
+            if flt != "ALL":
+                tail = "\n回复【查全部订单】可查看所有状态的订单。" + tail
+            blocks.append(tail)
+            return "\n".join(blocks)
+
+        # 空态
+        if not result["logged_in"]:
+            blocks.append("目前没有订单。")
+            blocks.append(
+                "💡 当前为未登录状态，只能看到本次运行期间创建的模拟订单；\n"
+                "登录道旅后可查询账号下的全部历史订单（真实订单，跨会话保留）：\n"
+                "python rollinggo_book.py login"
+            )
+        elif result.get("remote_error"):
+            blocks.append("本次会话本地也没有可展示的订单。")
+        else:
+            blocks.append(
+                f"没有{flt_name}订单。" if flt_name else "账号下暂无订单。"
+            )
+            if flt != "ALL":
+                blocks.append("回复【查全部订单】可查看所有状态的订单。")
+        return "\n".join(blocks)
 
     def _handle_cancel(self, extracted: dict) -> str:
         """
@@ -724,6 +714,11 @@ class HotelBookingAgent:
             self.state.conversation_history.append(f"助手：{response}")
             return response
 
+        # 临时查询订单（不清空验价上下文，查完仍可确认下单）
+        query_text = self._try_order_query_during_confirm(text)
+        if query_text is not None:
+            return query_text
+
         email = rlg.extract_email(text)
 
         # 验价后缺邮箱的追问阶段
@@ -769,6 +764,27 @@ class HotelBookingAgent:
             "请回复【确认下单】创建真实订单，或回复【取消】放弃；\n"
             "也可以回复常用入住人序号（如【使用常用入住人 1】）或一个新邮箱。\n"
             "（验价锁定的价格有时效，超时后需要重新验价）"
+        )
+
+    def _try_order_query_during_confirm(self, text: str) -> Optional[str]:
+        """
+        验价待确认阶段用户临时查订单：返回查询文本并保留验价上下文；
+        不是订单查询时返回 None，交回确认流程继续处理。
+        """
+        if "订单" not in text:
+            return None
+        m = re.search(r'(?<![A-Za-z0-9])([A-Z0-9]{8,})(?![A-Za-z0-9])', text.upper())
+        if m:
+            body = self._handle_order_query({"order_id": m.group(1)}, text)
+        elif any(w in text for w in
+                 ("查", "历史", "记录", "列表", "有哪些", "我的", "看看")):
+            body = self._handle_order_list({}, text)
+        else:
+            return None
+        return body + (
+            "\n----------------------------------------\n"
+            "⏳ 你还有一笔已验价的订单尚未决定：回复【确认下单】继续创建，"
+            "回复【取消】放弃（验价价格有时效）。"
         )
 
     def _execute_real_booking(self, ctx: dict) -> str:

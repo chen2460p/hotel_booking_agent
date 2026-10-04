@@ -64,10 +64,11 @@ class LLMClient:
 
 用户输入：{user_input}
 
-意图可选值：book（预订）、search（搜索查询）、order_query（查订单）、cancel（取消订单）、chat（其他）
+意图可选值：book（预订）、search（搜索查询）、order_query（查订单/历史订单）、cancel（取消订单）、chat（其他）
 参数可选字段：city（城市）、check_in（入住日期）、check_out（离店日期）、
 min_star（最低星级整数）、max_price（价格上限数字）、facilities（设施列表）、keyword（关键词）、
-order_id（订单号）、guest_name（入住人姓名）
+order_id（订单号）、order_status（订单状态筛选，仅查订单时使用：
+ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消）、guest_name（入住人姓名）
 
 重要规则：
 - check_in 和 check_out 必须转换成 YYYY-MM-DD 格式的具体日期。
@@ -108,10 +109,19 @@ order_id（订单号）、guest_name（入住人姓名）
         params = {}
         intent = "chat"
 
-        # ---- 意图判断（注意顺序：售后/评价优先于预订，避免误匹配）----
-        if any(kw in text for kw in ["取消", "退订", "退款", "退了"]):
+        # ---- 意图判断（注意顺序：查询/售后/评价优先于预订，避免误匹配）----
+        # 保护：含"取消"但实际是查询句式（如"查已取消的订单"）必须归为查订单
+        is_order_lookup = "订单" in text and any(
+            kw in text for kw in
+            ["查", "历史", "记录", "列表", "有哪些", "看看", "我的"]
+        )
+        if is_order_lookup:
+            intent = "order_query"
+        elif any(kw in text for kw in ["取消", "退订", "退款", "退了"]):
             intent = "cancel"
-        elif any(kw in text for kw in ["查订单", "订单状态", "我的订单", "订单号"]):
+        elif any(kw in text for kw in [
+                "查订单", "订单状态", "我的订单", "订单号",
+                "历史订单", "订单记录", "订单列表"]):
             intent = "order_query"
         elif any(kw in text for kw in [
             "评价", "口碑", "点评", "评论", "怎么样", "好不好",
@@ -214,6 +224,18 @@ order_id（订单号）、guest_name（入住人姓名）
             order_id = [g for g in order_match.groups() if g][0]
             if order_id.startswith("ORD"):
                 params["order_id"] = order_id
+
+        # ---- 订单状态筛选（仅查订单场景）----
+        if intent == "order_query":
+            if any(w in text for w in ["待支付", "未支付", "未付款", "待付款"]):
+                params["order_status"] = "PENDING"
+            elif any(w in text for w in ["已取消", "取消过", "退款"]):
+                params["order_status"] = "CANCELLED"
+            elif any(w in text for w in
+                     ["已完成", "完成的", "已支付", "已付款", "已入住", "住过的"]):
+                params["order_status"] = "FINISHED"
+            elif any(w in text for w in ["全部", "所有", "历史"]):
+                params["order_status"] = "ALL"
 
         # ---- 入住人姓名提取（简单规则："入住人XXX"或"XXX入住"）----
         name_match = re.search(r'入住人?\s*[:：是]?\s*([\u4e00-\u9fa5]{2,4})', text)

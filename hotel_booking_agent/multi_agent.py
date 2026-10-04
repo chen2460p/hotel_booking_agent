@@ -15,7 +15,7 @@ from models import Hotel, Order, BookingParams, AgentState
 from tools import (
     search_hotels, get_hotel_detail, calculate_total_price,
     create_order, pay_order, cancel_order, get_order_status,
-    format_hotel_list
+    format_hotel_list, list_history_orders, format_order_rows,
 )
 from llm import LLMClient
 from rag import get_rag
@@ -233,13 +233,36 @@ class ServiceAgent(BaseAgent):
 
         msg = self.inbox.pop(0)
 
-        # 任务1：查询订单
+        # 任务1：查询订单（有订单号查单笔；无订单号列历史订单）
         if msg.msg_type == "task" and msg.content == "query_order":
             order_id = msg.data.get("order_id", "")
             if not order_id:
+                flt = str(msg.data.get("order_status", "ALL")).upper()
+                result = list_history_orders(flt)
+                rows = result["rows"]
+                flt_names = {"PENDING": "待支付", "FINISHED": "已完成/已支付",
+                             "CANCELLED": "已取消"}
+                scope = "道旅账号" if result["logged_in"] else "本次会话"
+                title = f"你的{scope}订单"
+                if flt in flt_names:
+                    title += f"（{flt_names[flt]}）"
+                if result.get("remote_error"):
+                    title += f"\n⚠️ 道旅查询失败：{result['remote_error']}"
+                if rows:
+                    text = title + "：\n" + format_order_rows(rows) \
+                        + "\n\n回复订单号可查询单笔详情。"
+                elif not result["logged_in"]:
+                    text = (
+                        "目前没有订单。\n"
+                        "💡 登录道旅（python rollinggo_book.py login）后可查询账号下"
+                        "的全部真实历史订单。"
+                    )
+                else:
+                    text = f"{title}：账号下暂无相关订单。"
                 return AgentMessage(
                     sender=self.name, receiver="Supervisor",
-                    msg_type="error", content="missing_order_id"
+                    msg_type="result", content="order_list",
+                    data={"text": text}
                 )
 
             order = get_order_status(order_id)
@@ -540,19 +563,24 @@ class SupervisorAgent:
         return "暂时没有检索到相关评价信息。"
 
     def _dispatch_service_query(self, extracted: dict) -> str:
-        """分发订单查询任务给 ServiceAgent"""
+        """分发订单查询任务给 ServiceAgent（单笔详情或历史订单列表）"""
         order_id = extracted.get("order_id", "")
         msg = AgentMessage(
             sender="Supervisor", receiver="ServiceAgent",
             msg_type="task", content="query_order",
-            data={"order_id": order_id}
+            data={
+                "order_id": order_id,
+                "order_status": extracted.get("order_status", "ALL"),
+            }
         )
         self.workers["service"].receive(msg)
         result = self.workers["service"].process(self.shared_state)
 
         if result:
-            if result.content == "missing_order_id":
-                return "请提供订单号，我帮你查询订单状态。订单号格式如 ORDXXXXXXXX"
+            if result.content == "order_list":
+                response = result.data["text"]
+                self.shared_state.conversation_history.append(f"助手：{response}")
+                return response
             if result.content == "order_not_found":
                 return f"未找到订单号 {result.data.get('order_id', '')}，请确认订单号是否正确。"
             if result.content == "order_found":
