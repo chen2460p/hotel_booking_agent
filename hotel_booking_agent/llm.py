@@ -67,10 +67,13 @@ class LLMClient:
 意图可选值：book（预订）、search（搜索查询）、order_query（查订单/历史订单）、cancel（取消订单）、chat（其他）
 参数可选字段：city（城市）、check_in（入住日期）、check_out（离店日期）、
 min_star（最低星级整数）、max_price（价格上限数字）、facilities（设施列表）、keyword（关键词）、
+location（城市内的具体位置/商圈/地标，如"市中心""春熙路步行街附近""三亚湾海边""高铁站旁边"）、
 order_id（订单号）、order_status（订单状态筛选，仅查订单时使用：
 ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消）、guest_name（入住人姓名）
 
 重要规则：
+- location 只放城市以下的位置修饰（行政区、商圈、地标、路名及"附近/周边/市中心"等），
+  城市本身放 city；例如"成都市中心春熙路步行街附近"→city="成都"、location="市中心春熙路步行街附近"。
 - check_in 和 check_out 必须转换成 YYYY-MM-DD 格式的具体日期。
   口语日期换算示例（今天是2026-10-03周六）："这周末"→check_in=2026-10-10、check_out=2026-10-11；"下周末"→2026-10-17/2026-10-18；"明天"→2026-10-04；"后天"→2026-10-05。
   如果提供了"住N晚"，用入住日期推算离店日期。
@@ -145,6 +148,46 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
             if city in text:
                 params["city"] = city
                 break
+
+        # ---- 位置/商圈提取（城市以下的位置修饰：市中心、地标+附近等）----
+        location_phrases = []
+        location_patterns = (
+            r'[一-龥A-Za-z0-9]{2,12}?(?:步行街|商业街|商圈|广场|火车站|高铁站|机场|'
+            r'大学城|会展中心|体育中心|地铁站|景区|景点|主题公园|海洋公园|古镇|古城|夜市|老街|'
+            r'海边|海滩|沙滩|湖边|江边|湾)'
+            r'(?:附近|周边|旁边|一带)?',
+            r'[一-龥]{2,10}?(?:附近|周边|旁边|一带)',
+            r'市中心|市区中心|老城区|古城区',
+        )
+        # 命中片段开头可能连带的动词/意愿词
+        _LEAD_VERBS = (
+            "帮我订", "帮忙订", "我要订", "我想订", "想要订", "想订", "要订",
+            "预订", "预定", "帮订", "找一下", "找一找", "查查", "查一下",
+            "搜一下", "我想去", "想要去", "我要去", "想去", "找", "查", "搜", "去",
+        )
+        # 城市名后若紧跟这些字，说明城市名是地名实体的一部分（如"三亚湾"），不可剥离
+        _GEO_ENTITY_CHARS = "湾江湖海山岛桥港口溪潭"
+        for pat in location_patterns:
+            for phrase in re.findall(pat, text):
+                p = phrase.strip()
+                changed = True
+                while changed:                      # 反复剥离前缀动词
+                    changed = False
+                    for v in _LEAD_VERBS:
+                        if p.startswith(v) and len(p) - len(v) >= 2:
+                            p = p[len(v):]
+                            changed = True
+                            break
+                # 剥离城市前缀（"成都春熙路附近"→"春熙路附近"），
+                # 但"三亚湾"是地名实体，不能剥成"湾"
+                if params.get("city") and p.startswith(params["city"]):
+                    rest = p[len(params["city"]):]
+                    if rest and rest[0] not in _GEO_ENTITY_CHARS:
+                        p = rest.lstrip("的")
+                if len(p) >= 2:
+                    location_phrases.append(p)
+        if location_phrases:
+            params["location"] = max(location_phrases, key=len)
 
         # ---- 日期提取（支持多种口语表达）----
         # 1. 明确日期格式 2026-10-05 或 2026/10/05

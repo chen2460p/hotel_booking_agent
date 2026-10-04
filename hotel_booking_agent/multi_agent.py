@@ -85,9 +85,10 @@ class SearchAgent(BaseAgent):
 
             # 格式化搜索结果
             nights = self._calc_nights(params.check_in, params.check_out)
+            area_text = f"{params.city}{params.location}，" if params.location else ""
             result_text = (
                 f"为你找到 {len(results)} 家符合条件的酒店"
-                f"（{params.check_in} 入住，{params.check_out} 离店，共{nights}晚）：\n\n"
+                f"（{area_text}{params.check_in} 入住，{params.check_out} 离店，共{nights}晚）：\n\n"
                 f"{format_hotel_list(results)}\n\n"
                 f"请告诉我你想选择哪一家（回复序号或酒店名）。"
             )
@@ -389,6 +390,19 @@ class SupervisorAgent:
     对应八股中的 Supervisor-Worker 协调模式
     """
 
+    # 模拟房型床型关键词兜底（"大床"→"大床房"），与 agent.py 保持一致
+    _BED_KEYWORDS = (
+        ("特大床", "特大床"), ("大床", "大床"),
+        ("双床", "双床"), ("单人床", "单人床"),
+        ("标间", "标准"), ("标房", "标准"),
+        ("家庭", "家庭"), ("套房", "套房"),
+    )
+    # 等待补姓名时，裸回复这些词不应被当作姓名
+    _NAME_STOPWORDS = {
+        "谢谢", "感谢", "你好", "您好", "再见", "退出", "取消", "不要",
+        "算了", "不用", "好的", "知道", "等等", "稍后", "随便",
+    }
+
     def __init__(self):
         self.llm = LLMClient()
         self.shared_state = AgentState()
@@ -437,7 +451,7 @@ class SupervisorAgent:
         elif intent == "cancel":
             return self._dispatch_cancel(extracted=extracted)
         else:
-            return self._handle_chat(user_input)
+            return self._handle_chat(user_input, extracted)
 
     def _handle_booking_intent(self, user_input: str) -> str:
         """处理预订/搜索意图——参数澄清或分发搜索任务"""
@@ -506,22 +520,51 @@ class SupervisorAgent:
             self._reset_booking_state()
             return "订单已取消。"
 
-        # 解析房型和入住人
+        # 解析房型和入住人（支持跨轮补全：先给名字后补房型，反之亦然）
         import re
+        hotel = self.shared_state.selected_hotel
+        pending = self.shared_state.pending_booking
+
         room_type = None
         guest_name = None
 
-        if self.shared_state.selected_hotel:
-            for rt in self.shared_state.selected_hotel.room_types:
+        if hotel:
+            # 先房型名完整包含，再按床型关键词兜底（"大床"→"大床房"）
+            for rt in hotel.room_types:
                 if rt in user_input:
                     room_type = rt
                     break
+            if not room_type:
+                for keyword, room_key in self._BED_KEYWORDS:
+                    if keyword in user_input:
+                        room_type = next(
+                            (rt for rt in hotel.room_types if room_key in rt), None)
+                        if room_type:
+                            break
 
-        name_match = re.search(r'入住人?\s*[:：是]?\s*([\u4e00-\u9fa5]{2,4})', user_input)
-        if name_match:
-            guest_name = name_match.group(1)
+        # 显式说法：入住人张三 / 我叫张三 / 张三入住
+        for pat in (r'入住人?\s*[:：是叫]?\s*([\u4e00-\u9fa5]{2,4})',
+                    r'(?:我叫|名字是|姓名是|名字叫|叫)\s*([\u4e00-\u9fa5]{2,4})',
+                    r'([\u4e00-\u9fa5]{2,4})\s*(?:入住|住店|来住)'):
+            m = re.search(pat, user_input)
+            if m:
+                guest_name = m.group(1)
+                break
+        # 上一轮已给房型、本轮只回复裸姓名（如"陈老二"）
+        if not guest_name and pending.get("room_type"):
+            t = user_input.strip().strip("。.!！?？,， ")
+            if re.fullmatch(r'[\u4e00-\u9fa5]{2,4}', t) \
+                    and t not in self._NAME_STOPWORDS:
+                guest_name = t
+
+        # 与上一轮暂存的另一半信息合并
+        if not guest_name:
+            guest_name = pending.get("guest_name")
+        if not room_type:
+            room_type = pending.get("room_type")
 
         if room_type and guest_name:
+            self.shared_state.pending_booking = {}
             # 分发创建订单任务给 BookingAgent
             msg = AgentMessage(
                 sender="Supervisor", receiver="BookingAgent",
@@ -540,9 +583,11 @@ class SupervisorAgent:
             return None
 
         elif room_type and not guest_name:
+            self.shared_state.pending_booking = {"room_type": room_type}
             return f"好的，{room_type}。请告诉我入住人姓名。"
-        elif not room_type and guest_name and self.shared_state.selected_hotel:
-            return f"好的，入住人{guest_name}。请选择房型：{'、'.join(self.shared_state.selected_hotel.room_types)}"
+        elif not room_type and guest_name and hotel:
+            self.shared_state.pending_booking = {"guest_name": guest_name}
+            return f"好的，入住人{guest_name}。请选择房型：{'、'.join(hotel.room_types)}"
 
         return None
 
@@ -627,14 +672,22 @@ class SupervisorAgent:
 
         return "取消操作失败，请联系客服。"
 
-    def _handle_chat(self, user_input: str) -> str:
+    # 这些字段出现，说明用户本轮确实在补充预订信息（而非闲聊）
+    _BOOKING_PARAM_KEYS = (
+        "city", "check_in", "check_out", "min_star",
+        "max_price", "facilities", "keyword", "guest_name",
+    )
+
+    def _handle_chat(self, user_input: str, extracted: Optional[dict] = None) -> str:
         """处理闲聊和酒店选择"""
+        extracted = extracted or {}
         # 酒店选择（推荐阶段用户回复序号）
         if self.shared_state.stage == "recommend" and self.shared_state.search_results:
             selection = self._parse_hotel_selection(user_input)
             if selection:
                 self.shared_state.selected_hotel = selection
                 self.shared_state.stage = "booking"
+                self.shared_state.pending_booking = {}
                 hotel = selection
                 nights = self._calc_nights(
                     self.shared_state.params.check_in,
@@ -662,20 +715,40 @@ class SupervisorAgent:
                 total = len(self.shared_state.search_results)
                 return f"请输入 1-{total} 之间的序号，或直接告诉我酒店名称。"
 
-        # 预订流程中补充信息
-        if self.shared_state.stage in ("clarify", "intent"):
+        # 参数澄清阶段：仅当本轮消息确实携带预订信息时才继续预订流程
+        if self.shared_state.stage in ("clarify", "intent") and any(
+                k in extracted for k in self._BOOKING_PARAM_KEYS):
             return self._handle_booking_intent(user_input)
 
-        # 默认回复
-        response = (
-            "你好！我是酒店预订助手，可以帮你：\n"
-            "1. 搜索和预订酒店（告诉我城市、日期、预算等）\n"
-            "2. 查询订单状态（提供订单号）\n"
-            "3. 取消订单（提供订单号）\n\n"
-            "请问有什么可以帮你的？"
-        )
+        # 真正的闲聊
+        response = self._chat_reply(user_input)
         self.shared_state.conversation_history.append(f"助手：{response}")
         return response
+
+    def _chat_reply(self, user_input: str) -> str:
+        """闲聊回复：谢谢/问候/告别给友好模板，其余交给真实 LLM 或能力介绍。"""
+        text = user_input.strip().lower()
+        if any(w in user_input for w in ("谢谢", "感谢", "多谢", "辛苦")):
+            return "不客气～还有酒店查询、预订或订单相关的需要，随时告诉我。"
+        if any(w in user_input for w in ("再见", "拜拜", "拜")) or text in ("bye", "goodbye"):
+            return "再见！祝你旅途愉快，需要订酒店时再来找我。"
+        if user_input.strip() in ("你好", "您好", "嗨", "你好啊") \
+                or text in ("hi", "hello"):
+            return (
+                "你好！我是酒店预订智能助手，可以帮你搜索预订酒店、查询历史订单、取消订单。\n"
+                "想订哪里的酒店？直接告诉我就行。"
+            )
+        if self.llm.use_real_llm:
+            reply = self.llm.generate_response(
+                "你是一个酒店预订智能助手，语气亲切简洁。请简短回应用户的寒暄或无关问题"
+                "（不超过两句话），并自然引导用户说出订房需求。不要编造酒店信息。",
+                user_input)
+            if reply and reply != "好的，我明白了。":
+                return reply
+        return (
+            "我主要能帮你：搜索预订酒店（如：帮我订下周末成都 300 元以内的酒店）、"
+            "查询历史订单、取消订单。告诉我你的需求吧。"
+        )
 
     def _parse_hotel_selection(self, user_input: str) -> Optional[Hotel]:
         """解析用户的酒店选择"""
@@ -709,6 +782,8 @@ class SupervisorAgent:
             p.facilities = list(existing)
         if "keyword" in extracted:
             p.keyword = extracted["keyword"]
+        if "location" in extracted:
+            p.location = extracted["location"]
 
     def _generate_clarify_question(self, missing: list) -> str:
         """生成参数追问"""
@@ -737,4 +812,5 @@ class SupervisorAgent:
         self.shared_state.search_results = []
         self.shared_state.selected_hotel = None
         self.shared_state.current_order = None
+        self.shared_state.pending_booking = {}
         self.shared_state.stage = "intent"
