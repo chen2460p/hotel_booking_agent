@@ -13,6 +13,7 @@
 
 import os
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -160,6 +161,42 @@ def _get_client() -> RollingGoMCPClient:
 
 # ========== 参数构造 ==========
 
+# location 中的具体 POI 关键词 → 道旅 placeType（无商圈枚举，地标统一按"景点"）
+_POI_TYPE_RULES = (
+    ("机场", "机场"),
+    ("火车站", "火车站"), ("高铁站", "火车站"),
+    ("地铁站", "地铁站"),
+    ("景区", "景点"), ("景点", "景点"), ("古镇", "景点"), ("古城", "景点"),
+    ("故宫", "景点"), ("会展中心", "景点"), ("体育中心", "景点"),
+    ("大学城", "景点"), ("步行街", "景点"), ("商业街", "景点"), ("商圈", "景点"),
+    ("广场", "景点"), ("公园", "景点"), ("夜市", "景点"), ("老街", "景点"),
+    ("海滩", "景点"), ("沙滩", "景点"), ("海边", "景点"), ("湖边", "景点"),
+    ("江边", "景点"), ("湾", "景点"),
+)
+# POI 搜索时的"附近"半径（米）。服务端过滤不完全严格，客户端还会按地址加权
+_POI_NEARBY_RADIUS = 3000
+
+
+def _parse_poi(location: str) -> Optional[tuple]:
+    """
+    把"市中心中街步行街附近"解析为 POI（中街步行街，景点）。
+    返回 (poi_name, place_type)；纯泛词（市中心/市区）无法定位时返回 None。
+    """
+    name = re.sub(r'附近|周边|旁边|一带', '', location.strip())
+    name = re.sub(r'^市中心|^市区中心|^市区|^老城区|^古城区', '', name)
+    # "西安路商圈"→"西安路"：商圈是范围词不是地名一部分，保留会干扰地理编码
+    name = re.sub(r'商圈$|商业圈$|商业区$|商圈$', '', name)
+    name = name.strip("的 　")
+    if len(name) < 2:
+        return None
+    if re.search(r'区$|县$|旗$', name) and len(name) <= 4:
+        return name, "区/县"
+    for key, ptype in _POI_TYPE_RULES:
+        if key in name:
+            return name, ptype
+    return None
+
+
 def _build_arguments(params: BookingParams, size: int = 20) -> dict:
     """把项目的 BookingParams 映射成 searchHotels 的官方参数结构"""
     nights = 1
@@ -173,16 +210,29 @@ def _build_arguments(params: BookingParams, size: int = 20) -> dict:
             pass
 
     origin_parts = [params.city]
+    # 城市以下的位置修饰（市中心/商圈/地标+附近）必须进入语义查询，
+    # 否则 place 只锁城市，会把市属县的酒店也召回
+    if params.location:
+        origin_parts.append(params.location)
     if params.keyword:
         origin_parts.append(params.keyword)
     if params.max_price:
         origin_parts.append(f"预算{int(params.max_price)}元以内")
     origin_parts.append("酒店")
 
+    # 有具体地标/商圈时按 POI 搜索：place="地标 城市"，POI 半径内召回；
+    # 纯泛词（如"市中心"）无法定位 POI，仍按城市搜索交给 originQuery 语义排序
+    poi = _parse_poi(params.location) if params.location else None
+    if poi:
+        poi_name, place_type = poi
+        place = f"{poi_name} {params.city}"
+    else:
+        poi_name, place_type, place = None, "城市", params.city
+
     arguments: Dict[str, Any] = {
         "originQuery": "".join(origin_parts),
-        "place": params.city,
-        "placeType": "城市",
+        "place": place,
+        "placeType": place_type,
         "size": size,
     }
     if params.check_in:
@@ -194,6 +244,9 @@ def _build_arguments(params: BookingParams, size: int = 20) -> dict:
     if params.min_star:
         # 官方约定：starRatings [4,5] 表示 4-5 星
         filter_options["starRatings"] = [float(params.min_star), 5.0]
+    if poi_name:
+        # 当地点是 POI 时生效，限定直线距离（米）
+        filter_options["distanceInMeter"] = _POI_NEARBY_RADIUS
     if filter_options:
         arguments["filterOptions"] = filter_options
 
@@ -328,6 +381,8 @@ def _to_hotel(item: dict, city: str) -> Optional[Hotel]:
         rating=rating,
         review_count=review_count,
         booking_url=str(item.get("bookingUrl") or ""),
+        latitude=_to_float(item.get("latitude")),
+        longitude=_to_float(item.get("longitude")),
     )
 
 
@@ -352,31 +407,201 @@ def _extract_hotel_list(data: Any) -> list:
     return []
 
 
-def search_real_hotels(params: BookingParams, size: int = 20) -> List[Hotel]:
-    """调用 searchHotels 并映射为 Hotel 列表"""
-    client = _get_client()
-    data = client.call_tool("searchHotels", _build_arguments(params, size))
+# 距目标城市中心超过该距离（公里）判为跨城结果。
+# 实测：道旅会把"大连西安路"整个 POI 错误编码到西安（相距约 1200km）；
+# 而目标城市下辖最远郊县一般在 100km 内（实测来宾金秀 91km）。
+# 100km 在两类结果之间留有安全间隙。
+_CROSS_CITY_KM = 100.0
+# POI"附近"结果的客户端近邻半径（公里）。服务端 distanceInMeter 实测执行
+# 不严格（3km 请求会混入 47~68km 外的下辖县镇），客户端按 POI 锚点再过滤。
+_POI_LOCAL_KM = 10.0
 
-    # 实测失败响应形态：{"success": false, "code": xxxx, "message": "..."}
+
+def _is_same_city_item(item: dict, city: str, city_coord) -> bool:
+    """
+    判定酒店是否属于目标城市。道旅每条酒店都带经纬度，距离是最可靠证据
+    （地址/营销描述里的行政文本实测会误判：市区店描述提到外地市即被误杀，
+    故不采用）。坐标缺失时保守保留，交由后续环节排序。
+    """
+    la, lo = _to_float(item.get("latitude")), _to_float(item.get("longitude"))
+    if city_coord and la and lo:
+        from geo_data import haversine_km
+        return haversine_km(la, lo, *city_coord) <= _CROSS_CITY_KM
+    return True
+
+
+def _median(values: List[float]) -> float:
+    s = sorted(values)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def _estimate_poi_anchor(items: list, city_coord, loc_keys) -> Optional[tuple]:
+    """
+    估计 POI 锚点坐标：
+    1) 名称/地址含地标词的酒店坐标中位数（最可靠）
+    2) 否则取距市中心最近的 3 家坐标中位数
+    都拿不到时返回城市中心。
+    """
+    from geo_data import haversine_km
+    located = [it for it in items
+               if _to_float(it.get("latitude")) and _to_float(it.get("longitude"))]
+    hit = [it for it in located
+           if any(k in f"{it.get('name') or ''}{it.get('address') or ''}"
+                  for k in loc_keys)]
+    pool = hit
+    if not pool and city_coord:
+        pool = sorted(
+            located,
+            key=lambda it: haversine_km(
+                _to_float(it.get("latitude")), _to_float(it.get("longitude")),
+                *city_coord))[:3]
+    if pool:
+        return (_median([_to_float(it.get("latitude")) for it in pool]),
+                _median([_to_float(it.get("longitude")) for it in pool]))
+    return city_coord
+
+
+def _call_search(client, arguments: dict) -> list:
+    data = client.call_tool("searchHotels", arguments)
     if isinstance(data, dict) and data.get("success") is False:
         raise RuntimeError(f"道旅搜索失败 code={data.get('code')}: "
                            f"{data.get('message')}")
+    return [it for it in _extract_hotel_list(data) if isinstance(it, dict)]
 
-    raw_hotels = _extract_hotel_list(data)
 
-    hotels = []
-    for item in raw_hotels:
-        if isinstance(item, dict):
-            h = _to_hotel(item, params.city)
-            if h:
-                hotels.append(h)
+def _city_search_arguments(params: BookingParams, size: int) -> dict:
+    """构造城市级搜索参数（去掉 POI 与距离限定），用于 POI 失效时的兜底。"""
+    args = _build_arguments(params, size)
+    args["place"] = params.city
+    args["placeType"] = "城市"
+    fo = args.get("filterOptions")
+    if isinstance(fo, dict):
+        fo.pop("distanceInMeter", None)
+        if not fo:
+            args.pop("filterOptions", None)
+    return args
 
-    # 预算已通过服务端 hotelTags.maxPricePerNight 筛选；
-    # 本地再兜一次，防止个别无价/价格波动酒店漏网
+
+def search_real_hotels(params: BookingParams, size: int = 20) -> List[Hotel]:
+    """
+    调用 searchHotels 并做质量校正：
+    1) 城市硬校验——剔除服务端地理编码跑偏的跨城酒店（如"大连西安路"→西安）
+    2) POI 模式按锚点近邻过滤——剔除混入"附近"结果的下辖县镇酒店
+    3) POI 搜索质量差（0 同城/无地标命中）时自动补一次城市搜索
+    4) 预算本地兜底 + 地标词命中优先排序
+    """
+    from geo_data import get_city_coord, haversine_km
+
+    client = _get_client()
+    city_coord = get_city_coord(params.city)
+    loc_keys = _location_keywords(params.location) if params.location else []
+    poi = _parse_poi(params.location) if params.location else None
+
+    items = _call_search(client, _build_arguments(params, size))
+    same = [it for it in items if _is_same_city_item(it, params.city, city_coord)]
+
+    # POI 被服务端错误编码到外地（0 同城）或地标零命中时，补城市搜索
+    has_landmark_hit = any(
+        any(k in f"{it.get('name') or ''}{it.get('address') or ''}" for k in loc_keys)
+        for it in same)
+    if poi and (not same or (loc_keys and not has_landmark_hit)):
+        try:
+            city_items = _call_search(client, _city_search_arguments(params, size))
+            known_ids = {it.get("hotelId") for it in same}
+            same.extend(it for it in city_items
+                        if it.get("hotelId") not in known_ids
+                        and _is_same_city_item(it, params.city, city_coord))
+            has_landmark_hit = has_landmark_hit or any(
+                any(k in f"{it.get('name') or ''}{it.get('address') or ''}"
+                    for k in loc_keys) for it in same)
+        except Exception as e:
+            print(f"[城市兜底搜索失败] {e}")
+
+    # POI 模式：按锚点剔除下辖县镇等离群点（坐标缺失时放弃硬剔）
+    if poi and city_coord:
+        anchor = _estimate_poi_anchor(same, city_coord, loc_keys)
+        kept = []
+        for it in same:
+            la, lo = _to_float(it.get("latitude")), _to_float(it.get("longitude"))
+            if la and lo and anchor:
+                if haversine_km(la, lo, *anchor) <= _POI_LOCAL_KM:
+                    kept.append(it)
+            else:
+                kept.append(it)
+        # 全部被剔说明锚点不可信（如小县城地标坐标稀疏），退回未剔集合
+        same = kept or same
+
+    hotels = [h for h in (_to_hotel(it, params.city) for it in same) if h]
+
+    # 预算服务端已筛，本地兜底无价/波动
     if params.max_price:
         hotels = [h for h in hotels
                   if h.price_per_night <= 0 or h.price_per_night <= params.max_price]
+
+    # 排序：地标词命中优先 → 距市中心近优先（稳定保序）
+    if city_coord:
+        def _dist(h):
+            return haversine_km(h.latitude, h.longitude, *city_coord) \
+                if h.latitude and h.longitude else 9999.0
+        indexed = sorted(enumerate(hotels),
+                         key=lambda pair: (_location_hit(pair[1], loc_keys) == 0,
+                                           _dist(pair[1]), pair[0]))
+        hotels = [h for _, h in indexed]
+    elif loc_keys:
+        hotels = _rank_by_location(hotels, params.location)
     return hotels
+
+
+def _location_hit(h: Hotel, loc_keys: List[str]) -> int:
+    text = f"{h.name}{h.address}"
+    return sum(1 for k in loc_keys if k != h.city and k in text)
+
+
+# 地理类型后缀：剥掉后得到地标实体核心，"中街步行街"→"中街"、"三亚湾海边"→"三亚湾"
+_GEO_SUFFIX_RE = re.compile(
+    r'(步行街|商业街|主题公园|海洋公园|会展中心|体育中心|火车站|高铁站|地铁站|'
+    r'大学城|机场|商圈|景区|景点|广场|古镇|古城|夜市|老街|海边|海滩|沙滩|'
+    r'湖边|江边|附近|周边|旁边|一带|市中心|市区|路|街|湾|站)$'
+)
+
+
+def _location_keywords(location: str) -> List[str]:
+    """从位置描述提取可用于地址匹配的地标词，如"春熙路步行街附近"→春熙路步行街/春熙路。"""
+    cleaned = re.sub(
+        r'附近|周边|旁边|一带|市中心|市区中心|市区|老城区|古城区', '', location)
+    kws: List[str] = []
+    for seg in re.findall(r'[一-龥]{2,}', cleaned):
+        kws.append(seg)
+        core = _GEO_SUFFIX_RE.sub("", seg)   # 剥一层地理类型后缀取实体核心
+        if len(core) >= 2:
+            kws.append(core)
+        elif len(seg) > 3:
+            kws.append(seg[:3])               # 剥不出核心时用前三字兜底
+    # 长词优先，去重保序
+    seen, result = set(), []
+    for k in sorted(kws, key=len, reverse=True):
+        if k not in seen:
+            seen.add(k)
+            result.append(k)
+    return result
+
+
+def _rank_by_location(hotels: List["Hotel"], location: str) -> List["Hotel"]:
+    """按名称/地址与位置词的命中数稳定排序，命中多的在前；无命中的保留在后面不删除。"""
+    keywords = _location_keywords(location)
+    if not keywords:
+        return hotels
+
+    def score(h) -> int:
+        text = f"{h.name}{h.address}"
+        # 剥后缀可能得到城市名本身（三亚湾→三亚），城市名不参与位置命中
+        return sum(1 for k in keywords if k != h.city and k in text)
+
+    # 稳定排序：原顺序作为次序键，命中分降序
+    indexed = list(enumerate(hotels))
+    indexed.sort(key=lambda pair: (-score(pair[1]), pair[0]))
+    return [h for _, h in indexed]
 
 
 # ========== 酒店详情（实时房型报价 / 退改政策）==========
