@@ -33,6 +33,7 @@
 - **真实酒店搜索**：道旅 `searchHotels` 返回全国城市实时可订酒店、展示价、星级、设施标签；支持按星级、每晚预算服务端筛选
 - **实时房型报价**：道旅 `getHotelDetail` 返回同房型下含早/退改等上百条报价，程序按房型聚合、每房型保留最便宜一档，展示餐食、床型、面积、退改政策、是否需申请
 - **真实验价 + 下单**：道旅 OAuth REST 接口 `/hotelpriceconfirm`（锁价拿 `referenceNo`）→ `/hotelbook`（创建订单拿 `orderNo` + `paymentUrl`）→ `/hotelorders`（查单）
+- **历史订单查询**：对话里说「查我的历史订单 / 查待支付的订单 / 查已取消的订单」即可拉取道旅账号全部真实订单（跨会话保留），支持按状态筛选；未登录时降级展示本次会话的本地订单并引导登录
 - **资金安全设计**：验价与下单两步分离、强制二次确认、常用入住人须用户确认后才使用、**程序只拿到支付链接，绝不在程序内完成支付**
 - **三级数据源回退**：道旅（有价格）→ 高德 POI（仅名称地址）→ 内置模拟酒店库，任何 Key 缺失都不阻断演示
 - **RAG 酒店评价**：切块 → Embedding（DashScope `text-embedding-v2` 或 TF-IDF 模拟）→ 向量召回 → 重排 → 生成回答
@@ -174,11 +175,20 @@ python main_multi.py
 
 也可以在多轮对话中补充：「换一家」「第 3 种房型」「使用常用入住人 1」「换个邮箱 xxx@xx.com」。
 
+历史订单查询：
+
+```
+你 > 查我的历史订单        # 道旅账号全部真实订单（已登录时；未登录显示本次会话模拟单）
+你 > 查待支付的订单        # 状态筛选：待支付 / 已完成已支付 / 已取消
+你 > 查订单 188910810421   # 按订单号查单笔详情（本地没有会自动查道旅详情）
+```
+
 命令行直接操作道旅账号（不经过对话）：
 
 ```powershell
 python rollinggo_book.py login     # 浏览器 OAuth 授权
 python rollinggo_book.py           # 查看 token 状态
+python rollinggo_book.py orders [all|pending|finished]  # 查历史订单
 ```
 
 ## 真实下单原理与安全设计
@@ -233,9 +243,9 @@ orderNo + paymentUrl（通用收银台，用户自行打开支付）
 |---|---|
 | `models.py` | 全部 dataclass；`BookingParams.is_complete()/missing_fields()` 驱动参数追问；`Order.source` 区分 mock/rollinggo |
 | `llm.py` | `LLMClient.extract_intent_and_params()`：意图 book/search/order_query/cancel/chat + 结构化参数；含口语日期换算 prompt |
-| `tools.py` | `search_hotels()` 三级回退；`get_hotel_detail(live=True)` 实时富化；`create_order()` 模拟单；`create_real_order()` 道旅真单；运行时酒店缓存 `_RUNTIME_HOTEL_CACHE`；内存 `ORDER_DB` |
+| `tools.py` | `search_hotels()` 三级回退；`get_hotel_detail(live=True)` 实时富化；`create_order()` 模拟单；`create_real_order()` 道旅真单；`list_history_orders()` 历史订单（远程+本地合并、状态筛选）；运行时酒店缓存 `_RUNTIME_HOTEL_CACHE`；内存 `ORDER_DB` |
 | `rollinggo_mcp.py` | `RollingGoMCPClient`：MCP 握手、JSON/SSE 双解析；搜索参数构造（`hotelTags.maxPricePerNight` 等）；报价按房型聚合取最低价 |
-| `rollinggo_book.py` | OAuth PKCE 登录与本地回调服务；token 存取（与官方 CLI 共享 `~/.hotel-cli/token.json`）；`price_confirm() / create_booking() / list_orders() / get_order_detail()` |
+| `rollinggo_book.py` | OAuth PKCE 登录与本地回调服务；token 存取（与官方 CLI 共享 `~/.hotel-cli/token.json`）；`price_confirm() / create_booking() / list_orders() / get_order_detail() / parse_orders()`；CLI 支持 `login/status/logout/orders` |
 | `amap_poi.py` | 高德文本搜索 v3（`restapi.amap.com/v3/place/text`），住宿大类 100000，星级词映射 |
 | `agent.py` | 主状态机：选店、序号/房型名/床型关键词匹配报价、验价确认卡编排、下单与取消 |
 | `multi_agent.py` | `AgentMessage` 消息队列 + `AgentState` 共享黑板；Supervisor 分发 Search/Booking/Service/Review 四个 Worker |
@@ -271,6 +281,12 @@ A：先执行 `$env:PYTHONUTF8 = "1"` 再运行程序。
 
 **Q：会真的扣钱吗？**
 A：只有你本人打开 `paymentUrl` 在收银台完成支付才会扣款；只验价或创建订单后不支付，不会产生费用。
+
+**Q：为什么重启程序后查不到之前的模拟订单？**
+A：模拟订单只存在进程内存（`ORDER_DB`）中，重启即清空，这是教学演示设计；登录道旅后「查历史订单」走的是账号云端数据，`python rollinggo_book.py orders` 也可直接查询，跨设备/重启都在。
+
+**Q：验价等待确认时能查订单吗？**
+A：可以。在确认卡片阶段直接说「查我的订单」，系统会展示订单列表，并保留你的验价上下文（查完仍可回复【确认下单】，但锁价有时效，超时需重新验价）。
 
 ## 免责声明
 

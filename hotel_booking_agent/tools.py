@@ -304,6 +304,142 @@ def get_order_status(order_id: str) -> Optional[Order]:
     return ORDER_DB.get(order_id)
 
 
+# ========== 历史订单列表（道旅真实订单 + 本地内存订单）==========
+
+# 本地订单状态 → 统一中文文案
+_LOCAL_STATUS_TEXT = {
+    "pending": "待支付",
+    "paid": "已支付",
+    "cancelled": "已取消",
+}
+
+# 列表筛选器允许的状态桶
+_ORDER_FILTERS = ("ALL", "PENDING", "FINISHED", "CANCELLED")
+
+
+def _local_order_to_row(order: Order) -> dict:
+    """把本地 Order 转成与道旅订单一致的归一化行结构。"""
+    return {
+        "order_no": order.order_id,
+        "hotel_name": order.hotel_name,
+        "room_name": order.room_type,
+        "check_in": order.check_in,
+        "check_out": order.check_out,
+        "total_price": float(order.total_price or 0),
+        "currency": "CNY",
+        "status": order.status,
+        "status_text": _LOCAL_STATUS_TEXT.get(order.status, order.status),
+        "payment_url": order.payment_url or "",
+        "create_time": "",
+        "source": order.source,                       # mock / rollinggo
+        "session_local": True,                        # 来自本次进程内存
+    }
+
+
+def _order_status_bucket(row: dict) -> str:
+    """把任意订单行归入 PENDING / CANCELLED / FINISHED 桶，用于本地筛选。"""
+    text = str(row.get("status_text") or "")
+    raw = str(row.get("status") or "").upper()
+    if "取消" in text or "退" in text or any(
+            k in raw for k in ("CANCEL", "REFUND", "REJECT", "VOID")):
+        return "CANCELLED"
+    if "待支付" in text or "未支付" in text \
+            or "PAY" in raw or "UNPAID" in raw or raw == "PENDING":
+        return "PENDING"
+    return "FINISHED"
+
+
+def list_history_orders(status_filter: str = "ALL") -> dict:
+    """
+    工具7b：查询历史订单列表。
+
+    数据源：
+    - 已登录道旅 OAuth：拉取道旅账号订单（真正的"历史"，跨会话保留），
+      并补充本次进程刚创建、远程可能尚未同步的本地真实单/模拟单；
+    - 未登录：仅返回本地内存订单（程序重启后为空）。
+
+    status_filter：ALL / PENDING（待支付）/ FINISHED（已支付等终态）/ CANCELLED
+    返回：{logged_in, source, filter, rows, remote_error}
+    """
+    flt = (status_filter or "ALL").upper()
+    if flt not in _ORDER_FILTERS:
+        flt = "ALL"
+
+    rows: List[dict] = []
+    remote_error: Optional[str] = None
+    logged_in = False
+    try:
+        import rollinggo_book as rlg
+        logged_in = rlg.is_logged_in()
+    except Exception:
+        logged_in = False
+
+    if logged_in:
+        # FINISHED/CANCELLED 统一拉全量再在本地过滤，避免对接口语义做过度假设
+        api_status = "PENDING" if flt == "PENDING" else "ALL"
+        try:
+            import rollinggo_book as rlg
+            rows = rlg.parse_orders(rlg.list_orders(api_status))
+        except Exception as e:
+            remote_error = str(e)
+
+        # 补充本地有、远程列表里没有的订单（刚下单未同步 / 模拟单）
+        remote_ids = {r.get("order_no") for r in rows}
+        for order in ORDER_DB.values():
+            if order.order_id not in remote_ids:
+                rows.append(_local_order_to_row(order))
+        source = "rollinggo"
+    else:
+        rows = [_local_order_to_row(o) for o in ORDER_DB.values()]
+        source = "local" if rows else "none"
+
+    if flt != "ALL":
+        rows = [r for r in rows if _order_status_bucket(r) == flt]
+
+    return {
+        "logged_in": logged_in,
+        "source": source,
+        "filter": flt,
+        "rows": rows,
+        "remote_error": remote_error,
+    }
+
+
+def format_order_rows(rows: List[dict], max_show: int = 10) -> str:
+    """把归一化订单行列表格式化为终端可读文本（供 Agent / 多 Agent 版复用）。"""
+    if not rows:
+        return ""
+    lines = []
+    for i, r in enumerate(rows[:max_show], 1):
+        tag = "【道旅】" if r.get("source") == "rollinggo" \
+            and not r.get("session_local") else "【本地】"
+        total = r.get("total_price")
+        if total is None or total == "":
+            total_text = "金额待确认"
+        else:
+            # 归一化链路本就产出数值；这里兼容外部直接传入字符串金额的情况
+            try:
+                total_text = f"{float(total):g} {r.get('currency') or 'CNY'}"
+            except (TypeError, ValueError):
+                total_text = f"{total} {r.get('currency') or 'CNY'}"
+        head = (
+            f"{i}. {tag}{r.get('order_no') or '未知订单号'}\n"
+            f"   {r.get('hotel_name') or '酒店未知'}"
+        )
+        if r.get("room_name"):
+            head += f" · {r['room_name']}"
+        if r.get("check_in") or r.get("check_out"):
+            head += f"\n   入住：{r.get('check_in') or '?'} → {r.get('check_out') or '?'}"
+        head += f"\n   总价：{total_text} · 状态：{r.get('status_text') or '未知'}"
+        lines.append(head)
+        # 待支付订单附上支付链接（真实订单由用户自行付款）
+        if r.get("payment_url") and _order_status_bucket(r) == "PENDING":
+            lines.append(f"   支付链接：{r['payment_url']}")
+    if len(rows) > max_show:
+        lines.append(f"... 另有 {len(rows) - max_show} 笔订单未展示")
+    return "\n".join(lines)
+
+
 def format_hotel_list(hotels: List[Hotel], max_show: int = 5) -> str:
     """工具8：格式化酒店列表为可读文本（供 Agent 展示给用户）"""
     if not hotels:

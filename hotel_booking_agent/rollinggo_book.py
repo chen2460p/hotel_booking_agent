@@ -425,12 +425,99 @@ def create_booking(
 
 def list_orders(status: str = "ALL") -> Any:
     """查询订单列表：ALL / PENDING / FINISHED。返回原始响应。"""
+    status = (status or "ALL").upper()
+    if status not in ("ALL", "PENDING", "FINISHED"):
+        status = "ALL"
     return _request("/hotelorders", {"status": status})
 
 
 def get_order_detail(order_no: str) -> Any:
     """查询订单详情。"""
     return _request("/hotelorderdetail", {"orderNo": str(order_no)})
+
+
+# ---------------------------------------------------------------------------
+# 订单响应归一化（列表 / 详情共用）
+# ---------------------------------------------------------------------------
+# 道旅订单状态为英文码/短语，不同渠道取值不完全一致，这里按关键词保守映射；
+# 含中文的状态直接透传，无法识别的英文码原样展示，绝不臆造状态。
+def humanize_order_status(raw_status: Any) -> str:
+    if raw_status in (None, ""):
+        return "未知"
+    s = str(raw_status).strip()
+    upper = s.upper()
+    if re.search(r"[\u4e00-\u9fa5]", s):
+        return s                       # 接口已给中文，直接用
+    if any(k in upper for k in ("CANCEL", "REFUND", "REJECT", "VOID", "FAIL")):
+        return "已取消"
+    if any(k in upper for k in ("PAY", "UNPAID")) or upper in ("PENDING", "WAIT"):
+        return "待支付"
+    if "REQUEST" in upper or "CONFIRMING" in upper:
+        return "待酒店确认"
+    if any(k in upper for k in ("FINISH", "COMPLET", "CHECKED", "STAYED", "CLOSED")):
+        return "已完成"
+    if any(k in upper for k in ("CONFIRM", "BOOKED", "SUCCESS", "ISSUED")):
+        return "已确认"
+    return s
+
+
+def _extract_order_rows(raw: Any) -> List[Dict[str, Any]]:
+    """从列表/详情响应中取出订单 dict 列表（实测列表在 orderList 字段）。"""
+    # 1) 顶层就是列表
+    if isinstance(raw, list):
+        return [x for x in raw if isinstance(x, dict)]
+
+    # 2) 优先递归找 orderList（可能嵌在 data/result 等包裹层下；空列表也是有效结果）
+    listed = _find_key(raw, ["orderList", "orders", "bookingList"])
+    if isinstance(listed, list):
+        return [x for x in listed if isinstance(x, dict)]
+
+    # 3) 脱包裹后再找订单数组或单个订单对象（详情响应）
+    body = _unwrap(raw)
+    if isinstance(body, list):
+        return [x for x in body if isinstance(x, dict)]
+    if isinstance(body, dict):
+        for v in body.values():
+            if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                return v
+        if _find_key(body, ["orderNo", "order_no", "bookingNo"]):
+            return [body]
+    return []
+
+
+def parse_orders(raw: Any) -> List[Dict[str, Any]]:
+    """
+    把道旅订单列表/详情响应归一化为统一行结构：
+    order_no / hotel_name / room_name / check_in / check_out /
+    total_price / currency / status(原始) / status_text(中文) /
+    payment_url / create_time
+    """
+    rows: List[Dict[str, Any]] = []
+    for it in _extract_order_rows(raw):
+        status = _find_key(it, ["orderStatus", "status", "bookingStatus"])
+        rows.append({
+            "order_no": str(_find_key(
+                it, ["orderNo", "order_no", "bookingNo"], "")) or "",
+            "hotel_name": str(_find_key(
+                it, ["hotelName", "hotelNameCn", "hotel"], "")) or "",
+            "room_name": str(_find_key(
+                it, ["roomName", "roomNameCn", "room"], "")) or "",
+            "check_in": str(_find_key(
+                it, ["checkInDate", "checkIn"], "")) or "",
+            "check_out": str(_find_key(
+                it, ["checkOutDate", "checkOut"], "")) or "",
+            "total_price": _to_number(_find_key(
+                it, ["totalPrice", "totalAmount", "total", "amount"])),
+            "currency": str(_find_key(it, ["currency", "currencyCode", "ccy"], "CNY")),
+            "status": status,
+            "status_text": humanize_order_status(status),
+            "payment_url": str(_find_key(
+                it, ["paymentUrl", "payUrl", "cashierUrl", "payURL"], "")) or "",
+            "create_time": str(_find_key(
+                it, ["createTime", "createdAt", "orderTime", "bookingTime"], "")) or "",
+            "source": "rollinggo",
+        })
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -488,8 +575,32 @@ def _to_bool(value: Any) -> Optional[bool]:
 
 
 # ---------------------------------------------------------------------------
-# 命令行入口：python rollinggo_book.py login | status
+# 命令行入口：python rollinggo_book.py login | status | logout | orders
 # ---------------------------------------------------------------------------
+def _cli_orders(status: str = "ALL") -> None:
+    """命令行查询道旅历史订单：python rollinggo_book.py orders [all|pending|finished]"""
+    try:
+        raw = list_orders(status)
+    except (RollingGoAuthError, RollingGoApiError) as e:
+        print(f"查询失败：{e}")
+        return
+    rows = parse_orders(raw)
+    if not rows:
+        print(f"道旅账号下没有{'待支付' if status == 'PENDING' else ''}订单。")
+        return
+    print(f"共 {len(rows)} 笔订单：")
+    for i, r in enumerate(rows, 1):
+        line = (
+            f"{i}. {r['order_no']} | {r['hotel_name']} | "
+            f"{r['check_in']}→{r['check_out']} | "
+            f"{r['total_price'] if r['total_price'] is not None else '?'}"
+            f" {r['currency']} | {r['status_text']}"
+        )
+        print(line)
+        if r["payment_url"] and r["status_text"] == "待支付":
+            print(f"   支付链接：{r['payment_url']}")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     if cmd == "login":
@@ -502,5 +613,7 @@ if __name__ == "__main__":
             print(f"已删除 {_TOKEN_PATH}")
         else:
             print("当前未登录")
+    elif cmd == "orders":
+        _cli_orders((sys.argv[2] if len(sys.argv) > 2 else "ALL").upper())
     else:
-        print("用法: python rollinggo_book.py [login|status|logout]")
+        print("用法: python rollinggo_book.py [login|status|logout|orders [all|pending|finished]]")
