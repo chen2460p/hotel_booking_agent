@@ -38,9 +38,13 @@ class Hotel:
     room_types: List[str]   # 房型列表
     rating: float           # 用户评分（0-5）
     review_count: int       # 评论数
+    recommend_rate: str = ""    # 好评率，如 "92%"（仅真实评价来源有值）
+    rating_source: str = ""     # 评分来源，如 "高德地图"/"百度地图"；空表示内置模拟/未知
     # 实时详情（仅道旅详情接口返回；模拟/高德数据为空）
     rate_plans: List[RoomRatePlan] = field(default_factory=list)
     booking_url: str = ""   # 真实预订页链接
+    latitude: float = 0.0   # 纬度（道旅真实酒店有，用于距离/城市校验）
+    longitude: float = 0.0  # 经度
 
 
 @dataclass
@@ -53,6 +57,7 @@ class BookingParams:
     max_price: Optional[float] = None   # 每晚预算上限（可选）
     facilities: List[str] = field(default_factory=list)  # 必须设施（可选）
     keyword: Optional[str] = None       # 关键词，如"海景""亲子"（可选）
+    location: Optional[str] = None      # 位置/商圈/地标，如"市中心""春熙路步行街附近"（可选）
 
     def is_complete(self) -> bool:
         """判断必填参数是否齐全"""
@@ -98,4 +103,6 @@ class AgentState:
     conversation_history: List[str] = field(default_factory=list) # 对话历史（短期记忆）
     # 真实预订多轮上下文：草稿（等邮箱）与待确认验价单（等【确认下单】）
     booking_context: dict = field(default_factory=dict)
+    # 选房阶段跨轮暂存：用户只给了房型或只给了入住人时，先记下等下一轮补全
+    pending_booking: dict = field(default_factory=dict)
     stage: str = "intent"  # 当前阶段：intent意图理解 / clarify参数澄清 / search搜索 / recommend推荐 / booking预订 / booking_confirm验价待确认 /售后

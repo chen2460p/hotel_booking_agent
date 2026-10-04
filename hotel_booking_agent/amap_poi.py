@@ -4,9 +4,10 @@
 #       解决模拟数据库 HOTEL_DB 只有 4 个城市的问题。
 #
 # 能力边界（重要）：
-# - 高德 POI 只提供：名称、类型、地址、坐标、行政区划
-# - 不提供：实时房价、空房、评分、设施、可下单房型
-#   因此价格/评分/设施类筛选在真实模式下不生效（仅城市 + 关键词由服务端过滤）
+# - 高德 POI 提供：名称、类型、地址、坐标、行政区划；extensions=all 时
+#   酒店类 POI 还可能在 biz_ext.rating 返回真实住客评分（无评价条数/好评率）
+# - 不提供：实时房价、空房、评价条数、设施、可下单房型
+#   因此价格/设施类筛选在真实模式下不生效（仅城市 + 关键词由服务端过滤）
 #
 # 申请方式（必须申请"Web服务"类型的 Key，JS API 的 Key 不能用于服务端调用）：
 # 1. 注册并登录 https://lbs.amap.com/
@@ -82,8 +83,23 @@ def _build_address(poi: dict) -> str:
 
 
 def _to_hotel(poi: dict, city: str) -> Hotel:
-    """把高德 POI 映射成项目统一的 Hotel 模型"""
+    """把高德 POI 映射成项目统一 Hotel 模型"""
     type_text = poi.get("type", "")
+    # 高德 location 形如 "经度,纬度"（GCJ02 火星坐标），用于后续评分 POI 匹配
+    lat = lng = 0.0
+    loc = str(poi.get("location") or "")
+    if "," in loc:
+        try:
+            lng_str, lat_str = loc.split(",", 1)
+            lat, lng = float(lat_str), float(lng_str)
+        except ValueError:
+            pass
+    # extensions=all 时 biz_ext.rating 为真实住客评分（字符串，如 "4.8"），
+    # 直接随搜索响应取到，无需额外请求；无评分的 POI 留 0 由 hotel_rating 补
+    try:
+        rating = float((poi.get("biz_ext") or {}).get("rating") or 0)
+    except (TypeError, ValueError):
+        rating = 0.0
     return Hotel(
         hotel_id=f"AMAP_{poi.get('id', '')}",
         name=poi.get("name", "未知酒店"),
@@ -93,8 +109,11 @@ def _to_hotel(poi: dict, city: str) -> Hotel:
         price_per_night=0.0,   # POI 无价格，0 表示未知（展示层特殊处理）
         facilities=[],         # POI 无设施明细
         room_types=list(_DEFAULT_ROOM_TYPES),
-        rating=0.0,            # POI 无评分，0 表示未知
-        review_count=0,
+        rating=rating,         # 真实评分（无则 0），来源标注高德地图
+        review_count=0,        # 高德接口不提供评价条数
+        rating_source="高德地图" if rating > 0 else "",
+        latitude=lat,
+        longitude=lng,
     )
 
 
@@ -105,9 +124,14 @@ def search_real_hotels(params: BookingParams,
     - 城市：city 参数直接传中文名（如"成都"），citylimit=true 限定本市
     - 关键词：海景/亲子等关键词拼入 keywords 由高德做名称匹配
     """
-    keywords = "酒店"
+    # 位置（市中心/商圈/地标附近）与酒店属性词都拼入检索词，
+    # 高德文本搜索支持地标语义，如"春熙路步行街附近酒店"
+    keyword_parts = []
+    if params.location:
+        keyword_parts.append(params.location)
     if params.keyword:
-        keywords = f"{params.keyword}酒店"
+        keyword_parts.append(params.keyword)
+    keywords = "".join(keyword_parts) + "酒店" if keyword_parts else "酒店"
 
     response = requests.get(
         _AMAP_TEXT_SEARCH_URL,
@@ -119,7 +143,8 @@ def search_real_hotels(params: BookingParams,
             "citylimit": "true",
             "offset": page_size,
             "page": page,
-            "extensions": "base",
+            # all：返回 biz_ext.rating 真实住客评分（base 不含该字段）
+            "extensions": "all",
             "output": "JSON",
         },
         timeout=8,

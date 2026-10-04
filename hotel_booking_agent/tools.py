@@ -12,6 +12,11 @@ from rollinggo_mcp import (
     search_real_hotels as search_rollinggo_hotels,
     enrich_hotel_detail,
 )
+from hotel_rating import (
+    is_enabled as rating_enabled,
+    enrich_hotels_rating,
+    enrich_hotel_rating,
+)
 
 
 # ========== 模拟酒店数据库 ==========
@@ -102,6 +107,19 @@ def _cache_runtime_hotels(hotels: List[Hotel]) -> None:
         _RUNTIME_HOTEL_CACHE[h.hotel_id] = h
 
 
+def _enrich_ratings_safely(hotels: List[Hotel]) -> None:
+    """为真实酒店批量补真实住客评分（默认只补前8家，模块内7天缓存）；
+    评分服务任何异常都不影响订房主流程。"""
+    if not rating_enabled():
+        return
+    try:
+        n = enrich_hotels_rating(hotels)
+        if n:
+            print(f"[评分] 已为 {n} 家酒店补全真实住客评分（来源：高德/百度地图）")
+    except Exception as e:
+        print(f"[评分服务异常，已忽略] {type(e).__name__}: {e}")
+
+
 # ========== 工具函数 ==========
 # 每个工具对应 Agent 可调用的一个"能力"，遵循八股中的 Tool 设计原则：
 # - 小而可组合，一个工具做一件事
@@ -121,6 +139,7 @@ def search_hotels(params: BookingParams) -> List[Hotel]:
     if params.city and rollinggo_enabled():
         try:
             results = search_rollinggo_hotels(params)
+            _enrich_ratings_safely(results)
             _cache_runtime_hotels(results)
             return results
         except Exception as e:
@@ -129,6 +148,7 @@ def search_hotels(params: BookingParams) -> List[Hotel]:
     if params.city and amap_enabled():
         try:
             results = search_amap_hotels(params)
+            _enrich_ratings_safely(results)
             _cache_runtime_hotels(results)
             # 高德 POI 无价格/星级/设施数据，这些筛选条件无法执行
             if params.min_star or params.max_price or params.facilities:
@@ -167,6 +187,17 @@ def search_hotels(params: BookingParams) -> List[Hotel]:
             if kw in h.name or any(kw in f for f in h.facilities)
         ]
 
+    # 按位置/商圈匹配（酒店名或地址命中地标词；纯"市中心"等泛词无法判定则跳过）
+    if params.location:
+        from rollinggo_mcp import _location_keywords
+        loc_keys = [k for k in _location_keywords(params.location)
+                    if k != params.city]   # 剥后缀可能得到城市名本身，排除
+        if loc_keys:
+            results = [
+                h for h in results
+                if any(k in h.name or k in (h.address or "") for k in loc_keys)
+            ]
+
     # 排序：评分高 + 评论多的优先（确定性排序规则）
     results.sort(key=lambda h: (h.rating, h.review_count), reverse=True)
 
@@ -195,6 +226,13 @@ def get_hotel_detail(hotel_id: str, check_in: Optional[str] = None,
             enrich_hotel_detail(cached, check_in, check_out)
         except Exception as e:
             print(f"[道旅详情获取失败，使用搜索缓存数据] {e}")
+
+    # 搜索阶段没配上评分（或当时还没配 Key）时，查详情再补一次真实评分
+    if live and rating_enabled() and cached.rating == 0:
+        try:
+            enrich_hotel_rating(cached)
+        except Exception as e:
+            print(f"[评分服务异常，已忽略] {type(e).__name__}: {e}")
     return cached
 
 
@@ -450,7 +488,16 @@ def format_hotel_list(hotels: List[Hotel], max_show: int = 5) -> str:
         star_text = f"{h.star}星" if h.star else "星级未知"
         price_text = f"{h.price_per_night:g}元/晚" if h.price_per_night else "价格以实际预订为准"
         if h.rating:
-            rating_text = f"评分：{h.rating}（{h.review_count}条评论）"
+            meta = []
+            if h.review_count:
+                meta.append(f"{h.review_count}条真实评价")
+            if h.recommend_rate:
+                meta.append(f"好评率{h.recommend_rate}")
+            if h.rating_source:
+                meta.append(f"来源：{h.rating_source}")
+            rating_text = f"评分：{h.rating:g}"
+            if meta:
+                rating_text += f"（{'，'.join(meta)}）"
         else:
             rating_text = "暂无评分"
         facilities_str = "、".join(h.facilities[:4]) if h.facilities else "信息待补充"
