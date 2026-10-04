@@ -84,7 +84,7 @@ class HotelBookingAgent:
         elif intent == "cancel":
             return self._handle_cancel(extracted)
         else:
-            return self._handle_chat(user_input)
+            return self._handle_chat(user_input, extracted)
 
     def _merge_params(self, extracted: dict):
         """
@@ -109,6 +109,8 @@ class HotelBookingAgent:
             p.facilities = list(existing)
         if "keyword" in extracted:
             p.keyword = extracted["keyword"]
+        if "location" in extracted:
+            p.location = extracted["location"]
 
     def _handle_booking_flow(self, user_input: str) -> str:
         """
@@ -146,9 +148,10 @@ class HotelBookingAgent:
         else:
             # 计算入住晚数用于展示
             nights = self._calc_nights(params.check_in, params.check_out)
+            area_text = f"{params.city}{params.location}，" if params.location else ""
             response = (
                 f"为你找到 {len(results)} 家符合条件的酒店"
-                f"（{params.check_in} 入住，{params.check_out} 离店，共{nights}晚）：\n\n"
+                f"（{area_text}{params.check_in} 入住，{params.check_out} 离店，共{nights}晚）：\n\n"
                 f"{format_hotel_list(results)}\n\n"
                 f"请告诉我你想选择哪一家（回复序号或酒店名），"
                 f"或告诉我更多偏好我帮你进一步筛选。"
@@ -343,8 +346,15 @@ class HotelBookingAgent:
                 f"回复【确认取消】即可取消，或回复【取消操作】放弃。"
             )
 
-    def _handle_chat(self, user_input: str) -> str:
+    # 这些字段出现在提取结果中，说明用户本轮确实在补充预订信息（而非闲聊）
+    _BOOKING_PARAM_KEYS = (
+        "city", "check_in", "check_out", "min_star",
+        "max_price", "facilities", "keyword", "guest_name",
+    )
+
+    def _handle_chat(self, user_input: str, extracted: Optional[dict] = None) -> str:
         """处理闲聊和其他问题"""
+        extracted = extracted or {}
         # 检查是否是在回复酒店选择（用户回复序号选酒店）
         if self.state.stage == "recommend" and self.state.search_results:
             selection = self._parse_hotel_selection(user_input)
@@ -363,22 +373,52 @@ class HotelBookingAgent:
             self.state.current_order = None
             return "好的，已取消操作。"
 
-        # 检查是否是在预订流程中补充信息
-        # 注意：只要 stage 是 clarify/intent，就走预订流程
-        # （参数可能在 run() 中已被合并齐全，此时应直接搜索而非返回默认回复）
-        if self.state.stage in ("clarify", "intent"):
+        # 参数澄清阶段：仅当本轮消息确实携带预订信息时才继续预订流程，
+        # "你好/谢谢"这类纯闲聊不应被当成对追问的回答
+        if self.state.stage in ("clarify", "intent") and any(
+                k in extracted for k in self._BOOKING_PARAM_KEYS):
             return self._handle_booking_flow(user_input)
 
-        # 默认闲聊回复
-        response = (
-            "你好！我是酒店预订助手，可以帮你：\n"
-            "1. 搜索和预订酒店（告诉我城市、日期、预算等）\n"
-            "2. 查询订单状态（提供订单号）\n"
-            "3. 取消订单（提供订单号）\n\n"
-            "请问有什么可以帮你的？"
-        )
+        # 真正的闲聊
+        response = self._chat_reply(user_input)
         self.state.conversation_history.append(f"助手：{response}")
         return response
+
+    def _chat_reply(self, user_input: str) -> str:
+        """生成闲聊回复：真实 LLM 模式自然作答，模拟模式按场景给模板。"""
+        text = user_input.strip().lower()
+        if any(w in user_input for w in ("谢谢", "感谢", "多谢", "辛苦")):
+            return "不客气～还有酒店查询、预订或订单相关的需要，随时告诉我。"
+        if any(w in user_input for w in ("再见", "拜拜", "拜")) or text in ("bye", "goodbye"):
+            return "再见！祝你旅途愉快，需要订酒店时再来找我。"
+        if user_input.strip() in ("你好", "您好", "嗨", "hi", "hello", "你好啊") \
+                or text in ("hi", "hello"):
+            return (
+                "你好！我是酒店预订智能助手，可以帮你：\n"
+                "1. 搜索和预订酒店（告诉我城市、日期、预算等）\n"
+                "2. 查询历史订单（如「查我的历史订单」「查待支付的订单」）\n"
+                "3. 取消订单\n\n"
+                "想订哪里的酒店？直接告诉我就行。"
+            )
+
+        # 其他闲聊：有真实 LLM 时自然回答，没有时回到能力介绍
+        if self.llm.use_real_llm:
+            context = (
+                "你是一个酒店预订智能助手，具备酒店搜索预订、历史订单查询、取消订单能力，"
+                "语气亲切简洁。请简短回应用户的寒暄或无关问题（不超过两句话），"
+                "并自然引导用户说出订房需求（城市、日期、预算）。不要编造酒店信息。"
+            )
+            reply = self.llm.generate_response(context, user_input)
+            if reply and reply != "好的，我明白了。":
+                return reply
+
+        return (
+            "我主要能帮你处理这些事：\n"
+            "1. 搜索和预订酒店（例如：帮我订下周末成都 300 元以内的酒店）\n"
+            "2. 查询历史订单（例如：查我的历史订单 / 查待支付的订单）\n"
+            "3. 取消订单\n\n"
+            "告诉我你的需求吧。"
+        )
 
     def _parse_hotel_selection(self, user_input: str) -> Optional[Hotel]:
         """
@@ -408,6 +448,8 @@ class HotelBookingAgent:
         """
         self.state.selected_hotel = hotel
         self.state.stage = "booking"
+        # 新选了酒店，上一家酒店的选房暂存不再适用
+        self.state.pending_booking = {}
 
         p = self.state.params
         # 实时详情：各房型的含早/退改报价
@@ -499,6 +541,58 @@ class HotelBookingAgent:
                     target = rp.room_name + " " + rp.bed_type
                     if any(k in target for k in keys):
                         return rp
+        return None
+
+    # 模拟库房型的床型关键词兜底（与 _match_rate_plan 的床型兜底保持一致）
+    _MOCK_BED_KEYWORDS = (
+        ("特大床", "特大床"), ("大床", "大床"),
+        ("双床", "双床"), ("单人床", "单人床"),
+        ("标间", "标准"), ("标房", "标准"),
+        ("家庭", "家庭"), ("套房", "套房"),
+    )
+
+    def _match_mock_room_type(self, user_input: str) -> Optional[str]:
+        """匹配模拟库房型：先房型名完整包含，再按床型关键词兜底（"大床"→"大床房"）。"""
+        room_types = self.state.selected_hotel.room_types or []
+        for rt in room_types:                       # 完整房型名优先
+            if rt in user_input:
+                return rt
+        for keyword, room_key in self._MOCK_BED_KEYWORDS:
+            if keyword in user_input:
+                for rt in room_types:
+                    if room_key in rt:
+                        return rt
+        return None
+
+    # 等待用户补姓名时，裸回复这些词不应被当成姓名
+    _NAME_STOPWORDS = {
+        "谢谢", "感谢", "你好", "您好", "再见", "退出", "取消", "不要",
+        "算了", "不用", "好的", "知道", "等等", "稍后", "随便",
+    }
+
+    def _extract_guest_name(self, user_input: str,
+                            waiting_for_name: bool = False) -> Optional[str]:
+        """
+        从消息提取入住人姓名：
+        1) "入住人张三 / 姓名：张三 / 我叫张三 / 张三入住" 等显式说法
+        2) waiting_for_name=True 时，接受裸姓名（如只回复"陈老二"）
+        """
+        text = user_input.strip()
+        patterns = (
+            r'入住人?\s*[:：是叫]?\s*([\u4e00-\u9fa5]{2,4})',
+            r'(?:我叫|名字是|姓名是|名字叫|叫)\s*([\u4e00-\u9fa5]{2,4})',
+            r'([\u4e00-\u9fa5]{2,4})\s*(?:入住|住店|来住)',
+        )
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                return m.group(1)
+        if waiting_for_name:
+            t = text.strip("。.!！?？,， ")
+            if re.fullmatch(r'[\u4e00-\u9fa5]{2,4}', t) and t not in self._NAME_STOPWORDS:
+                return t
+            if re.fullmatch(r"[A-Za-z][A-Za-z .'\-]{1,30}", t):
+                return t
         return None
 
     def confirm_booking(self, room_type: str, guest_name: str,
@@ -916,41 +1010,34 @@ class HotelBookingAgent:
 
         hotel = self.state.selected_hotel
         ctx = self.state.booking_context
+        pending = self.state.pending_booking
         text = user_input.strip()
 
-        # 4) 真实下单草稿：放弃重选
-        if ctx and text in ("取消", "放弃", "不要了", "重新选", "重新选择"):
+        # 4) 选房/验价阶段：放弃重选（验价草稿或已暂存一半的房型/姓名都清空）
+        if (ctx or pending) and text in ("取消", "放弃", "不要了", "重新选", "重新选择"):
             self.state.booking_context = {}
+            self.state.pending_booking = {}
             return "好的，已清空本次选择，请重新回复房型序号 + 入住人姓名。"
 
-        email = rlg.extract_email(user_input)
+        email = rlg.extract_email(user_input) or pending.get("email_override")
 
-        # 5) 解析房型和入住人
-        room_type = None
-        rate_plan = None
-        guest_name = None
-
+        # 5) 解析本轮消息中的房型和入住人（上一轮已给的另一半信息稍后合并）
         # 优先匹配道旅实时房型报价（序号/房型名/床型关键词）
-        if hotel.rate_plans:
-            rate_plan = self._match_rate_plan(user_input)
-            if rate_plan:
-                room_type = rate_plan.room_name
+        rate_plan = self._match_rate_plan(user_input) if hotel.rate_plans else None
+        room_type = rate_plan.room_name if rate_plan \
+            else self._match_mock_room_type(user_input)
+        guest_name = self._extract_guest_name(
+            user_input, waiting_for_name=bool(pending.get("room_type")))
 
-        # 回退：模拟库房型名的直接包含匹配
+        # 6) 与上一轮暂存信息合并：先名字后房型 / 先房型后名字都能接上
+        if not guest_name:
+            guest_name = pending.get("guest_name")
         if not room_type:
-            for rt in hotel.room_types:
-                if rt in user_input:
-                    room_type = rt
-                    break
-
-        name_match = re.search(r'入住人?\s*[:：是]?\s*([\u4e00-\u9fa5]{2,4})', user_input)
-        if name_match:
-            guest_name = name_match.group(1)
-        else:
-            # 尝试从句子中提取姓名（简单规则）
-            name_match2 = re.search(r'([\u4e00-\u9fa5]{2,4})\s*(入住|住)', user_input)
-            if name_match2:
-                guest_name = name_match2.group(1)
+            room_type = pending.get("room_type")
+            if room_type and not rate_plan:
+                # 沿用上一轮房型名时重新解析报价对象，避免使用过期价格
+                rate_plan = next(
+                    (rp for rp in hotel.rate_plans if rp.room_name == room_type), None)
 
         # 7) 链路选择：道旅酒店 + 有效报价 + 已登录 OAuth → 直接验价
         #    邮箱在验价后的确认环节处理（可用道旅账号常用邮箱，展示后由用户确认）
@@ -959,6 +1046,7 @@ class HotelBookingAgent:
             and str(hotel.hotel_id).startswith("RLG_")
         )
         if room_type and guest_name and real_capable and rlg.is_logged_in():
+            self.state.pending_booking = {}
             draft = {
                 "rate_plan_obj": rate_plan,
                 "room_type": room_type,
@@ -968,14 +1056,19 @@ class HotelBookingAgent:
             return self._do_real_price_confirm(draft)
 
         if room_type and guest_name:
+            self.state.pending_booking = {}
             # 模拟链路（未登录的真实酒店也先落模拟单，并给出登录提示）
             response = self.confirm_booking(room_type, guest_name, rate_plan)
             if real_capable and not rlg.is_logged_in():
                 response += "\n\n" + LOGIN_HINT
             return response
         elif room_type and not guest_name:
+            # 只拿到房型：暂存，等下一轮入住人姓名
+            self.state.pending_booking = {"room_type": room_type, "email_override": email}
             return f"好的，{room_type}。请告诉我入住人姓名。"
-        elif not room_type and guest_name:
+        elif guest_name and not room_type:
+            # 只拿到姓名：暂存，等下一轮房型（避免用户分两条消息时重复询问）
+            self.state.pending_booking = {"guest_name": guest_name, "email_override": email}
             return f"好的，入住人{guest_name}。请回复房型序号或名称选择房型。"
         return None  # 无法解析，返回 None 让主流程处理
 
@@ -986,4 +1079,5 @@ class HotelBookingAgent:
         self.state.selected_hotel = None
         self.state.current_order = None
         self.state.booking_context = {}
+        self.state.pending_booking = {}
         self.state.stage = "intent"
