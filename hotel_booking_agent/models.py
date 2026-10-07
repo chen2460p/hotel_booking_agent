@@ -23,6 +23,7 @@ class RoomRatePlan:
     room_size: str = ""     # 面积（平方米，接口可能给区间）
     on_request: bool = False  # 是否需申请确认（非即时确认）
     rate_plan_id: str = ""  # 报价计划ID（真实下单时需要）
+    image_url: str = ""     # 该房型实拍图直链（道旅 roomInfo.images，无图留空）
 
 
 @dataclass
@@ -45,6 +46,7 @@ class Hotel:
     booking_url: str = ""   # 真实预订页链接
     latitude: float = 0.0   # 纬度（道旅真实酒店有，用于距离/城市校验）
     longitude: float = 0.0  # 经度
+    image_url: str = ""     # 酒店实拍封面图直链（道旅 imageUrl / 高德 photos，无图留空，禁止编造）
 
 
 @dataclass
