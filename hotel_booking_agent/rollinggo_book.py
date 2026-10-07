@@ -8,6 +8,11 @@
   POST {MCP_BASE}/hotelorders        查询订单列表
   POST {MCP_BASE}/hotelorderdetail   查询订单详情
 
+注意：道旅未开放"取消订单"接口（2026-10 实测 MCP tools/list 仅 3 个工具、
+所有 REST 取消路径候选均 404；OAuth scope 里的 hotel:order:cancel 暂无对应
+端点）。真实订单只能引导用户到 rollinggo.cn 订单详情页手动取消，
+助手侧绝不能只在本地标记"已取消"（会造成与网页状态不一致的假象）。
+
 鉴权：OAuth 授权码 + PKCE（client_id=rollinggoskill），通过 rollinggo.store
 中转完成授权。token 与官方 CLI 共享，存放在：
   Windows: %USERPROFILE%\\.hotel-cli\\token.json
