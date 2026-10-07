@@ -329,12 +329,57 @@ def pay_order(order_id: str) -> bool:
     return False
 
 
-def cancel_order(order_id: str) -> bool:
-    """工具6：取消订单（售后场景）"""
-    if order_id in ORDER_DB and ORDER_DB[order_id].status != "cancelled":
-        ORDER_DB[order_id].status = "cancelled"
-        return True
-    return False
+def sync_real_order_status(order: Order) -> None:
+    """
+    道旅真实订单以远端状态为准：本地 ORDER_DB 只是下单时的快照，
+    用户在网页上支付/取消后本地不会自动更新。查询类操作前调用本函数
+    拉一次订单详情同步状态（失败静默，沿用本地快照）。
+    """
+    if order.source != "rollinggo":
+        return
+    try:
+        import rollinggo_book as rlg
+        if not rlg.is_logged_in():
+            return
+        rows = rlg.parse_orders(rlg.get_order_detail(order.order_id))
+        if not rows:
+            return
+        bucket = _order_status_bucket(rows[0])
+        order.status = {"CANCELLED": "cancelled",
+                        "PENDING": "pending"}.get(bucket, "paid")
+    except Exception:
+        pass
+
+
+def cancel_order(order_id: str) -> str:
+    """
+    工具6：取消订单（售后场景）
+    返回："ok" 已取消 / "remote_unsupported" 道旅真实订单无取消接口 / "not_found"
+    """
+    order = ORDER_DB.get(order_id)
+    if order is None or order.status == "cancelled":
+        return "not_found"
+    # 道旅没有开放订单取消接口（MCP 工具与 REST 路径均已实测确认），
+    # 绝不能只在本地标记取消——那会让用户以为订单已取消，实际仍在网页待支付
+    if order.source == "rollinggo":
+        return "remote_unsupported"
+    order.status = "cancelled"
+    return "ok"
+
+
+def real_order_cancel_guide(order_id: str) -> str:
+    """道旅真实订单的取消指引（agent / multi_agent 共用）。"""
+    return (
+        f"订单 {order_id} 是道旅真实订单，道旅暂未开放取消接口，"
+        f"助手无法代为取消（也不会在本地把它标记为已取消，"
+        f"以免和道旅网页状态不一致）。\n"
+        f"请手动取消：\n"
+        f"  1. 打开订单详情页："
+        f"https://rollinggo.cn/pc/#/hotel/detail?subOrderNo={order_id}\n"
+        f"  2. 点击页面右侧【取消订单】按钮\n"
+        f"  3. 是否免费取消以页面【取消政策】的截止时间为准；"
+        f"订单尚未支付的话，不支付就不会扣款"
+    )
 
 
 def get_order_status(order_id: str) -> Optional[Order]:
@@ -501,13 +546,19 @@ def format_hotel_list(hotels: List[Hotel], max_show: int = 5) -> str:
         else:
             rating_text = "暂无评分"
         facilities_str = "、".join(h.facilities[:4]) if h.facilities else "信息待补充"
-        lines.append(
+        block = (
             f"{i}. {h.name}（{star_text}）\n"
             f"   价格：{price_text} | {rating_text}\n"
             f"   地址：{h.address}\n"
             f"   设施：{facilities_str}\n"
             f"   房型：{'、'.join(h.room_types)}"
         )
+        if h.image_url:
+            block += f"\n   实拍图：{h.image_url}"
+        lines.append(block)
     if len(hotels) > max_show:
         lines.append(f"... 还有 {len(hotels) - max_show} 家，可告知更多偏好帮你筛选")
+    # 有真实图片时提示链接可点击（模拟库无实拍图则不提示，避免噪音）
+    if any(h.image_url for h in hotels[:max_show]):
+        lines.append("（实拍图链接可在终端中 Ctrl+点击 打开查看，图片由数据方提供）")
     return "\n".join(lines)
