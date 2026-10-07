@@ -269,6 +269,8 @@ _PICK_ADDR = ("address", "addr", "hotelAddress", "location")
 _PICK_STAR = ("starRating", "star", "starRate", "hotelStar")
 _PICK_RATING = ("guestRating", "rating", "score", "commentScore")
 _PICK_REVIEW = ("reviewCount", "commentCount", "commentNum")
+_PICK_IMAGE = ("imageUrl", "image", "imgUrl", "photoUrl",
+               "coverUrl", "thumbnailUrl", "mainImage")
 
 # tags 中房型标签 → 统一房型名
 _ROOM_TAG_MAP = (
@@ -383,6 +385,7 @@ def _to_hotel(item: dict, city: str) -> Optional[Hotel]:
         booking_url=str(item.get("bookingUrl") or ""),
         latitude=_to_float(item.get("latitude")),
         longitude=_to_float(item.get("longitude")),
+        image_url=str(_pick(item, _PICK_IMAGE, default="") or ""),
     )
 
 
@@ -606,6 +609,32 @@ def _rank_by_location(hotels: List["Hotel"], location: str) -> List["Hotel"]:
 
 # ========== 酒店详情（实时房型报价 / 退改政策）==========
 
+def _extract_room_image(info: dict) -> str:
+    """
+    取房型实拍图。实测 roomInfo.images 为单个 URL 字符串；
+    兼容数组 / 逗号分隔多图（取第一张），无图返回空串。
+    """
+    imgs = info.get("images") if isinstance(info, dict) else None
+    if isinstance(imgs, list):
+        for x in imgs:
+            url = str(x or "").strip()
+            if url:
+                return url
+        return ""
+    if isinstance(imgs, str):
+        s = imgs.strip()
+        if s.startswith("["):
+            try:
+                arr = json.loads(s)
+                if isinstance(arr, list) and arr:
+                    return str(arr[0]).strip()
+            except ValueError:
+                pass
+        # 多图逗号分隔时取第一张（单 URL 不含逗号）
+        return s.split(",")[0].strip() if s else ""
+    return ""
+
+
 def _to_rate_plan(plan: dict) -> RoomRatePlan:
     """把单个 roomRatePlans 报价映射为 RoomRatePlan"""
     info = plan.get("roomInfo") or {}
@@ -620,6 +649,7 @@ def _to_rate_plan(plan: dict) -> RoomRatePlan:
         room_size=str(info.get("size") or ""),
         on_request=bool(plan.get("isOnRequest")),
         rate_plan_id=str(plan.get("ratePlanId") or ""),
+        image_url=_extract_room_image(info),
     )
 
 

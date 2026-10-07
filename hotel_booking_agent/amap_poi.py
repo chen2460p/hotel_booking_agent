@@ -82,6 +82,23 @@ def _build_address(poi: dict) -> str:
     return "".join(result)
 
 
+def _extract_photo(poi: dict) -> str:
+    """
+    取 POI 实拍首图：extensions=all 时高德返回 photos 数组，
+    形如 [{"title": "", "url": "http://1024.../xxx.jpg"}]。无图返回空串。
+    """
+    photos = poi.get("photos")
+    if isinstance(photos, list):
+        for p in photos:
+            if isinstance(p, dict):
+                url = str(p.get("url") or "").strip()
+                if url:
+                    return url
+            elif isinstance(p, str) and p.strip():
+                return p.strip()
+    return ""
+
+
 def _to_hotel(poi: dict, city: str) -> Hotel:
     """把高德 POI 映射成项目统一 Hotel 模型"""
     type_text = poi.get("type", "")
@@ -114,6 +131,7 @@ def _to_hotel(poi: dict, city: str) -> Hotel:
         rating_source="高德地图" if rating > 0 else "",
         latitude=lat,
         longitude=lng,
+        image_url=_extract_photo(poi),
     )
 
 
