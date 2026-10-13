@@ -30,6 +30,7 @@ import re
 import json
 import math
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
@@ -61,6 +62,8 @@ _DIST_FUZZY = 1.0
 
 _notice_shown = False
 _mem_cache: Dict[str, dict] = {}
+_cache_lock = threading.Lock()   # 批量富化 5 线程共享缓存，读写都持锁
+_disk_loaded = False             # 磁盘缓存进程内只懒加载一次
 
 
 # ========== Key 与开关 ==========
@@ -206,11 +209,14 @@ def _save_cache(items: dict) -> None:
 
 def _cached_get(key: str) -> Optional[dict]:
     """返回缓存记录；过期/不存在返回 None。负缓存记录 rating 为 0。"""
-    rec = _mem_cache.get(key)
-    if rec is None:
-        rec = _load_cache().get(key)
-        if rec:
-            _mem_cache[key] = rec
+    global _disk_loaded
+    with _cache_lock:
+        if not _disk_loaded:
+            # 磁盘缓存进程内只读一次：批量富化场景不再逐家整文件 IO
+            for k, v in _load_cache().items():
+                _mem_cache.setdefault(k, v)
+            _disk_loaded = True
+        rec = _mem_cache.get(key)
     # 旧版（v1 百度单源）记录无 source 字段，视为未缓存以便按新双源重查
     if not rec or "source" not in rec:
         return None
@@ -223,13 +229,11 @@ def _cached_get(key: str) -> Optional[dict]:
 def _cache_put(key: str, rec: dict) -> None:
     rec = dict(rec)
     rec["ts"] = int(time.time())
-    _mem_cache[key] = rec
-    try:
-        items = _load_cache()
-        items[key] = rec
-        _save_cache(items)
-    except Exception:
-        pass
+    with _cache_lock:
+        _mem_cache[key] = rec
+        # 以内存全量为准写盘：不再读盘合并，
+        # 消除并发 read-modify-write 后写覆盖先写导致的缓存条目丢失
+        _save_cache(_mem_cache)
 
 
 # ========== 名称归一与双匹配 ==========
