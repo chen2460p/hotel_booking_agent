@@ -3,6 +3,7 @@
 
 from typing import List, Optional
 from datetime import datetime, timedelta
+import time
 import uuid
 
 from models import Hotel, Order, BookingParams
@@ -96,6 +97,19 @@ HOTEL_DB: List[Hotel] = [
 
 # 订单存储（模拟数据库）
 ORDER_DB: dict = {}
+
+# 订单读取节流（进程内即可，CLI 重启归零，无需落盘）：
+# - 远端状态同步：同笔订单 60 秒内不重复拉道旅详情（连续查询不重复打接口）
+# - 历史列表：60 秒内同筛选条件复用结果，下单/支付/取消后主动失效
+_SYNC_TTL = 60
+_HISTORY_TTL = 60
+_ORDER_SYNC_TS: dict = {}      # order_id -> 上次同步尝试时间戳
+_HISTORY_CACHE: dict = {}      # status_filter -> (时间戳, 结果)
+
+
+def _invalidate_history_cache() -> None:
+    """订单写入/状态变更后失效历史列表缓存，保证写后读最新。"""
+    _HISTORY_CACHE.clear()
 
 # 实时搜索结果缓存（道旅/高德）：进程内按 hotel_id 保存最近搜到的真实酒店，
 # 使 get_hotel_detail 也能查到非模拟库的酒店（下单前详情确认等场景）
@@ -282,6 +296,7 @@ def create_order(hotel: Hotel, params: BookingParams,
         status="pending"
     )
     ORDER_DB[order.order_id] = order
+    _invalidate_history_cache()
     return order
 
 
@@ -314,6 +329,7 @@ def create_real_order(hotel: Hotel, params: BookingParams, room_type: str,
         contact_email=contact_email,
     )
     ORDER_DB[order.order_id] = order
+    _invalidate_history_cache()
     return order
 
 
@@ -325,6 +341,7 @@ def pay_order(order_id: str) -> bool:
     """
     if order_id in ORDER_DB:
         ORDER_DB[order_id].status = "paid"
+        _invalidate_history_cache()
         return True
     return False
 
@@ -337,6 +354,11 @@ def sync_real_order_status(order: Order) -> None:
     """
     if order.source != "rollinggo":
         return
+    now = time.time()
+    if now - _ORDER_SYNC_TS.get(order.order_id, 0) < _SYNC_TTL:
+        return
+    # 记录尝试时刻：远端暂时失败时也不会在 TTL 内被连环重试
+    _ORDER_SYNC_TS[order.order_id] = now
     try:
         import rollinggo_book as rlg
         if not rlg.is_logged_in():
@@ -364,6 +386,7 @@ def cancel_order(order_id: str) -> str:
     if order.source == "rollinggo":
         return "remote_unsupported"
     order.status = "cancelled"
+    _invalidate_history_cache()
     return "ok"
 
 
@@ -448,6 +471,11 @@ def list_history_orders(status_filter: str = "ALL") -> dict:
     if flt not in _ORDER_FILTERS:
         flt = "ALL"
 
+    # 60 秒内同筛选条件直接复用上次结果（连续两次"查历史订单"只打一次接口）
+    cached = _HISTORY_CACHE.get(flt)
+    if cached and time.time() - cached[0] < _HISTORY_TTL:
+        return cached[1]
+
     rows: List[dict] = []
     remote_error: Optional[str] = None
     logged_in = False
@@ -479,13 +507,15 @@ def list_history_orders(status_filter: str = "ALL") -> dict:
     if flt != "ALL":
         rows = [r for r in rows if _order_status_bucket(r) == flt]
 
-    return {
+    result = {
         "logged_in": logged_in,
         "source": source,
         "filter": flt,
         "rows": rows,
         "remote_error": remote_error,
     }
+    _HISTORY_CACHE[flt] = (time.time(), result)
+    return result
 
 
 def format_order_rows(rows: List[dict], max_show: int = 10) -> str:
