@@ -29,13 +29,18 @@ except ImportError:
     pass
 
 # 携程图片爬虫回退：道旅无图时从携程详情页爬真实图集。
-# 零依赖（仅 requests + re），30 天磁盘缓存，失败静默返回空列表。
+# 零依赖（仅 requests + re），30 天磁盘缓存，失败静默返回空。
+# 一次请求同时拿酒店封面图集与「房型名→实拍图」映射：
+#   - 封面：Hotel.image_url 缺失且高德也无图时回填
+#   - 房型图：rate_plans 里 roomInfo.images 缺失的条目按名称模糊匹配回填
 # 携程搜索页 SSR 只渲染前 5 家热门酒店，冷门酒店大概率匹配不上，
 # 由 0.85 相似度阈值保证不误匹配给错图。
 try:
-    from ctrip_crawler import enrich_hotel_images as _ctrip_enrich
+    from ctrip_crawler import fetch_all_images as _ctrip_all
+    from ctrip_crawler import match_room_url as _ctrip_match_room
 except ImportError:
-    _ctrip_enrich = None  # 爬虫模块缺失时优雅降级
+    _ctrip_all = None  # 爬虫模块缺失时优雅降级
+    _ctrip_match_room = None
 
 # 国内站默认 .cn；若用的是 global.rollinggo.store 的国际 Key（mcp_ 开头），
 # 可在 .env 设置 ROLLINGGO_MCP_URL=https://mcp.rollinggo.ai/mcp
@@ -713,14 +718,20 @@ def enrich_hotel_detail(hotel: Hotel, check_in: str,
     if isinstance(data, dict) and data.get("bookingUrl"):
         hotel.booking_url = data["bookingUrl"]
 
-    # ----- 携程图片回退：道旅无图时爬携程详情页 -----
-    # 仅对封面图缺失的情况触发（房型图由 _extract_room_image 独立处理）
-    if not hotel.image_url and _ctrip_enrich is not None:
+    # ----- 携程图片回退：封面缺失或任一房型图缺失时，爬一次携程详情页 -----
+    # 一次详情页请求同时拿到封面图集和房型图映射，缓存 30 天
+    need_cover = not hotel.image_url
+    need_rooms = any(not rp.image_url for rp in (hotel.rate_plans or []))
+    if (need_cover or need_rooms) and _ctrip_all is not None:
         try:
-            urls = _ctrip_enrich(hotel)
-            if urls:
-                hotel.image_url = urls[0]
-        except Exception as e:
+            covers, room_map = _ctrip_all(hotel)
+            if need_cover and covers:
+                hotel.image_url = covers[0]
+            if need_rooms and room_map and _ctrip_match_room is not None:
+                for rp in hotel.rate_plans:
+                    if not rp.image_url:
+                        rp.image_url = _ctrip_match_room(rp.room_name, room_map)
+        except Exception:
             # 爬虫网络/解析异常绝不阻塞订房主流程
             pass
 
