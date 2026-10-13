@@ -30,6 +30,14 @@ dist/
 *.bak
 *.swp
 
+# ===== SQLite 数据库 =====
+*.db
+*.db-shm
+*.db-wal
+
+# ===== 运行时缓存（评分/携程图片缓存）=====
+hotel_booking_agent/cache/
+
 # ===== Jupyter =====
 .ipynb_checkpoints/
 

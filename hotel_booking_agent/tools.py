@@ -7,6 +7,7 @@ import time
 import uuid
 
 from models import Hotel, Order, BookingParams
+import storage
 from amap_poi import is_enabled as amap_enabled, search_real_hotels as search_amap_hotels
 from rollinggo_mcp import (
     is_enabled as rollinggo_enabled,
@@ -95,8 +96,10 @@ HOTEL_DB: List[Hotel] = [
     ),
 ]
 
-# 订单存储（模拟数据库）
-ORDER_DB: dict = {}
+# 订单存储：由 storage 模块统一管理（自动回退内存 dict）
+#  - 未配置 DATABASE_URL / SQLite/MySQL 不可用 → 内存（CLI 重启丢失，与原先 ORDER_DB 行为一致）
+#  - 配了且可用 → 真实持久化（SQLite 零依赖 / MySQL 可选）
+# 详见 storage.py
 
 # 订单读取节流（进程内即可，CLI 重启归零，无需落盘）：
 # - 远端状态同步：同笔订单 60 秒内不重复拉道旅详情（连续查询不重复打接口）
@@ -295,7 +298,7 @@ def create_order(hotel: Hotel, params: BookingParams,
         total_price=total,
         status="pending"
     )
-    ORDER_DB[order.order_id] = order
+    storage.insert_order(order)
     _invalidate_history_cache()
     return order
 
@@ -328,7 +331,7 @@ def create_real_order(hotel: Hotel, params: BookingParams, room_type: str,
         payment_url=booking_result.get("payment_url") or "",
         contact_email=contact_email,
     )
-    ORDER_DB[order.order_id] = order
+    storage.insert_order(order)
     _invalidate_history_cache()
     return order
 
@@ -339,11 +342,10 @@ def pay_order(order_id: str) -> bool:
     高危操作——真实场景需要接入支付网关 + 短信验证
     这里模拟支付成功
     """
-    if order_id in ORDER_DB:
-        ORDER_DB[order_id].status = "paid"
+    ok = storage.update_status(order_id, "paid")
+    if ok:
         _invalidate_history_cache()
-        return True
-    return False
+    return ok
 
 
 def sync_real_order_status(order: Order) -> None:
@@ -378,14 +380,14 @@ def cancel_order(order_id: str) -> str:
     工具6：取消订单（售后场景）
     返回："ok" 已取消 / "remote_unsupported" 道旅真实订单无取消接口 / "not_found"
     """
-    order = ORDER_DB.get(order_id)
+    order = storage.get_order(order_id)
     if order is None or order.status == "cancelled":
         return "not_found"
     # 道旅没有开放订单取消接口（MCP 工具与 REST 路径均已实测确认），
     # 绝不能只在本地标记取消——那会让用户以为订单已取消，实际仍在网页待支付
     if order.source == "rollinggo":
         return "remote_unsupported"
-    order.status = "cancelled"
+    storage.update_status(order_id, "cancelled")
     _invalidate_history_cache()
     return "ok"
 
@@ -407,7 +409,7 @@ def real_order_cancel_guide(order_id: str) -> str:
 
 def get_order_status(order_id: str) -> Optional[Order]:
     """工具7：查询订单状态（售后场景）"""
-    return ORDER_DB.get(order_id)
+    return storage.get_order(order_id)
 
 
 # ========== 历史订单列表（道旅真实订单 + 本地内存订单）==========
@@ -495,13 +497,14 @@ def list_history_orders(status_filter: str = "ALL") -> dict:
             remote_error = str(e)
 
         # 补充本地有、远程列表里没有的订单（刚下单未同步 / 模拟单）
+        all_local = storage.list_all_orders()
         remote_ids = {r.get("order_no") for r in rows}
-        for order in ORDER_DB.values():
+        for order in all_local:
             if order.order_id not in remote_ids:
                 rows.append(_local_order_to_row(order))
         source = "rollinggo"
     else:
-        rows = [_local_order_to_row(o) for o in ORDER_DB.values()]
+        rows = [_local_order_to_row(o) for o in storage.list_all_orders()]
         source = "local" if rows else "none"
 
     if flt != "ALL":

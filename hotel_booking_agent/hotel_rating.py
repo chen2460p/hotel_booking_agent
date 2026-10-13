@@ -20,7 +20,7 @@
 #   高德返回 GCJ02、百度返回 BD09，匹配前按数据源做坐标转换
 # - 两家都配置时优先用百度（字段更全），百度未命中再回退高德；
 #   只配置一家也能独立工作
-# - 磁盘缓存（~/.hotel-cli/ratings_cache.json，7 天有效）：评分变化慢，
+# - 磁盘缓存（项目内 cache/ratings_cache.json，7 天有效）：评分变化慢，
 #   避免每次搜索都批量请求；查无结果做 3 天负缓存
 # - 免费接口额度有限，默认只富化列表前 8 家酒店（教学演示足够）
 # - 未配置 Key 或任何调用失败都静默降级为"暂无评分"，绝不阻塞订房主流程
@@ -53,8 +53,53 @@ _MAX_WORKERS = 5                    # 批量富化并发数
 _ENRICH_LIMIT = 8                   # 每次搜索最多富化前 N 家（节省免费额度）
 _CACHE_TTL = 7 * 24 * 3600         # 命中缓存 7 天
 _NEG_CACHE_TTL = 3 * 24 * 3600     # 查无评分 3 天内不再请求
-_CACHE_PATH = os.path.join(os.path.expanduser("~"), ".hotel-cli",
-                           "ratings_cache.json")
+# 缓存放项目内 cache/ 目录（git 已排除）：与携程图片缓存统一存放策略
+_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "cache", "ratings_cache.json")
+
+# ========== QPS 节流（令牌桶，百度/高德各一套，AK 独立） ==========
+# 配额参考：
+#   - 百度地图 服务端 AK：个人认证 2 QPS / 企业认证 5-20 QPS
+#   - 高德地图 Web 服务 AK：个人认证 5 QPS
+# 可在 .env 中覆盖：BAIDU_QPS_LIMIT=3 / AMAP_QPS_LIMIT=5
+import threading as _t
+import time as _t_time
+
+def _qps_from_env(name: str, default: float) -> float:
+    v = os.environ.get(name, "").strip()
+    if not v:
+        return default
+    try:
+        x = float(v)
+        return 0.1 <= x <= 1000.0 and x or default
+    except ValueError:
+        return default
+
+class _TokenBucket:
+    """线程安全令牌桶：每秒补充 qps 个令牌，取令牌时阻塞等待。"""
+    def __init__(self, qps: float):
+        self._qps = qps
+        self._tokens = qps
+        self._last = _t_time.monotonic()
+        self._lock = _t.Lock()
+
+    def acquire(self) -> None:
+        """阻塞到拿到 1 个令牌；线程安全。"""
+        while True:
+            with self._lock:
+                now = _t_time.monotonic()
+                elapsed = now - self._last
+                self._last = now
+                self._tokens = min(self._qps, self._tokens + elapsed * self._qps)
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+            # 没拿到，sleep 100ms 再试；实际平均等待 = 1/qps 秒
+            _t_time.sleep(0.1)
+
+# 两套独立桶（百度/高德 AK 配额各自独立，互不影响）
+_baidu_bucket = _TokenBucket(_qps_from_env("BAIDU_QPS_LIMIT", 2.0))
+_amap_bucket  = _TokenBucket(_qps_from_env("AMAP_QPS_LIMIT", 5.0))
 
 # 名称与坐标双匹配的距离阈值（公里，已预留坐标系转换误差）
 _DIST_EXACT = 3.0
@@ -298,6 +343,7 @@ def _match_candidate(hotel: Hotel, candidates: List[tuple],
 
 def _fetch_amap_pois(hotel: Hotel) -> List[dict]:
     """按酒店名 + 城市做高德文本检索（extensions=all 取 biz_ext.rating）。"""
+    _amap_bucket.acquire()  # ← 节流：高德 AK QPS
     resp = requests.get(
         _AMAP_SEARCH_URL,
         params={
@@ -359,6 +405,7 @@ def _rating_from_amap(hotel: Hotel) -> Optional[dict]:
 
 def _fetch_baidu_pois(hotel: Hotel) -> List[dict]:
     """按酒店名 + 城市做百度文本检索（scope=2 取评价明细）。"""
+    _baidu_bucket.acquire()  # ← 节流：百度 AK QPS
     resp = requests.get(
         _BAIDU_SEARCH_URL,
         params={
