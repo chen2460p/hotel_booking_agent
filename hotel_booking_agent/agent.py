@@ -34,6 +34,9 @@ class HotelBookingAgent:
         """初始化 Agent：加载 LLM 客户端和初始状态"""
         self.llm = LLMClient()
         self.state = AgentState()
+        # 阶段回调（Web SSE 用）：fn(stage_key, text)，CLI 为 None 完全不影响；
+        # 回调异常由 _emit_stage 吞掉，绝不阻塞订房主流程
+        self.on_stage = None
         # 工具注册表——Agent 可调用的所有工具（对应八股中的 Tool 设计）
         self.tools = {
             "search_hotels": search_hotels,
@@ -44,6 +47,14 @@ class HotelBookingAgent:
             "get_order_status": get_order_status,
         }
 
+    def _emit_stage(self, key: str, text: str) -> None:
+        """阶段事件回调（Web SSE 推进度用）；CLI on_stage=None 时零开销。"""
+        if self.on_stage:
+            try:
+                self.on_stage(key, text)
+            except Exception:
+                pass  # 回调失败不影响主流程
+
     def run(self, user_input: str) -> str:
         """
         Agent 主入口——处理用户输入并返回回复
@@ -51,6 +62,7 @@ class HotelBookingAgent:
         """
         # 记录对话历史（短期记忆）
         self.state.conversation_history.append(f"用户：{user_input}")
+        self._emit_stage("thinking", "正在理解你的需求…")
 
         # 真实订单的支付只能由用户打开支付链接完成，任何时候都不能本地标记已支付
         if ("支付" in user_input and self.state.current_order
@@ -124,6 +136,14 @@ class HotelBookingAgent:
         """
         params = self.state.params
 
+        # ===== 阶段0：选房拦截 =====
+        # "订第二家""选3"这类带动词的选择句会被 LLM 判成 book 直冲重新搜索，
+        # 必须先按选房解析；命中即进入下单流程，未命中才继续搜索流程
+        if self.state.stage == "recommend" and self.state.search_results:
+            selection = self._parse_hotel_selection(user_input)
+            if selection:
+                return self._handle_hotel_selection(selection)
+
         # ===== 阶段1：参数澄清（Agent 多轮对话能力）=====
         if not params.is_complete():
             self.state.stage = "clarify"
@@ -135,6 +155,7 @@ class HotelBookingAgent:
         # ===== 阶段2：搜索（Workflow 确定性流程）=====
         # 参数齐全后，不需要 LLM 参与，直接调用搜索工具
         self.state.stage = "search"
+        self._emit_stage("searching", "正在搜索酒店、获取真实评分…")
         results = search_hotels(params)
         self.state.search_results = results
 
@@ -267,6 +288,7 @@ class HotelBookingAgent:
         2) "查历史订单/所有订单/待支付订单" → 历史清单（支持状态筛选）
         3) "查订单/我的订单/订单状态" → 当前会话那笔订单；没有再回退历史清单
         """
+        self._emit_stage("order_query", "正在查询订单状态…")
         order_id = extracted.get("order_id")
 
         # 无订单号：先区分"历史清单"与"当前订单"
@@ -419,12 +441,12 @@ class HotelBookingAgent:
         extracted = extracted or {}
         # 检查是否是在回复酒店选择（用户回复序号选酒店）
         if self.state.stage == "recommend" and self.state.search_results:
-            selection = self._parse_hotel_selection(user_input)
+            selection = self._parse_hotel_selection(user_input, allow_bare_number=True)
             if selection:
                 return self._handle_hotel_selection(selection)
-            # 用户输入了数字但超出范围，给出提示
+            # 用户输入了序数（阿拉伯/中文数字）但超出范围，给出提示
             import re
-            if re.search(r'\d+', user_input):
+            if re.search(r'\d+|[一二三四五六七八九十]', user_input):
                 total = len(self.state.search_results)
                 return f"请输入 1-{total} 之间的序号，或直接告诉我酒店名称。当前共有 {total} 家酒店可选。"
 
@@ -484,18 +506,41 @@ class HotelBookingAgent:
             "告诉我你的需求吧。"
         )
 
-    def _parse_hotel_selection(self, user_input: str) -> Optional[Hotel]:
+    # 选择句模式：动词(订/选/要/来/住) + 序数（阿拉伯/中文数字），
+    # 避免裸数字把"10月20日"这类日期误当序号
+    _SELECT_MARK = re.compile(
+        r'(?:订|选|要|来|住)\s*第?\s*([一二三四五六七八九十]|\d{1,2})\s*[家号个]?')
+    _CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+               "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+    def _parse_hotel_selection(self, user_input: str,
+                               allow_bare_number: bool = False) -> Optional[Hotel]:
         """
         解析用户的酒店选择（回复序号或酒店名）
         这是 Agent 的"理解"能力——从自然语言中解析用户选择
+
+        allow_bare_number：是否接受纯序号（如"2"）。仅在选房确认场景
+        （_handle_chat，用户正对着列表回复）开启；搜索拦截场景必须关闭，
+        否则"换上海10月20日"里的"10"会被当成第10家。
         """
-        import re
-        # 尝试解析序号
-        num_match = re.search(r'(\d+)', user_input)
-        if num_match:
-            idx = int(num_match.group(1)) - 1
+        # 尝试解析序号：只用"订/选/要/来/住 + 序数"模式捕获的数字，
+        # 不裸搜全文数字（防止"10月20日"被当成第10家）
+        m = self._SELECT_MARK.search(user_input)
+        if m:
+            raw = m.group(1)
+            idx = (int(raw) if raw.isdigit() else self._CN_NUM.get(raw, 0)) - 1
             if 0 <= idx < len(self.state.search_results):
                 return self.state.search_results[idx]
+            return None
+
+        # 纯序号（如"2"）：仅选房确认场景
+        if allow_bare_number:
+            t = user_input.strip()
+            if re.fullmatch(r"\d{1,3}", t):
+                idx = int(t) - 1
+                if 0 <= idx < len(self.state.search_results):
+                    return self.state.search_results[idx]
+                return None
 
         # 尝试匹配酒店名
         for hotel in self.state.search_results:
@@ -517,6 +562,7 @@ class HotelBookingAgent:
 
         p = self.state.params
         # 实时详情：各房型的含早/退改报价
+        self._emit_stage("pricing", "正在获取实时房型报价…")
         live_detail = get_hotel_detail(
             hotel.hotel_id, p.check_in, p.check_out)
         if live_detail is not None:

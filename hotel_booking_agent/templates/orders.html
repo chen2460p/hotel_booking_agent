@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>历史订单 · 酒店预订 Agent</title>
+<style>
+  body { font-family: "Microsoft YaHei", system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 16px; }
+  h1 { color: #2c3e50; }
+  .topbar { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; font-size: 13px; color: #666; }
+  .topbar a { color: #2980b9; text-decoration: none; }
+  .tag { background: #ecf0f1; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
+  th, td { border-bottom: 1px solid #eee; padding: 8px 10px; text-align: left; }
+  th { background: #f8f9fa; color: #555; }
+  tr:hover td { background: #fafbfc; }
+  .status-pending { color: #e67e22; }
+  .status-paid    { color: #27ae60; }
+  .status-cancel  { color: #95a5a6; text-decoration: line-through; }
+  .btn { padding: 4px 12px; background: #2980b9; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; margin-right: 6px; }
+  .btn:hover { background: #1e6fa0; }
+  .btn.danger { background: #c0392b; }
+  .btn.danger:hover { background: #a93226; }
+  .pay-link { color: #e67e22; }
+  .empty { text-align: center; padding: 40px; color: #999; }
+  .filter { margin-top: 12px; }
+  .filter a { display: inline-block; padding: 4px 12px; margin-right: 6px; border: 1px solid #ddd; border-radius: 14px; text-decoration: none; color: #555; font-size: 13px; }
+  .filter a.active { background: #2980b9; color: #fff; border-color: #2980b9; }
+</style>
+</head>
+<body>
+<h1>📋 历史订单</h1>
+<div class="topbar">
+  <span class="tag">存储：{{ storage_backend }}</span>
+  <a href="/">← 返回聊天</a>
+</div>
+
+<div class="filter">
+  <a class="{{ 'active' if current_filter=='ALL' else '' }}" href="/orders?filter=ALL">全部</a>
+  <a class="{{ 'active' if current_filter=='PENDING' else '' }}" href="/orders?filter=PENDING">待支付</a>
+  <a class="{{ 'active' if current_filter=='FINISHED' else '' }}" href="/orders?filter=FINISHED">已完成</a>
+  <a class="{{ 'active' if current_filter=='CANCELLED' else '' }}" href="/orders?filter=CANCELLED">已取消</a>
+</div>
+
+<div id="table_container"></div>
+
+<script>
+async function loadOrders() {
+  const urlParams = new URLSearchParams(window.location.search);
+  const current_filter = urlParams.get("filter") || "ALL";
+  const r = await fetch(`/api/orders?filter=${current_filter}`);
+  const data = await r.json();
+  const rows = data.rows || [];
+
+  const container = document.getElementById("table_container");
+  if (!rows.length) {
+    container.innerHTML = `<div class="empty">暂无${current_filter}订单</div>`;
+    return;
+  }
+
+  let html = `<table>
+    <tr><th>订单号</th><th>酒店</th><th>房型</th><th>入住</th><th>总价</th><th>状态</th><th>来源</th><th>操作</th></tr>`;
+  for (const o of rows) {
+    const status = o.status_text || o.status;
+    const cls = o.status === "pending" ? "status-pending" :
+                o.status === "cancelled" ? "status-cancel" : "status-paid";
+    let action = "";
+    if (o.status === "pending") {
+      if (o.source === "rollinggo" && o.payment_url) {
+        action += `<a class="pay-link" target="_blank" href="${o.payment_url}">去支付</a>`;
+      } else if (o.source === "mock") {
+        action += `<button class="btn" onclick="pay('${o.order_no}')">标记支付</button>`;
+        action += `<button class="btn danger" onclick="cancel('${o.order_no}')">取消</button>`;
+      }
+    }
+    html += `<tr>
+      <td>${o.order_no}</td>
+      <td>${o.hotel_name}</td>
+      <td>${o.room_name || '-'}</td>
+      <td>${o.check_in || '?'} → ${o.check_out || '?'}</td>
+      <td>${o.total_price} ${o.currency || 'CNY'}</td>
+      <td class="${cls}">${status}</td>
+      <td>${o.source === "rollinggo" ? '【道旅】' : '本地'}</td>
+      <td>${action || '-'}</td>
+    </tr>`;
+  }
+  html += `</table>`;
+  container.innerHTML = html;
+}
+
+async function pay(id) {
+  if (!confirm(`确认标记订单 ${id} 为已支付？`)) return;
+  const r = await fetch(`/api/orders/${id}/pay`, {method: "POST"});
+  alert((await r.json()).ok ? "已标记支付" : "操作失败");
+  loadOrders();
+}
+async function cancel(id) {
+  if (!confirm(`确认取消订单 ${id}？`)) return;
+  const r = await fetch(`/api/orders/${id}/cancel`, {method: "POST"});
+  const d = await r.json();
+  if (d.ok) { alert("已取消"); loadOrders(); }
+  else if (d.reason === "remote_unsupported") { alert(d.guide || "道旅真实订单请手动在网页取消"); }
+  else { alert("操作失败"); }
+}
+
+loadOrders();
+</script>
+</body>
+</html>

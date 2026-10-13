@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>酒店预订 Agent · Web 版</title>
+<style>
+  body { font-family: "Microsoft YaHei", system-ui, sans-serif; max-width: 780px; margin: 0 auto; padding: 16px; }
+  h1 { color: #2c3e50; }
+  .topbar { display: flex; gap: 12px; margin-bottom: 12px; font-size: 13px; color: #666; }
+  .topbar a { color: #2980b9; text-decoration: none; }
+  .topbar a:hover { text-decoration: underline; }
+  .tag { background: #ecf0f1; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+  .tag.mem { background: #ffeaa7; color: #b8860b; }
+  .tag.sql { background: #dff0d8; color: #2d6a4f; }
+  .tag.mys { background: #fce4ec; color: #c2185b; }
+  #chatbox { height: 500px; overflow-y: auto; border: 1px solid #ddd; border-radius: 8px; padding: 12px; background: #fafafa; margin-bottom: 12px; white-space: pre-wrap; font-size: 14px; }
+  #chatbox .user { text-align: right; margin: 6px 0; }
+  #chatbox .user span { background: #3498db; color: #fff; padding: 6px 10px; border-radius: 8px; display: inline-block; max-width: 80%; }
+  #chatbox .bot { margin: 6px 0; }
+  #chatbox .bot span { background: #fff; border: 1px solid #e0e0e0; padding: 6px 10px; border-radius: 8px; display: inline-block; max-width: 85%; }
+  #chatbox .sys { text-align: center; color: #aaa; font-size: 12px; margin: 8px 0; }
+  #chatbox .bot.status span { background: #f8f9fa; color: #7f8c8d; font-style: italic; border-style: dashed; }
+  #chatbox .bot a { color: #2980b9; word-break: break-all; }
+  #chatbox .bot .chat-img { display: block; max-width: 280px; max-height: 190px; border-radius: 8px; margin: 6px 0; cursor: zoom-in; border: 1px solid #e0e0e0; min-height: 56px; background: #f5f6f7; }
+  #inputrow { display: flex; gap: 8px; }
+  #inputrow textarea { flex: 1; height: 64px; padding: 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; resize: none; }
+  #inputrow button { padding: 0 20px; background: #2980b9; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  #inputrow button:disabled { background: #95a5a6; cursor: not-allowed; }
+  .example { font-size: 12px; color: #888; margin-top: 8px; }
+</style>
+</head>
+<body>
+<h1>🏨 酒店预订 Agent</h1>
+<div class="topbar">
+  <span class="tag {{ 'mem' if storage_backend == 'memory' else ('sql' if storage_backend == 'sqlite' else 'mys') }}">
+    存储：{{ storage_backend }}（{{ '真实持久化' if storage_enabled else '内存回退' }}）
+  </span>
+  <a href="/orders">📋 查看历史订单</a>
+</div>
+
+<div id="chatbox">
+  <div class="sys">👋 你好！告诉我想订哪的酒店就行，例如"帮我订下周末三亚海景房，预算 1000 以内"。</div>
+</div>
+
+<div id="inputrow">
+  <textarea id="input" placeholder="输入你的需求…（Enter 发送，Shift+Enter 换行）"></textarea>
+  <button id="send">发送</button>
+</div>
+<div class="example">
+  提示：多轮对话已支持（同一浏览器会话保持搜索/选房状态）；重启 Web 进程会话重置。图片与链接可直接点击，等待期间可看到实时进度（理解需求 → 搜索酒店 → 获取报价）。
+</div>
+
+<script>
+const chatbox = document.getElementById("chatbox");
+const input   = document.getElementById("input");
+const send    = document.getElementById("send");
+
+// ---------- 会话标识：localStorage 持久化，同一浏览器刷新/重开不丢会话 ----------
+let sessionId = localStorage.getItem("hb_session_id");
+if (!sessionId) {
+  sessionId = (crypto.randomUUID ? crypto.randomUUID()
+                                  : "s-" + Date.now() + "-" + Math.random().toString(36).slice(2));
+  localStorage.setItem("hb_session_id", sessionId);
+}
+
+// ---------- 富文本渲染：URL → 内嵌图片 / 可点链接（DOM API 拼装，无 XSS 风险）----------
+const URL_RE   = /https?:\/\/[^\s，。；、！？（）)】"'<>]+/g;
+const IMG_RE   = /\.(jpe?g|png|webp|gif)[^\s]*$/i;   // 扩展名后允许 CDN 尾巴（如 .jpg-t、?x-oss-…）
+
+// ---------- 图片串行加载队列 ----------
+// 道旅 CDN 有突发并发风控：实测 8 张同时请求 → 5 张 403。
+// 改为逐张加载（失败重试 1 次），彻底避开限流窗口。
+const _imgQueue = [];
+let _imgBusy = false;
+
+function _enqueueImg(img, url) {
+  _imgQueue.push([img, url]);
+  _pumpImg();
+}
+
+function _pumpImg() {
+  if (_imgBusy || !_imgQueue.length) return;
+  _imgBusy = true;
+  const [img, url] = _imgQueue.shift();
+  const finish = () => { _imgBusy = false; _pumpImg(); };
+  img.onload = finish;
+  img.onerror = () => {
+    if (+(img.dataset.retry || 0) < 1) {          // 403 是临时风控，稍候重试一次
+      img.dataset.retry = "1";
+      setTimeout(() => { img.src = url; }, 800);
+      return;                                     // 不 finish，重试结果出来再放行
+    }
+    const a = document.createElement("a");        // 仍失败：退化为可点链接
+    a.href = url; a.target = "_blank"; a.rel = "noopener"; a.textContent = url;
+    img.replaceWith(a);
+    finish();
+  };
+  img.src = url;
+}
+
+function renderRich(span, text) {
+  // 按 URL 分段：普通文本走 textNode，图片 URL 渲染 <img>，其余渲染 <a>
+  span.textContent = "";
+  let last = 0, m;
+  URL_RE.lastIndex = 0;
+  while ((m = URL_RE.exec(text)) !== null) {
+    if (m.index > last) {
+      span.appendChild(document.createTextNode(text.slice(last, m.index)));
+    }
+    const url = m[0];
+    if (IMG_RE.test(url)) {
+      const img = document.createElement("img");
+      img.className = "chat-img";
+      img.alt = "酒店实拍图";
+      img.onclick = () => window.open(url, "_blank");
+      _enqueueImg(img, url);          // 串行队列加载，失败重试后仍败则退化 <a>
+      span.appendChild(img);
+    } else {
+      const a = document.createElement("a");
+      a.href = url; a.target = "_blank"; a.rel = "noopener";
+      a.textContent = "🔗 " + url;
+      span.appendChild(a);
+    }
+    last = m.index + url.length;
+  }
+  if (last < text.length) {
+    span.appendChild(document.createTextNode(text.slice(last)));
+  }
+}
+
+function append(cls, text, rich) {
+  const div = document.createElement("div");
+  div.className = cls;
+  const span = document.createElement("span");
+  if (rich) { renderRich(span, text); }
+  else      { span.textContent = text; }
+  div.appendChild(span);
+  chatbox.appendChild(div);
+  chatbox.scrollTop = chatbox.scrollHeight;
+  return div;
+}
+
+async function sendMsg() {
+  const text = input.value.trim();
+  if (!text) return;
+  append("user", text);
+  input.value = "";
+  send.disabled = true;
+  // 状态条：SSE stage 事件实时更新文案（理解需求 → 搜索酒店 → 获取报价）
+  const status = append("bot", "正在连接助手…");
+  status.classList.add("status");
+  try {
+    const r = await fetch("/api/chat/stream", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({user_input: text, session_id: sessionId}),
+    });
+    if (!r.ok || !r.body) throw new Error("HTTP " + r.status);
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "", reply = null, currentOrder = "", errMsg = null;
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {   // SSE 帧以空行分隔
+        const block = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        let ev = "message", data = "";
+        for (const line of block.split("\n")) {
+          if (line.startsWith("event:")) ev = line.slice(6).trim();
+          else if (line.startsWith("data:")) data += line.slice(5).trim();
+        }
+        if (!data) continue;
+        const d = JSON.parse(data);
+        if (ev === "stage") {
+          status.querySelector("span").textContent = "⏳ " + d.text;
+        } else if (ev === "result") {
+          reply = d.reply;
+          currentOrder = d.current_order;
+          if (d.session_id && d.session_id !== sessionId) {
+            sessionId = d.session_id;
+            localStorage.setItem("hb_session_id", sessionId);
+          }
+        } else if (ev === "error") {
+          errMsg = d.message;
+        }
+      }
+    }
+    status.remove();
+    if (errMsg) append("bot", "❌ " + errMsg);
+    else if (reply !== null) {
+      append("bot", reply, true);
+      if (currentOrder) append("sys", "📌 " + currentOrder);
+    } else append("bot", "(连接中断，未收到完整回复)");
+  } catch (e) {
+    status.remove();
+    append("bot", "❌ 请求失败：" + e.message);
+  } finally {
+    send.disabled = false;
+    input.focus();
+  }
+}
+
+send.onclick = sendMsg;
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); }
+});
+</script>
+</body>
+</html>
