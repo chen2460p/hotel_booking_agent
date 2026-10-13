@@ -244,8 +244,13 @@ async def health():
 
 
 if __name__ == "__main__":
+    import threading
+    import webbrowser
+
     import uvicorn
     print(f"storage_backend={storage.storage_backend()}  "
           f"(SQLite/MySQL 可用={storage.storage_available()})")
     print("启动 Web 服务… http://127.0.0.1:8000")
+    # 服务就绪后自动打开浏览器
+    threading.Timer(1.5, webbrowser.open, args=("http://127.0.0.1:8000/",)).start()
     uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
