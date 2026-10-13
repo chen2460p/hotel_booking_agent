@@ -28,6 +28,15 @@ try:
 except ImportError:
     pass
 
+# 携程图片爬虫回退：道旅无图时从携程详情页爬真实图集。
+# 零依赖（仅 requests + re），30 天磁盘缓存，失败静默返回空列表。
+# 携程搜索页 SSR 只渲染前 5 家热门酒店，冷门酒店大概率匹配不上，
+# 由 0.85 相似度阈值保证不误匹配给错图。
+try:
+    from ctrip_crawler import enrich_hotel_images as _ctrip_enrich
+except ImportError:
+    _ctrip_enrich = None  # 爬虫模块缺失时优雅降级
+
 # 国内站默认 .cn；若用的是 global.rollinggo.store 的国际 Key（mcp_ 开头），
 # 可在 .env 设置 ROLLINGGO_MCP_URL=https://mcp.rollinggo.ai/mcp
 _MCP_URL = os.environ.get(
@@ -703,4 +712,16 @@ def enrich_hotel_detail(hotel: Hotel, check_in: str,
         hotel.price_per_night = plans[0].price_per_night
     if isinstance(data, dict) and data.get("bookingUrl"):
         hotel.booking_url = data["bookingUrl"]
+
+    # ----- 携程图片回退：道旅无图时爬携程详情页 -----
+    # 仅对封面图缺失的情况触发（房型图由 _extract_room_image 独立处理）
+    if not hotel.image_url and _ctrip_enrich is not None:
+        try:
+            urls = _ctrip_enrich(hotel)
+            if urls:
+                hotel.image_url = urls[0]
+        except Exception as e:
+            # 爬虫网络/解析异常绝不阻塞订房主流程
+            pass
+
     return hotel
