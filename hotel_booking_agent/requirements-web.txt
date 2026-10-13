@@ -1,0 +1,11 @@
+# Web 入口依赖（CLI 入口 main.py / main_multi.py 不需要这些）
+fastapi>=0.110
+uvicorn[standard]>=0.27
+jinja2>=3.1
+
+# 项目运行基础依赖（CLI + Web 通用）
+requests>=2.28
+python-dotenv>=1.0
+
+# 可选：MySQL 后端（配了 DATABASE_URL=mysql+pymysql://... 才需要）
+# pymysql>=1.1
