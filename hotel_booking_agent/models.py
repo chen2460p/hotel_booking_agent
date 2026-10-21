@@ -47,6 +47,8 @@ class Hotel:
     latitude: float = 0.0   # 纬度（道旅真实酒店有，用于距离/城市校验）
     longitude: float = 0.0  # 经度
     image_url: str = ""     # 酒店实拍封面图直链（道旅 imageUrl / 高德 photos，无图留空，禁止编造）
+    distance_m: int = 0     # 距搜索地标的直线距离（米，道旅 distanceInMeters，0 表示未知）
+    distance_to: str = ""   # 距离参照的地标名，如 "沈阳故宫"
 
 
 @dataclass

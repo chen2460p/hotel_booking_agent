@@ -579,10 +579,15 @@ def format_hotel_list(hotels: List[Hotel], max_show: int = 5) -> str:
         else:
             rating_text = "暂无评分"
         facilities_str = "、".join(h.facilities[:4]) if h.facilities else "信息待补充"
+        distance_text = ""
+        if h.distance_m and h.distance_to:
+            # 距离由数据方给出，取整到 10 米，避免伪精确
+            dist_m = int(round(h.distance_m / 10.0) * 10)
+            distance_text = f"\n   距离：距{h.distance_to}约{dist_m}米"
         block = (
             f"{i}. {h.name}（{star_text}）\n"
             f"   价格：{price_text} | {rating_text}\n"
-            f"   地址：{h.address}\n"
+            f"   地址：{h.address}{distance_text}\n"
             f"   设施：{facilities_str}\n"
             f"   房型：{'、'.join(h.room_types)}"
         )

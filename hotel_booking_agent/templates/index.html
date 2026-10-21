@@ -2,6 +2,9 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<!-- 道旅图片 CDN 有防盗链：带 127.0.0.1 的 Referer 会 403 AccessDenied，
+     全页不发 Referer，图片和点击打开的新标签页才能正常加载 -->
+<meta name="referrer" content="no-referrer">
 <title>酒店预订 Agent · Web 版</title>
 <style>
   body { font-family: "Microsoft YaHei", system-ui, sans-serif; max-width: 780px; margin: 0 auto; padding: 16px; }
@@ -91,7 +94,7 @@ function _pumpImg() {
       return;                                     // 不 finish，重试结果出来再放行
     }
     const a = document.createElement("a");        // 仍失败：退化为可点链接
-    a.href = url; a.target = "_blank"; a.rel = "noopener"; a.textContent = url;
+    a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = url;
     img.replaceWith(a);
     finish();
   };
@@ -112,12 +115,13 @@ function renderRich(span, text) {
       const img = document.createElement("img");
       img.className = "chat-img";
       img.alt = "酒店实拍图";
-      img.onclick = () => window.open(url, "_blank");
+      img.referrerPolicy = "no-referrer";
+      img.onclick = () => window.open(url, "_blank", "noopener,noreferrer");
       _enqueueImg(img, url);          // 串行队列加载，失败重试后仍败则退化 <a>
       span.appendChild(img);
     } else {
       const a = document.createElement("a");
-      a.href = url; a.target = "_blank"; a.rel = "noopener";
+      a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer";
       a.textContent = "🔗 " + url;
       span.appendChild(a);
     }
