@@ -19,7 +19,7 @@ from tools import (
     format_hotel_list, list_history_orders, format_order_rows,
     sync_real_order_status, real_order_cancel_guide,
 )
-from llm import LLMClient
+from llm import LLMClient, shift_date
 from rag import get_rag
 
 
@@ -580,7 +580,15 @@ class SupervisorAgent:
 
         # ===== Step 1：意图理解（Supervisor 的核心能力）=====
         intent, extracted = self.llm.extract_intent_and_params(user_input)
-        self._merge_params(extracted)
+        self._merge_params(extracted, user_input)
+
+        # 澄清阶段用户只补一句"24号""住三天"时，常被判成闲聊；
+        # 只要带了预订参数就继续走预订流程，避免追问后又被踢回帮助菜单
+        if intent == "chat" and self.shared_state.stage == "clarify" and any(
+                k in extracted for k in
+                ("city", "check_in", "check_out", "_nights", "min_star",
+                 "max_price", "facilities", "location")):
+            intent = "book"
 
         # ===== Step 2：根据意图分发任务给对应 Worker =====
         if intent in ("book", "search"):
@@ -975,15 +983,26 @@ class SupervisorAgent:
                 return hotel
         return None
 
-    def _merge_params(self, extracted: dict):
+    def _merge_params(self, extracted: dict, user_input: str = ""):
         """合并提取的参数到共享状态"""
         p = self.shared_state.params
         if "city" in extracted:
             p.city = extracted["city"]
         if "check_in" in extracted:
-            p.check_in = extracted["check_in"]
+            new_ci = extracted["check_in"]
+            # 已有入住日期、正等离店日期时，用户只回一个日期（"27号""后天"）
+            # 应落到 check_out；否则会覆盖入住日期，导致反复追问离店日期
+            wants_check_in = any(w in user_input for w in ("入住", "改到", "提前", "推迟"))
+            if (p.check_in and not p.check_out and new_ci > p.check_in
+                    and "check_out" not in extracted and not wants_check_in):
+                p.check_out = new_ci
+            else:
+                p.check_in = new_ci
         if "check_out" in extracted:
             p.check_out = extracted["check_out"]
+        # 用户只说"住三天"时，用已有的入住日期推算离店日期
+        if extracted.get("_nights") and p.check_in and not p.check_out:
+            p.check_out = shift_date(p.check_in, int(extracted["_nights"]))
         if "min_star" in extracted:
             p.min_star = extracted["min_star"]
         if "max_price" in extracted:

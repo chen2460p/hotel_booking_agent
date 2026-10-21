@@ -184,6 +184,9 @@ _POI_TYPE_RULES = (
     ("故宫", "景点"), ("会展中心", "景点"), ("体育中心", "景点"),
     ("大学城", "景点"), ("步行街", "景点"), ("商业街", "景点"), ("商圈", "景点"),
     ("广场", "景点"), ("公园", "景点"), ("夜市", "景点"), ("老街", "景点"),
+    # "中街""太原街""春熙路"这类具体街道没有类型后缀，也按地标处理，
+    # 否则会退化成城市搜索，拿不到 distanceInMeters，无法展示距离
+    ("街", "景点"), ("路", "景点"), ("大道", "景点"),
     ("海滩", "景点"), ("沙滩", "景点"), ("海边", "景点"), ("湖边", "景点"),
     ("江边", "景点"), ("湾", "景点"),
 )
@@ -549,15 +552,36 @@ def search_real_hotels(params: BookingParams, size: int = 20) -> List[Hotel]:
         # 全部被剔说明锚点不可信（如小县城地标坐标稀疏），退回未剔集合
         same = kept or same
 
-    hotels = [h for h in (_to_hotel(it, params.city) for it in same) if h]
+    hotels = []
+    for it in same:
+        h = _to_hotel(it, params.city)
+        if not h:
+            continue
+        # 道旅已按 POI 返回每条酒店的直线距离（米），直接透传，无需再估算锚点
+        if poi:
+            dist = _to_float(it.get("distanceInMeters"))
+            if dist:
+                h.distance_m = int(round(dist))
+                h.distance_to = poi[0]
+        hotels.append(h)
 
     # 预算服务端已筛，本地兜底无价/波动
     if params.max_price:
         hotels = [h for h in hotels
                   if h.price_per_night <= 0 or h.price_per_night <= params.max_price]
 
-    # 排序：地标词命中优先 → 距市中心近优先（稳定保序）
-    if city_coord:
+    # 排序：
+    # 1) 有 POI 距离时——距离近的在前，距离未知（0）沉底，同距离再看地标词命中
+    # 2) 无 POI 距离时——沿用原规则：地标词命中优先 → 距市中心近优先
+    if poi and any(h.distance_m for h in hotels):
+        indexed = sorted(
+            enumerate(hotels),
+            key=lambda pair: (pair[1].distance_m == 0,
+                              pair[1].distance_m,
+                              _location_hit(pair[1], loc_keys) == 0,
+                              pair[0]))
+        hotels = [h for _, h in indexed]
+    elif city_coord:
         def _dist(h):
             return haversine_km(h.latitude, h.longitude, *city_coord) \
                 if h.latitude and h.longitude else 9999.0

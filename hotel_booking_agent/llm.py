@@ -9,6 +9,7 @@
 import os
 import re
 import json
+from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
 # 从 .env 文件加载环境变量（优先脚本所在目录，兼容从其他工作目录启动）
@@ -31,15 +32,26 @@ _NAME_DENY_WORDS = (
 )
 
 
+def shift_date(check_in: str, days: int) -> Optional[str]:
+    """在 YYYY-MM-DD 日期上加减天数；解析失败返回 None。"""
+    try:
+        return (datetime.strptime(check_in, "%Y-%m-%d") + timedelta(days=days)).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
 class LLMClient:
     """LLM 客户端——封装意图理解和参数提取能力"""
 
     def __init__(self):
         """初始化时检测是否有 API Key，自动选择模式"""
         self.api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+        # qwen-turbo 免费额度耗尽时接口会返回 429 Throttling.RateQuota，
+        # 默认换成额度更充足的 qwen-plus；可用 .env 的 DASHSCOPE_MODEL 覆盖
+        self.model = os.environ.get("DASHSCOPE_MODEL", "qwen-plus")
         self.use_real_llm = bool(self.api_key)
         if self.use_real_llm:
-            print("[系统] 检测到 DASHSCOPE_API_KEY，使用真实 LLM 模式")
+            print(f"[系统] 检测到 DASHSCOPE_API_KEY，使用真实 LLM 模式（模型：{self.model}）")
             try:
                 import dashscope
                 dashscope.api_key = self.api_key
@@ -71,7 +83,11 @@ class LLMClient:
 
     def _extract_with_llm(self, user_input: str) -> Tuple[str, dict]:
         """用真实 LLM 提取意图和参数"""
-        prompt = f"""你是一个酒店预订助手的意图识别模块。今天是2026-10-03（周六）。
+        today = datetime.now()
+        weekday_cn = "一二三四五六日"[today.weekday()]
+        tomorrow = today + timedelta(days=1)
+        day_after = today + timedelta(days=2)
+        prompt = f"""你是一个酒店预订助手的意图识别模块。今天是{today:%Y-%m-%d}（周{weekday_cn}）。
 请从用户输入中提取意图和参数，严格以 JSON 格式返回，只返回 JSON 不要其他文字。
 
 用户输入：{user_input}
@@ -87,21 +103,29 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
 - location 只放城市以下的位置修饰（行政区、商圈、地标、路名及"附近/周边/市中心"等），
   城市本身放 city；例如"成都市中心春熙路步行街附近"→city="成都"、location="市中心春熙路步行街附近"。
 - check_in 和 check_out 必须转换成 YYYY-MM-DD 格式的具体日期。
-  口语日期换算示例（今天是2026-10-03周六）："这周末"→check_in=2026-10-10、check_out=2026-10-11；"下周末"→2026-10-17/2026-10-18；"明天"→2026-10-04；"后天"→2026-10-05。
-  如果提供了"住N晚"，用入住日期推算离店日期。
+  口语日期换算示例（今天是{today:%Y-%m-%d}周{weekday_cn}）："明天"→check_in={tomorrow:%Y-%m-%d}；"后天"→check_in={day_after:%Y-%m-%d}；"这周末"→本周六/周日；"下周末"→下周六/周日。
+  用户只说"24号"这类只有日、没有月份的表达时，换算成不早于今天的最近一个24号（本月该日已过则算下月）。
+  如果提供了"住N晚""住N天"（N可能是中文数字，如"三天"），用入住日期推算离店日期。
 - city 是城市中文名，例如"沈阳"→"沈阳"。
 - max_price 是数字（元/晚）。
 - 无法确定的字段不要填，不要编造。
 
-示例返回：{{"intent":"book","city":"沈阳","check_in":"2026-10-17","check_out":"2026-10-18","max_price":1000}}"""
+示例返回：{{"intent":"book","city":"沈阳","check_in":"{tomorrow:%Y-%m-%d}","check_out":"{day_after:%Y-%m-%d}","max_price":1000}}"""
 
         try:
             response = self.dashscope.Generation.call(
-                model="qwen-turbo",
+                model=self.model,
                 prompt=prompt,
                 result_format="message",
                 response_format={"type": "json_object"}
             )
+            # 限流/鉴权失败时 output 为 None，直接取 .choices 会报无意义的
+            # 'NoneType' object has no attribute 'choices'，这里打印真实原因
+            if getattr(response, "output", None) is None:
+                print(f"[LLM 调用失败] status={getattr(response, 'status_code', None)} "
+                      f"code={getattr(response, 'code', None)} "
+                      f"message={getattr(response, 'message', None)}，回退规则引擎")
+                return self._extract_with_rules(user_input)
             text = response.output.choices[0].message.content
             # 尝试解析 JSON
             json_match = re.search(r'\{.*\}', text, re.DOTALL)
@@ -109,6 +133,10 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
                 data = json.loads(json_match.group())
                 intent = data.get("intent", "chat")
                 params = {k: v for k, v in data.items() if k != "intent" and v}
+                # LLM 对"24号""住三天"这类口语日期容易漏提，用规则引擎补齐缺失字段
+                _, rule_params = self._extract_with_rules(user_input)
+                for k, v in rule_params.items():
+                    params.setdefault(k, v)
                 return intent, params
         except Exception as e:
             print(f"[LLM 调用失败，回退规则引擎] {e}")
@@ -211,14 +239,72 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
         elif len(dates) == 1:
             params["check_in"] = f"{dates[0][0]}-{int(dates[0][1]):02d}-{int(dates[0][2]):02d}"
 
-        # 2. 口语化日期：下周三、这周末、明天等
-        from datetime import datetime, timedelta
         today = datetime.now()
 
-        if "明天" in text and "check_in" not in params:
-            params["check_in"] = (today + timedelta(days=1)).strftime("%Y-%m-%d")
-        if "后天" in text and "check_in" not in params:
-            params["check_in"] = (today + timedelta(days=2)).strftime("%Y-%m-%d")
+        def _future_month_day(month: int, day: int) -> Optional[datetime]:
+            """（月, 日）落到不早于今天的最近日期，跨年时取明年。非法日期返回 None。"""
+            for year in (today.year, today.year + 1):
+                try:
+                    d = datetime(year, month, day)
+                except ValueError:
+                    return None
+                if d.date() >= today.date():
+                    return d
+            return None
+
+        def _future_day_only(day: int) -> Optional[datetime]:
+            """只有"24号"这种日：本月该日已过则算下月。"""
+            year, month = today.year, today.month
+            if day < today.day:
+                month += 1
+                if month > 12:
+                    year, month = year + 1, 1
+            try:
+                return datetime(year, month, day)
+            except ValueError:
+                return None
+
+        # 2. 只有月日：10月24号 / 10月24日
+        if "check_in" not in params:
+            md_match = re.search(r'(\d{1,2})\s*月\s*(\d{1,2})\s*[号日]?', text)
+            if md_match:
+                d = _future_month_day(int(md_match.group(1)), int(md_match.group(2)))
+                if d:
+                    params["check_in"] = d.strftime("%Y-%m-%d")
+
+        # 3. 只有日：24号 / 24日（"帮我订24号沈阳的酒店"）
+        if "check_in" not in params:
+            day_match = re.search(r'(?<!\d)(\d{1,2})\s*[号日](?!\d)', text)
+            if day_match:
+                d = _future_day_only(int(day_match.group(1)))
+                if d:
+                    params["check_in"] = d.strftime("%Y-%m-%d")
+
+        # 4. 口语化日期：今天/明天/后天等
+        #    关键：先判断语境——"后天离店""明天退房""25号走"里的日期词是【离店日期】，
+        #    不能一律塞进 check_in，否则用户被问"哪天离店"时答"后天"会把入住日期改掉。
+        _ORAL_DATE_WORDS = [("大后天", 3), ("明天", 1), ("后天", 2), ("今晚", 0), ("今天", 0)]
+        for _word, _delta in _ORAL_DATE_WORDS:
+            if _word not in text:
+                continue
+            _idx = text.find(_word)
+            # 防止"大后天"里的"后天"被二次命中
+            if _word == "后天" and text[max(0, _idx - 1):_idx] == "大":
+                continue
+            _d = (today + timedelta(days=_delta)).strftime("%Y-%m-%d")
+            # 日期词后 0~3 字内出现离店提示词，或前面 0~3 字内出现"离店/退房"
+            _after = text[_idx + len(_word): _idx + len(_word) + 3]
+            _before = text[max(0, _idx - 3): _idx]
+            _is_checkout_ctx = (
+                any(h in _after for h in ("离店", "退房", "走", "退"))
+                or any(h in _before for h in ("离店", "退房"))
+            )
+            if _is_checkout_ctx:
+                if "check_out" not in params:
+                    params["check_out"] = _d
+            else:
+                if "check_in" not in params:
+                    params["check_in"] = _d
         if "这周末" in text or "本周末" in text:
             # 找到本周六
             days_until_sat = (5 - today.weekday()) % 7
@@ -231,12 +317,22 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
             params["check_in"] = (today + timedelta(days=days_until_sat)).strftime("%Y-%m-%d")
             params["check_out"] = (today + timedelta(days=days_until_sat + 1)).strftime("%Y-%m-%d")
 
-        # 住几晚 → 推算离店日期
-        nights_match = re.search(r'住(\d+)晚|(\d+)晚|住(\d+)天', text)
-        if nights_match and "check_in" in params and "check_out" not in params:
-            nights = int([g for g in nights_match.groups() if g][0])
-            ci = datetime.strptime(params["check_in"], "%Y-%m-%d")
-            params["check_out"] = (ci + timedelta(days=nights)).strftime("%Y-%m-%d")
+        # 住几晚/几天 → 推算离店日期（数字和中文数字都认："住三天""住3晚""两晚"）
+        _CN_NUMS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+                    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+        nights_match = re.search(
+            r'住\s*(\d+|[一二两三四五六七八九十])\s*(?:晚|天)(?!前|后)'
+            r'|(\d+|[一二两三四五六七八九十])\s*(?:晚|天)(?!前|后)',
+            text)
+        if nights_match:
+            raw = nights_match.group(1) or nights_match.group(2)
+            nights = int(raw) if raw.isdigit() else _CN_NUMS.get(raw, 0)
+            if nights > 0:
+                if "check_in" in params and "check_out" not in params:
+                    params["check_out"] = shift_date(params["check_in"], nights)
+                elif "check_in" not in params:
+                    # 本条只说"住三天"：把晚数交给 agent，结合上一轮的入住日期推算
+                    params["_nights"] = nights
 
         # ---- 星级提取 ----
         star_match = re.search(r'(\d)\s*星|星级.*?(\d)|要?(\d)星', text)
