@@ -29,8 +29,8 @@
 
 ## 功能特性
 
-- **自然语言预订**：「帮我订下周六成都的酒店，预算 300 以内，住两晚」→ LLM 自动提取城市/日期/预算/星级（含口语日期换算：明天、这周末、下周末）
-- **真实酒店搜索**：道旅 `searchHotels` 返回全国城市实时可订酒店、展示价、星级、设施标签；支持按星级、每晚预算服务端筛选
+- **自然语言预订**：「帮我订下周六成都的酒店，预算 300 以内，住两晚」→ LLM 自动提取城市/日期/预算/星级（含口语日期换算：明天、后天、这周末、下周末、"住三天"晚数推断）；多轮对话里先答入住再补离店不会互相覆盖
+- **真实酒店搜索**：道旅 `searchHotels` 返回全国城市实时可订酒店、展示价、星级、设施标签；支持按星级、每晚预算服务端筛选；**带 POI（故宫/中街/春熙路/高铁站）搜索时每条酒店附带直线距离，并按"近→远"排序**
 - **实时房型报价**：道旅 `getHotelDetail` 返回同房型下含早/退改等上百条报价，程序按房型聚合、每房型保留最便宜一档，展示餐食、床型、面积、退改政策、是否需申请
 - **真实验价 + 下单**：道旅 OAuth REST 接口 `/hotelpriceconfirm`（锁价拿 `referenceNo`）→ `/hotelbook`（创建订单拿 `orderNo` + `paymentUrl`）→ `/hotelorders`（查单）
 - **历史订单查询**：对话里说「查我的历史订单 / 查待支付的订单 / 查已取消的订单」即可拉取道旅账号全部真实订单（跨会话保留），支持按状态筛选；未登录时降级展示本次会话的本地订单并引导登录
@@ -81,6 +81,8 @@
     ├── .env.example           # 配置模板（复制为 .env 后填 Key）
     ├── main.py                # 入口①：ReAct + Workflow 混合版（真实下单链路在这）
     ├── main_multi.py          # 入口②：Supervisor-Worker 多 Agent 协作版
+    ├── web.py                 # 入口③：FastAPI + Web 聊天界面（图片内嵌、多轮会话池）
+    ├── templates/index.html   # Web 前端（referrer=no-referrer 防道旅 CDN 403）
     ├── agent.py               # 主版对话 Agent：状态机、选店选房、验价确认编排
     ├── multi_agent.py         # 多 Agent：Supervisor/Search/Booking/Service/Review
     ├── llm.py                 # LLM 封装：DashScope 真实模式 + 规则引擎模拟模式
@@ -114,7 +116,8 @@ Copy-Item .env.example .env   # PowerShell
 
 | 配置项 | 必填 | 使用模块 | 作用 |
 |---|---|---|---|
-| `DASHSCOPE_API_KEY` | 否 | llm.py / rag.py | 通义千问 Key；留空 → 意图识别用规则引擎、Embedding 用 TF-IDF |
+| `DASHSCOPE_API_KEY` | 否 | llm.py / rag.py | 通义千问 Key；留空 → 意图识别用规则引擎、Embedding 用 TF-IDF。**默认模型 qwen-plus**（qwen-turbo 易触发 429 限流，可通过 `DASHSCOPE_MODEL` 覆盖） |
+| `DASHSCOPE_MODEL` | 可选 | llm.py | 覆盖默认 LLM 模型名（如 `qwen-turbo` / `qwen-max`），限流或预算变动时改这里即可 |
 | `AMAP_API_KEY` | 选填 | amap_poi.py | 高德「**Web 服务**」类型 Key；道旅不可用时的 POI 回退（无价格） |
 | `ROLLINGGO_API_KEY` | 真实搜索必填 | rollinggo_mcp.py | 道旅开发者 Key（`mcp_` 开头），用于酒店搜索与实时房价 |
 | `ROLLINGGO_MCP_URL` | 可选 | 两个 rollinggo 模块 | 默认 `https://mcp.rollinggo.cn/mcp`；国际站改 `https://mcp.rollinggo.ai/mcp` |
@@ -241,10 +244,10 @@ orderNo + paymentUrl（通用收银台，用户自行打开支付）
 
 | 文件 | 关键内容 |
 |---|---|
-| `models.py` | 全部 dataclass；`BookingParams.is_complete()/missing_fields()` 驱动参数追问；`Order.source` 区分 mock/rollinggo |
-| `llm.py` | `LLMClient.extract_intent_and_params()`：意图 book/search/order_query/cancel/chat + 结构化参数；含口语日期换算 prompt |
-| `tools.py` | `search_hotels()` 三级回退；`get_hotel_detail(live=True)` 实时富化；`create_order()` 模拟单；`create_real_order()` 道旅真单；`list_history_orders()` 历史订单（远程+本地合并、状态筛选）；运行时酒店缓存 `_RUNTIME_HOTEL_CACHE`；内存 `ORDER_DB` |
-| `rollinggo_mcp.py` | `RollingGoMCPClient`：MCP 握手、JSON/SSE 双解析；搜索参数构造（`hotelTags.maxPricePerNight` 等）；报价按房型聚合取最低价 |
+| `models.py` | 全部 dataclass；`Hotel` 含 `distance_m`（距 POI 直线距离米）与 `distance_to`（参照地标名）；`BookingParams.is_complete()/missing_fields()` 驱动参数追问；`Order.source` 区分 mock/rollinggo |
+| `llm.py` | `LLMClient.extract_intent_and_params()`：意图 book/search/order_query/cancel/chat + 结构化参数；默认模型 qwen-plus（429 限流可通过 `DASHSCOPE_MODEL` 覆盖）；含口语日期换算（今天/明天/后天/住三天）+ 错误日志直接打印 status/code/message |
+| `tools.py` | `search_hotels()` 三级回退；`get_hotel_detail(live=True)` 实时富化；`create_order()` 模拟单；`create_real_order()` 道旅真单；`list_history_orders()` 历史订单（远程+本地合并、状态筛选）；运行时酒店缓存 `_RUNTIME_HOTEL_CACHE`；内存 `ORDER_DB`；`format_hotel_list()` 在有 POI 距离时输出距离行 |
+| `rollinggo_mcp.py` | `RollingGoMCPClient`：MCP 握手、JSON/SSE 双解析；搜索参数构造（`hotelTags.maxPricePerNight` 等）；报价按房型聚合取最低价；POI 距离透传（`distanceInMeters`）；地标识别扩展到 街/路/大道；排序策略：有 POI 距离时按"近→远"、未知沉底，否则地标词命中优先 |
 | `rollinggo_book.py` | OAuth PKCE 登录与本地回调服务；token 存取（与官方 CLI 共享 `~/.hotel-cli/token.json`）；`price_confirm() / create_booking() / list_orders() / get_order_detail() / parse_orders()`；CLI 支持 `login/status/logout/orders` |
 | `amap_poi.py` | 高德文本搜索 v3（`restapi.amap.com/v3/place/text`），住宿大类 100000，星级词映射 |
 | `agent.py` | 主状态机：选店、序号/房型名/床型关键词匹配报价、验价确认卡编排、下单与取消 |
@@ -258,7 +261,8 @@ orderNo + paymentUrl（通用收银台，用户自行打开支付）
 RoomRatePlan   # room_name, price_per_night, meal, cancelable, cancel_policy,
                # bed_type, max_occupancy, room_size, on_request, rate_plan_id
 Hotel          # hotel_id(道旅前缀 RLG_), name, star, price_per_night,
-               # facilities, room_types, rate_plans[], booking_url
+               # facilities, room_types, rate_plans[], booking_url,
+               # distance_m（距搜索地标直线距离米，0=未知）, distance_to（参照地标）
 Order          # order_id, ..., status(pending/paid/cancelled),
                # source(mock/rollinggo), payment_url, contact_email
 BookingParams  # city / check_in / check_out（必填）, min_star,
