@@ -1,29 +1,31 @@
-# 真实住客评分富化 —— 百度地图优先、高德地图兜底
+# 真实住客评分富化 —— 携程优先，百度其次，高德兜底
 #
 # 背景：道旅 RollingGo 只提供官方星级（starRating），不提供用户点评；
-#       OTA（携程等）接口有签名风控无法对接。本模块只展示地图厂商接口
-#       返回的真实用户评分，并在每条结果上标注数据来源，绝不编造评分。
+#       本模块只展示真实用户评分（来自携程或地图厂商接口），并在每条结果上
+#       标注数据来源，绝不编造评分。
 #
-# 数据源（任一可用即生效）：
-# 1. 百度地图（优先：评分 + 评价条数 + 好评率三字段最全）
+# 数据源（按优先级，任一可用即生效）：
+# 1. 携程（首选：字段最全，无需 Key）
+#    走 ctrip_crawler 的联想搜索接口，一次拿到评分 + 点评数 + 评价标签；
+#    7 天磁盘缓存，确认无评分做 3 天负缓存
+# 2. 百度地图（次选：评分 + 评价条数 + 好评率）
 #    需【服务端】AK，填入 .env：BAIDU_MAP_AK=你的AK
 #    申请：https://lbsyun.baidu.com/ → 控制台 → 应用管理 → 创建应用
 #    应用类型选【服务端】（注意：服务端 AK 需要企业认证）
-# 2. 高德地图（兜底：百度未配置/未命中时自动使用；个人身份证实名即可）
+# 3. 高德地图（兜底：个人身份证实名即可）
 #    申请：https://console.amap.com/ → 应用管理 → 创建应用 → 添加 Key
 #    服务平台必须选【Web服务】，把 Key 填入同目录 .env：AMAP_API_KEY=你的key
 #    文本搜索 extensions=all 时，酒店类 POI 的 biz_ext.rating 返回真实评分，
 #    但接口不提供评价条数 / 好评率。
 #
 # 设计要点：
-# - 名称 + 坐标双重匹配，避免同名酒店张冠李戴：道旅坐标为 WGS84、
+# - 名称 + 坐标双重匹配（地图源），避免同名酒店张冠李戴：道旅坐标为 WGS84、
 #   高德返回 GCJ02、百度返回 BD09，匹配前按数据源做坐标转换
-# - 两家都配置时优先用百度（字段更全），百度未命中再回退高德；
-#   只配置一家也能独立工作
+# - 携程与地图源的匹配各自独立：携程按同城 + 名称相似度，地图源按名称 + 距离
 # - 磁盘缓存（项目内 cache/ratings_cache.json，7 天有效）：评分变化慢，
 #   避免每次搜索都批量请求；查无结果做 3 天负缓存
 # - 免费接口额度有限，默认只富化列表前 8 家酒店（教学演示足够）
-# - 未配置 Key 或任何调用失败都静默降级为"暂无评分"，绝不阻塞订房主流程
+# - 任何调用失败都静默降级为"暂无评分"，绝不阻塞订房主流程
 
 import os
 import re
@@ -37,6 +39,12 @@ from typing import Dict, List, Optional
 import requests
 
 from models import Hotel
+
+# 携程评分（首选源，无需 Key）；模块缺失时优雅降级
+try:
+    from ctrip_crawler import fetch_rating as _ctrip_fetch_rating
+except Exception:
+    _ctrip_fetch_rating = None
 
 try:
     from dotenv import load_dotenv
@@ -100,6 +108,8 @@ class _TokenBucket:
 # 两套独立桶（百度/高德 AK 配额各自独立，互不影响）
 _baidu_bucket = _TokenBucket(_qps_from_env("BAIDU_QPS_LIMIT", 2.0))
 _amap_bucket  = _TokenBucket(_qps_from_env("AMAP_QPS_LIMIT", 5.0))
+# 携程联想搜索无公开配额说明，默认 2 QPS，可 .env 覆盖 CTRIP_QPS_LIMIT
+_ctrip_bucket = _TokenBucket(_qps_from_env("CTRIP_QPS_LIMIT", 2.0))
 
 # 名称与坐标双匹配的距离阈值（公里，已预留坐标系转换误差）
 _DIST_EXACT = 3.0
@@ -130,8 +140,8 @@ def baidu_enabled() -> bool:
 
 
 def is_enabled() -> bool:
-    """高德 / 百度任一配置即可用"""
-    return amap_enabled() or baidu_enabled()
+    """携程（无需 Key）/ 高德 / 百度任一可用即可用"""
+    return ctrip_available() or amap_enabled() or baidu_enabled()
 
 
 def _notice(msg: str) -> None:
@@ -236,6 +246,10 @@ def _load_cache() -> dict:
     try:
         with open(_CACHE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
+        # v3 起携程为首选评分源；旧版（v2 百度/高德）记录直接丢弃，
+        # 避免旧来源在 7 天 TTL 内压过携程
+        if data.get("version", 1) < 3:
+            return {}
         return data.get("items", {})
     except Exception:
         return {}
@@ -246,7 +260,7 @@ def _save_cache(items: dict) -> None:
         os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok=True)
         tmp = _CACHE_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"version": 2, "items": items}, f, ensure_ascii=False)
+            json.dump({"version": 3, "items": items}, f, ensure_ascii=False)
         os.replace(tmp, _CACHE_PATH)
     except Exception:
         pass
@@ -337,6 +351,26 @@ def _match_candidate(hotel: Hotel, candidates: List[tuple],
         if best_key is None or key > best_key:
             best, best_key = raw, key
     return best
+
+
+# ========== 携程源（首选，无需 Key）==========
+
+def ctrip_available() -> bool:
+    return _ctrip_fetch_rating is not None
+
+
+def _rating_from_ctrip(hotel: Hotel) -> Optional[dict]:
+    """携程真实用户评分（评分 + 点评数），名称与城市匹配由 ctrip_crawler 负责。"""
+    if _ctrip_fetch_rating is None:
+        return None
+    _ctrip_bucket.acquire()  # ← 节流：避免批量富化时打爆联想接口
+    rec = _ctrip_fetch_rating(hotel)
+    if not rec or rec.get("rating", 0) <= 0:
+        return None
+    return {"rating": rec["rating"],
+            "count": rec.get("count", 0),
+            "recommend": "",
+            "source": "携程"}
 
 
 # ========== 高德源（GCJ02，只有评分）==========
@@ -460,22 +494,22 @@ def _rating_from_baidu(hotel: Hotel) -> Optional[dict]:
             "source": "百度地图"}
 
 
-# ========== 单店查询（双源回退）==========
+# ========== 单店查询（三级回退）==========
 
 def fetch_rating(hotel: Hotel) -> Optional[dict]:
     """
     查询单家酒店的真实评价摘要。
-    两家都配置时优先百度（字段更全），未命中回退高德。
+    优先级：携程（无 Key 即可用）→ 百度（字段更全）→ 高德（兜底）。
     返回 {rating, count, recommend, source} 或 None（无数据/未配置/失败）。
     """
-    if not is_enabled():
-        return None
     key = _cache_key(hotel)
     cached = _cached_get(key)
     if cached is not None:
         return cached if cached.get("rating", 0) > 0 else None
-    # 顺序即优先级：百度（三字段）→ 高德（仅评分）
+    # 顺序即优先级
     runners = []
+    if ctrip_available():
+        runners.append(_rating_from_ctrip)
     if baidu_enabled():
         runners.append(_rating_from_baidu)
     if amap_enabled():
@@ -517,7 +551,7 @@ def enrich_hotels_rating(hotels: List[Hotel],
     并发为一批酒店补真实评分，返回成功条数。
     - 只处理真实来源（RLG_/AMAP_）且尚无评分的酒店，模拟库自带评分不覆盖
     - 默认只补前 limit 家，节省免费接口额度（缓存命中不计额度）
-    - 高德 / 百度 Key 都未配置时直接返回 0，不产生任何请求
+    - 没有任何可用评分源时直接返回 0，不产生请求
     """
     targets = [h for h in hotels
                if not h.rating_source and h.rating == 0
@@ -525,10 +559,7 @@ def enrich_hotels_rating(hotels: List[Hotel],
     if not targets:
         return 0
     if not is_enabled():
-        _notice("[提示] 未配置评分服务 Key，真实住客评分暂不显示；"
-                "在 .env 配置 BAIDU_MAP_AK（百度服务端 AK，字段最全）或 "
-                "AMAP_API_KEY（高德 Web服务 Key，个人实名即可）任一个即可，"
-                "申请方式见 hotel_rating.py 顶部说明")
+        _notice("[提示] 评分模块不可用，真实住客评分暂不显示；不影响订房")
         return 0
     ok = 0
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:

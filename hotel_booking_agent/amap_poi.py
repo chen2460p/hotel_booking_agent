@@ -17,6 +17,9 @@
 # 接口文档：https://lbs.amap.com/api/webservice/guide/api/search
 
 import os
+import re
+import math
+import difflib
 from typing import List
 
 import requests
@@ -99,6 +102,44 @@ def _extract_photo(poi: dict) -> str:
     return ""
 
 
+# 高德会把酒店的附属设施单列成 POI（大堂/停车场/餐厅…），它们的图片不是
+# 酒店外观，单店补图时必须排除，否则会把停车场照片当封面
+_FACILITY_POI = re.compile(
+    r"(停车场|大堂|前台|礼宾部|商务中心|会议室|宴会厅|餐厅|入口|侧门|电梯|售票处)")
+
+
+def _norm_name(name: str) -> str:
+    """名称归一：去括号/标点/空格，只留中英文数字。"""
+    return re.sub(r"[^\u4e00-\u9fa5a-zA-Z0-9]", "", name or "")
+
+
+def _name_sim(a: str, b: str) -> float:
+    na, nb = _norm_name(a), _norm_name(b)
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def _poi_lat_lng(poi: dict) -> tuple:
+    """高德 location 形如 '经度,纬度'（GCJ02），返回 (纬度, 经度)。"""
+    loc = str(poi.get("location") or "")
+    if "," not in loc:
+        return 0.0, 0.0
+    try:
+        lng_str, lat_str = loc.split(",", 1)
+        return float(lat_str), float(lng_str)
+    except ValueError:
+        return 0.0, 0.0
+
+
+def _distance_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    dl, dn = math.radians(lng2 - lng1), math.radians(lat2 - lat1)
+    a = (math.sin(dn / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(dl / 2) ** 2)
+    return 6371.0 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
 def _to_hotel(poi: dict, city: str) -> Hotel:
     """把高德 POI 映射成项目统一 Hotel 模型"""
     type_text = poi.get("type", "")
@@ -179,3 +220,77 @@ def search_real_hotels(params: BookingParams,
     pois = data.get("pois") or []
     return [_to_hotel(poi, params.city)
             for poi in pois if poi.get("id") and poi.get("name")]
+
+
+def fetch_hotel_photo(hotel: Hotel) -> str:
+    """单店高德补图（图片三级源）：返回真实实拍图直链，失败返回空串。
+
+    只在道旅、携程都给不出封面时调用。按酒店名 + 城市做一次文本检索，
+    名称相似度 ≥ 0.85 且（坐标可得时）距离 ≤ 3km 才采纳，避免同名错图。
+    道旅坐标 WGS84、高德 GCJ02，两者偏差约数百米，3km 阈值已留足余量。
+    """
+    if not is_enabled() or not hotel.name:
+        return ""
+    params = {
+        "key": get_api_key(),
+        "keywords": hotel.name,
+        "types": _ACCOMMODATION_TYPE,
+        "city": hotel.city or "",
+        "citylimit": "true",
+        "offset": 25,
+        "page": 1,
+        "extensions": "all",
+        "output": "JSON",
+    }
+    # 有坐标时按距离排序：泛泛的酒店名（如"北京饭店"）在无坐标检索里
+    # 常被同名/近名 POI 挤到 25 名之外，带坐标可稳定把目标拉进视野
+    if hotel.latitude and hotel.longitude:
+        params.update({
+            "location": f"{hotel.longitude},{hotel.latitude}",
+            "radius": 5000,
+            "sortrule": "distance",
+        })
+    try:
+        resp = requests.get(_AMAP_TEXT_SEARCH_URL, params=params, timeout=(5, 8))
+        data = resp.json()
+    except Exception:
+        return ""
+    if str(data.get("status")) != "1":
+        return ""
+    best, best_key = None, None
+    nn = _norm_name(hotel.name)
+    for poi in data.get("pois") or []:
+        name = poi.get("name", "")
+        if _FACILITY_POI.search(name):
+            continue
+        cn = _norm_name(name)
+        if not nn or not cn:
+            continue
+        sim = _name_sim(hotel.name, name)
+        # 强匹配：归一后互相包含且长度比 ≥ 0.6
+        # （"广州白天鹅宾馆" vs "白天鹅宾馆"、"XX酒店" vs "XX酒店(中街店)"）
+        shorter, longer = sorted((len(nn), len(cn)))
+        strong = (nn in cn or cn in nn) and shorter / longer >= 0.6
+        if not strong and sim < 0.85:
+            continue
+        if hotel.latitude and hotel.longitude:
+            lat, lng = _poi_lat_lng(poi)
+            if (lat and lng and _distance_km(hotel.latitude, hotel.longitude,
+                                             lat, lng) > 3.0):
+                continue
+        key = (2 if strong else 1, sim)
+        if best_key is None or key > best_key:
+            best, best_key = poi, key
+    if best is None:
+        return ""
+    # 优先取高德官方店铺图（store.is.autonavi.com），用户点评图（aos-comment）
+    # 常是客房内景，作为酒店封面不如官方外观图合适，仅作兜底
+    best_poi_urls = [str(p.get("url") or "").strip()
+                     for p in (best.get("photos") or []) if isinstance(p, dict)]
+    best_poi_urls = [u for u in best_poi_urls if u]
+    official = [u for u in best_poi_urls if "store.is.autonavi.com" in u]
+    url = (official or best_poi_urls or [""])[0]
+    # 部分图片是 http://，统一升级 https，避免网页混合内容被浏览器拦截
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    return url

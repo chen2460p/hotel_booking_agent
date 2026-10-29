@@ -49,3 +49,6 @@ hotel_booking_agent/cache/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ===== 个人资料（简历/面试材料，不提交）=====
+/面试准备/

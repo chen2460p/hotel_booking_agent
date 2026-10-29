@@ -408,11 +408,17 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
             try:
                 prompt = f"{context}\n\n用户：{user_input}\n助手："
                 response = self.dashscope.Generation.call(
-                    model="qwen-turbo",
+                    model=self.model,
                     prompt=prompt,
                     result_format="message"
                 )
-                return response.output.choices[0].message.content
+                # 与意图提取路径一致：限流时 output 为 None，打印真实原因再兜底
+                if getattr(response, "output", None) is None:
+                    print(f"[LLM 回复生成失败] status={getattr(response, 'status_code', '?')} "
+                          f"code={getattr(response, 'code', '?')} "
+                          f"message={getattr(response, 'message', '?')}")
+                else:
+                    return response.output.choices[0].message.content
             except Exception as e:
                 print(f"[LLM 回复生成失败] {e}")
 

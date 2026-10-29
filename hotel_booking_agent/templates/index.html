@@ -25,6 +25,15 @@
   #chatbox .bot.status span { background: #f8f9fa; color: #7f8c8d; font-style: italic; border-style: dashed; }
   #chatbox .bot a { color: #2980b9; word-break: break-all; }
   #chatbox .bot .chat-img { display: block; max-width: 280px; max-height: 190px; border-radius: 8px; margin: 6px 0; cursor: zoom-in; border: 1px solid #e0e0e0; min-height: 56px; background: #f5f6f7; }
+  /* 房型多图：横向图组，可左右滑动，避免整条消息被几十张图拉成长条 */
+  #chatbox .bot .chat-gallery { display: flex; gap: 6px; overflow-x: auto; overflow-y: hidden; max-width: 100%; padding: 2px 0 4px; white-space: normal; }
+  #chatbox .bot .chat-gallery .chat-img { flex: 0 0 auto; width: 170px; height: 115px; margin: 0; object-fit: cover; }
+  #chatbox .bot .chat-gallery > a { flex: 0 0 auto; max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+  #chatbox .bot .chat-gallery::-webkit-scrollbar { height: 6px; }
+  #chatbox .bot .chat-gallery::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
+  /* “展开全部”：逐段补真实评分后追加展示 */
+  #chatbox .bot .expand-hotels { display: block; margin: 8px 0 0; padding: 4px 12px; font-size: 12px; color: #2980b9; background: #fff; border: 1px dashed #2980b9; border-radius: 12px; cursor: pointer; }
+  #chatbox .bot .expand-hotels:disabled { color: #95a5a6; border-color: #ccc; cursor: default; }
   #inputrow { display: flex; gap: 8px; }
   #inputrow textarea { flex: 1; height: 64px; padding: 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; resize: none; }
   #inputrow button { padding: 0 20px; background: #2980b9; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
@@ -75,8 +84,26 @@ const IMG_RE   = /\.(jpe?g|png|webp|gif)[^\s]*$/i;   // 扩展名后允许 CDN �
 // 改为逐张加载（失败重试 1 次），彻底避开限流窗口。
 const _imgQueue = [];
 let _imgBusy = false;
+// 房型图组一次可能出现几十张：滚动到可视区附近才入队，
+// 既避免串行加载太久，也不并发冲击 CDN 风控。
+let _imgObserver = null;
 
 function _enqueueImg(img, url) {
+  img.dataset.src = url;
+  if (!("IntersectionObserver" in window)) { _pushImg(img, url); return; }
+  if (!_imgObserver) {
+    _imgObserver = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        _imgObserver.unobserve(e.target);
+        _pushImg(e.target, e.target.dataset.src);
+      }
+    }, { root: chatbox, rootMargin: "300px 0px" });
+  }
+  _imgObserver.observe(img);
+}
+
+function _pushImg(img, url) {
   _imgQueue.push([img, url]);
   _pumpImg();
 }
@@ -101,9 +128,10 @@ function _pumpImg() {
   img.src = url;
 }
 
-function renderRich(span, text) {
+function renderRich(span, text, appendMode) {
   // 按 URL 分段：普通文本走 textNode，图片 URL 渲染 <img>，其余渲染 <a>
-  span.textContent = "";
+  // appendMode=true 时保留已有内容，用于“展开全部”把后续酒店追加到同一条消息
+  if (!appendMode) span.textContent = "";
   let last = 0, m;
   URL_RE.lastIndex = 0;
   while ((m = URL_RE.exec(text)) !== null) {
@@ -130,6 +158,36 @@ function renderRich(span, text) {
   if (last < text.length) {
     span.appendChild(document.createTextNode(text.slice(last)));
   }
+  groupGalleries(span);
+}
+
+// 把连续出现的图片包进一个横向图组（房型多图），单张图保持原样
+function groupGalleries(span) {
+  const nodes = Array.from(span.childNodes);
+  for (let i = 0; i < nodes.length; i++) {
+    const first = nodes[i];
+    if (first.nodeType !== 1 || !first.classList.contains("chat-img")) continue;
+    const run = [first];
+    let j = i + 1;
+    while (j < nodes.length) {
+      const n = nodes[j];
+      if (n.nodeType === 3 && !n.textContent.trim()) { j++; continue; }
+      if (n.nodeType === 1 && n.classList.contains("chat-img")) { run.push(n); j++; continue; }
+      break;
+    }
+    if (run.length > 1) {
+      // 清掉图与图之间的换行/缩进，否则图组前后会多出空行
+      for (let k = i + 1; k < j; k++) {
+        const n = nodes[k];
+        if (n.nodeType === 3 && !n.textContent.trim()) n.remove();
+      }
+      const box = document.createElement("span");
+      box.className = "chat-gallery";
+      first.before(box);
+      run.forEach(img => box.appendChild(img));
+    }
+    i = j - 1;
+  }
 }
 
 function append(cls, text, rich) {
@@ -144,10 +202,56 @@ function append(cls, text, rich) {
   return div;
 }
 
+// ---------- 展开全部：按需补全剩余酒店的真实评分 ----------
+// 后端每段补 5 家（受百度/高德 QPS 限制，约 2-3 秒），逐段追加而不是一次等完。
+// 评分全部来自真实接口/7 天缓存；查不到仍是“暂无评分”，不做任何伪造。
+async function expandHotels(div, span, btn) {
+  btn.disabled = true;
+  const total = +btn.dataset.total;
+  let offset = +btn.dataset.next;
+  try {
+    while (offset < total) {
+      if (btn.dataset.stale) return;    // 用户已发新消息，搜索结果被替换，停止追加
+      btn.textContent = `⏳ 正在补全评分…（已展示 ${offset}/${total} 家）`;
+      const r = await fetch("/api/hotels/more", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({session_id: sessionId, offset, limit: 5}),
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const d = await r.json();
+      if (d.text) renderRich(span, "\n" + d.text, true);
+      if (!d.next || d.next <= offset) break;     // 防御：后端未推进则退出
+      offset = d.next;
+      btn.dataset.next = offset;
+      chatbox.scrollTop = chatbox.scrollHeight;
+    }
+    btn.remove();
+  } catch (e) {
+    // 保留已展开部分，允许从断点重试
+    btn.disabled = false;
+    btn.textContent = "展开失败，点击重试";
+  }
+}
+
+function addHotelExpander(div, span, total, shown) {
+  const btn = document.createElement("button");
+  btn.className = "expand-hotels";
+  btn.textContent = `展开全部（共 ${total} 家）`;
+  btn.dataset.next = shown;
+  btn.dataset.total = total;
+  btn.onclick = () => expandHotels(div, span, btn);
+  div.appendChild(btn);
+}
+
 async function sendMsg() {
   const text = input.value.trim();
   if (!text) return;
   append("user", text);
+  // 新一轮搜索会替换会话里的 search_results，旧消息的“展开全部”已失效
+  chatbox.querySelectorAll(".expand-hotels").forEach(b => {
+    b.dataset.stale = "1";
+    b.remove();
+  });
   input.value = "";
   send.disabled = true;
   // 状态条：SSE stage 事件实时更新文案（理解需求 → 搜索酒店 → 获取报价）
@@ -162,6 +266,7 @@ async function sendMsg() {
     const reader = r.body.getReader();
     const dec = new TextDecoder();
     let buf = "", reply = null, currentOrder = "", errMsg = null;
+    let hotelTotal = 0, hotelShown = 0;
     while (true) {
       const {done, value} = await reader.read();
       if (done) break;
@@ -182,6 +287,8 @@ async function sendMsg() {
         } else if (ev === "result") {
           reply = d.reply;
           currentOrder = d.current_order;
+          hotelTotal = d.hotel_total || 0;
+          hotelShown = d.hotel_shown || 0;
           if (d.session_id && d.session_id !== sessionId) {
             sessionId = d.session_id;
             localStorage.setItem("hb_session_id", sessionId);
@@ -194,7 +301,10 @@ async function sendMsg() {
     status.remove();
     if (errMsg) append("bot", "❌ " + errMsg);
     else if (reply !== null) {
-      append("bot", reply, true);
+      const botDiv = append("bot", reply, true);
+      if (hotelTotal > hotelShown) {
+        addHotelExpander(botDiv, botDiv.querySelector("span"), hotelTotal, hotelShown);
+      }
       if (currentOrder) append("sys", "📌 " + currentOrder);
     } else append("bot", "(连接中断，未收到完整回复)");
   } catch (e) {

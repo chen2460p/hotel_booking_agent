@@ -14,7 +14,6 @@ CLI 零配置可跑，Web 版有 DB 则持久化。
 
 import os
 import re
-import json
 import threading
 from typing import Dict, List, Optional, Tuple
 
@@ -236,12 +235,8 @@ def update_status(order_id: str, status: str) -> bool:
                 "UPDATE orders SET status = ? WHERE order_id = ?",
                 (status, order_id),
             )
-            affected = getattr(cur, "rowcount", cur.rowcount) if hasattr(cur, "rowcount") else 0
-        # sqlite3 返回 sqlite3.Cursor，pymysql 返回 pymysql.cursors.DictCursor
-        try:
+            # sqlite3 / pymysql 游标都有 rowcount
             affected = cur.rowcount
-        except Exception:
-            affected = 0
         # 更新内存副本，供同进程后续 get_order 立刻读到
         if order_id in _mem_db:
             _mem_db[order_id].status = status
@@ -268,19 +263,3 @@ def list_all_orders() -> List[Order]:
     except Exception as e:
         print(f"[storage] list_all_orders 失败：{e}")
         return list(_mem_db.values())
-
-
-# ---------- CLI 运行期的同步钩子 ----------
-# CLI 进程用内存 dict 起步；如果同时也有 DB（比如用户中途配了 DATABASE_URL），
-# 我们不想让工具层同时维护两份状态。这里暴露一个 hook，让 storage 可以接管内存里
-# 已有的初始化数据（由 tools.py 启动时调用一次）。
-
-def bootstrap_from_memory(mem_db: Dict[str, Order]) -> None:
-    """把 CLI 启动前内存 dict 里已有的订单写入 DB（DB 模式下）。"""
-    _init_once()
-    if _backend == "memory":
-        _mem_db.update(mem_db)
-        return
-    # 逐条 upsert
-    for o in mem_db.values():
-        insert_order(o)

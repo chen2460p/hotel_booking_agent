@@ -27,16 +27,16 @@ PROJ = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJ))
 os.chdir(str(PROJ))
 
-from fastapi import FastAPI, HTTPException, Request, Query
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from agent import HotelBookingAgent
-from models import BookingParams
 import tools
 import storage
+import hotel_rating
+import rollinggo_book as rlg
 
 app = FastAPI(title="酒店预订 Agent Web 版", version="0.2.0")
 templates = Jinja2Templates(directory=str(PROJ / "templates"))
@@ -84,6 +84,27 @@ class ChatResponse(BaseModel):
     session_id: str = ""          # 回传会话标识（前端未带时由服务端生成）
     storage_backend: str          # memory / sqlite / mysql
     storage_enabled: bool          # True = 真实持久化
+    hotel_total: int = 0          # 本次搜索命中的酒店总数（>5 时前端显示“展开全部”）
+    hotel_shown: int = 0          # 首屏已展示家数
+
+
+class HotelMoreRequest(BaseModel):
+    session_id: str
+    offset: int = 0               # 从第 offset 家（0 基）开始补
+    limit: int = 5                # 本次补全/展示家数
+
+
+def _hotel_counts(agent: HotelBookingAgent, reply: str) -> tuple:
+    """返回 (命中总数, 首屏已展示数)；仅对本次“推荐酒店”回复生效。
+
+    不能只看 stage：推荐阶段里用户追问订单等，stage 可能仍是 recommend，
+    但回复并不是酒店列表，此时不应给前端“展开全部”按钮。
+    """
+    state = agent.state
+    if state.stage != "recommend" or "请告诉我你想选择哪一家" not in reply:
+        return 0, 0
+    total = len(getattr(state, "search_results", None) or [])
+    return total, min(tools.HOTEL_PREVIEW, total)
 
 
 # ---------- 页面路由 ----------
@@ -120,10 +141,12 @@ async def api_chat(req: ChatRequest):
     if agent.state.current_order:
         o = agent.state.current_order
         current = f"当前订单 {o.order_id}：{o.hotel_name} · {o.room_type} · ¥{o.total_price:g}"
+    total, shown = _hotel_counts(agent, reply)
     return ChatResponse(
         reply=reply, current_order=current, session_id=session_id,
         storage_backend=storage.storage_backend(),
         storage_enabled=storage.storage_available(),
+        hotel_total=total, hotel_shown=shown,
     )
 
 
@@ -155,11 +178,13 @@ async def api_chat_stream(req: ChatRequest):
             if agent.state.current_order:
                 o = agent.state.current_order
                 current = f"当前订单 {o.order_id}：{o.hotel_name} · {o.room_type} · ¥{o.total_price:g}"
+            total, shown = _hotel_counts(agent, reply)
             q.put(("result", {
                 "reply": reply, "current_order": current,
                 "session_id": session_id,
                 "storage_backend": storage.storage_backend(),
                 "storage_enabled": storage.storage_available(),
+                "hotel_total": total, "hotel_shown": shown,
             }))
         except Exception as e:            # 后台线程异常也要送到前端
             q.put(("error", {"message": f"{type(e).__name__}: {e}"}))
@@ -184,6 +209,39 @@ async def api_chat_stream(req: ChatRequest):
     return StreamingResponse(
         event_gen(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/hotels/more")
+def api_hotels_more(req: HotelMoreRequest):
+    """
+    “展开全部”按需补全评分：为 search_results[offset:offset+limit] 补真实评分，
+    再按首屏同一套规则格式化返回。
+
+    - 评分只取真实数据（百度/高德 + 7 天磁盘缓存）；查不到仍显示“暂无评分”
+    - 用同步 def，FastAPI 自动放线程池执行，不阻塞事件循环
+    - 编号从 offset+1 延续，前端可直接追加到当前消息末尾
+    """
+    with _agents_lock:
+        entry = _agents.get(req.session_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期，请重新搜索")
+    results = getattr(entry["agent"].state, "search_results", None) or []
+    total = len(results)
+    start = max(0, req.offset)
+    if start >= total:
+        return {"text": "", "next": start, "total": total, "done": True}
+    limit = max(1, min(req.limit, 20))
+    end = min(total, start + limit)
+    chunk = results[start:end]
+    try:
+        # 只补尚无评分的酒店；缓存命中不产生请求
+        hotel_rating.enrich_hotels_rating(chunk, limit=len(chunk))
+    except Exception as e:
+        print(f"[展开补评分失败，按暂无评分展示] {type(e).__name__}: {e}")
+    return {
+        "text": tools.format_hotel_slice(results, start, end - start),
+        "next": end, "total": total, "done": end >= total,
+    }
 
 
 @app.get("/api/orders")
@@ -239,7 +297,7 @@ async def health():
         "storage_backend": storage.storage_backend(),
         "storage_enabled": storage.storage_available(),
         "active_sessions": session_count(),
-        "rollinggo_logged_in": tools.rollinggo_enabled() and False,  # 需实际 rlg.is_logged_in()
+        "rollinggo_logged_in": rlg.is_logged_in(),
     }
 
 

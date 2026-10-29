@@ -12,14 +12,22 @@
 import re
 from typing import Optional, List
 from dataclasses import dataclass, field
-from models import Hotel, Order, BookingParams, AgentState
+from models import AgentState
 from tools import (
-    search_hotels, get_hotel_detail, calculate_total_price,
+    search_hotels, get_hotel_detail,
     create_order, pay_order, cancel_order, get_order_status,
     format_hotel_list, list_history_orders, format_order_rows,
     sync_real_order_status, real_order_cancel_guide,
 )
-from llm import LLMClient, shift_date
+from llm import LLMClient
+from agent_common import (
+    CLARIFY_INTENT_KEYS, BOOKING_PARAM_KEYS, ORDER_FILTER_NAMES,
+    ORDER_STATUS_TEXT, merge_params, calc_nights,
+    generate_clarify_question, detect_order_filter, wants_order_list,
+    format_order_detail, extract_guest_name, parse_hotel_selection,
+    match_room_choice, booking_exit_action, quit_booking_message,
+    render_hotel_selection, chat_reply, reset_booking_state, is_selection_attempt,
+)
 from rag import get_rag
 
 
@@ -86,8 +94,14 @@ class SearchAgent(BaseAgent):
                 )
 
             # 格式化搜索结果
-            nights = self._calc_nights(params.check_in, params.check_out)
-            area_text = f"{params.city}{params.location}，" if params.location else ""
+            nights = calc_nights(params.check_in, params.check_out)
+            # 位置本身已带城市名时不重复拼（“沈阳”+“沈阳化工大学附近”）
+            location = (params.location or "").strip()
+            if location:
+                area_text = (f"{location}，" if location.startswith(params.city)
+                             else f"{params.city}{location}，")
+            else:
+                area_text = ""
             result_text = (
                 f"为你找到 {len(results)} 家符合条件的酒店"
                 f"（{area_text}{params.check_in} 入住，{params.check_out} 离店，共{nights}晚）：\n\n"
@@ -103,15 +117,6 @@ class SearchAgent(BaseAgent):
             )
 
         return None
-
-    def _calc_nights(self, check_in: str, check_out: str) -> int:
-        from datetime import datetime
-        try:
-            d1 = datetime.strptime(check_in, "%Y-%m-%d")
-            d2 = datetime.strptime(check_out, "%Y-%m-%d")
-            return (d2 - d1).days
-        except (ValueError, TypeError):
-            return 0
 
 
 # ========== 预订专员 Agent ==========
@@ -136,6 +141,8 @@ class BookingAgent(BaseAgent):
             params = shared_state.params
             room_type = msg.data.get("room_type", "")
             guest_name = msg.data.get("guest_name", "")
+            price = msg.data.get("price_per_night")
+            plan_note = msg.data.get("plan_note", "")
 
             if not hotel:
                 return AgentMessage(
@@ -143,22 +150,27 @@ class BookingAgent(BaseAgent):
                     msg_type="error", content="no_hotel_selected"
                 )
 
-            if room_type not in hotel.room_types:
+            valid_rooms = list(dict.fromkeys(
+                hotel.room_types + [rp.room_name for rp in hotel.rate_plans]))
+            if room_type not in valid_rooms:
                 return AgentMessage(
                     sender=self.name, receiver="Supervisor",
                     msg_type="error", content="invalid_room_type",
-                    data={"available": hotel.room_types}
+                    data={"available": valid_rooms}
                 )
 
-            # 调用工具创建订单
-            order = create_order(hotel, params, room_type, guest_name)
+            # 调用工具创建订单（多档报价时用所选档位的每晚价）
+            order = create_order(hotel, params, room_type, guest_name,
+                                 price_per_night=price)
             shared_state.current_order = order
+            plan_line = f"{plan_note}\n" if plan_note else ""
 
             result_text = (
                 f"订单创建成功！\n"
                 f"订单号：{order.order_id}\n"
                 f"酒店：{order.hotel_name}\n"
                 f"房型：{order.room_type}\n"
+                f"{plan_line}"
                 f"入住人：{order.guest_name}\n"
                 f"入住：{order.check_in} → {order.check_out}\n"
                 f"总价：{order.total_price}元\n"
@@ -254,7 +266,6 @@ class ServiceAgent(BaseAgent):
             # —— 当前订单优先：直接取共享状态里正在跟进的那笔 ——
             if scope_mode == "current" and shared_state.current_order:
                 order = shared_state.current_order
-                status_map = {"pending": "待支付", "paid": "已支付", "cancelled": "已取消"}
                 pay_hint = ""
                 if order.payment_url and order.status == "pending":
                     pay_hint = f"\n\n支付链接：{order.payment_url}"
@@ -266,7 +277,7 @@ class ServiceAgent(BaseAgent):
                     f"房型：{order.room_type}\n"
                     f"入住人：{order.guest_name}\n"
                     f"总价：{order.total_price:g}元\n"
-                    f"状态：{status_map.get(order.status, order.status)}"
+                    f"状态：{ORDER_STATUS_TEXT.get(order.status, order.status)}"
                     f"{pay_hint}\n\n想看全部历史订单，回复【查历史订单】即可。"
                 )
                 return AgentMessage(
@@ -279,8 +290,7 @@ class ServiceAgent(BaseAgent):
                 flt = str(msg.data.get("order_status", "ALL")).upper()
                 result = list_history_orders(flt)
                 rows = result["rows"]
-                flt_names = {"PENDING": "待支付", "FINISHED": "已完成/已支付",
-                             "CANCELLED": "已取消"}
+                flt_names = ORDER_FILTER_NAMES
                 scope_name = "道旅账号" if result["logged_in"] else "本次会话"
                 title = f"你的{scope_name}订单"
                 if flt in flt_names:
@@ -316,17 +326,7 @@ class ServiceAgent(BaseAgent):
                     data={"order_id": order_id}
                 )
 
-            status_map = {"pending": "待支付", "paid": "已支付", "cancelled": "已取消"}
-            result_text = (
-                f"订单信息：\n"
-                f"订单号：{order.order_id}\n"
-                f"酒店：{order.hotel_name}\n"
-                f"入住：{order.check_in} → {order.check_out}\n"
-                f"房型：{order.room_type}\n"
-                f"入住人：{order.guest_name}\n"
-                f"总价：{order.total_price}元\n"
-                f"状态：{status_map.get(order.status, order.status)}"
-            )
+            result_text = format_order_detail(order)
             return AgentMessage(
                 sender=self.name, receiver="Supervisor",
                 msg_type="result", content="order_found",
@@ -443,105 +443,14 @@ class SupervisorAgent:
     对应八股中的 Supervisor-Worker 协调模式
     """
 
-    # 模拟房型床型关键词兜底（"大床"→"大床房"），与 agent.py 保持一致
-    _BED_KEYWORDS = (
-        ("特大床", "特大床"), ("大床", "大床"),
-        ("双床", "双床"), ("单人床", "单人床"),
-        ("标间", "标准"), ("标房", "标准"),
-        ("家庭", "家庭"), ("套房", "套房"),
-    )
-    # 等待补姓名时，裸回复这些词不应被当作姓名
-    _NAME_STOPWORDS = {
-        "谢谢", "感谢", "你好", "您好", "再见", "退出", "取消", "不要",
-        "算了", "不用", "好的", "知道", "等等", "稍后", "随便",
-    }
-    # 含这些词的片段绝不是姓名（防止"入住时间改到…"被正则误抓成"时间改到"）
-    _NAME_DENY_WORDS = (
-        "时间", "日期", "改到", "改成", "推迟", "提前", "查询", "搜索",
-        "重新", "酒店", "宾馆", "房型", "入住", "离店", "周末", "预算",
-        "价格", "附近", "一下", "看看", "选择", "序号", "名称", "取消",
-        "订单", "支付", "帮忙", "帮我", "可以", "能不", "怎么", "什么",
-        "多少", "哪里", "哪个", "今天", "明天", "后天", "上午", "下午",
-        "晚上", "中午", "早上", "凌晨", "几点", "小时", "星期", "推荐",
-        "便宜",
-    )
-    # 选房阶段的逃生口：明确的重查指令 / 彻底放弃
-    _RESEARCH_WORDS = (
-        "重新查询", "重新搜索", "重新搜", "重新查", "再搜", "再查", "重搜",
-        "重查", "换一家", "换个酒店", "换酒店", "重新选", "重选", "重新开始",
-    )
-    _QUIT_BOOKING_WORDS = ("不订了", "取消预订", "算了不订", "不买了")
-
-    # 订单状态筛选：用户说法 → 统一状态桶（与 agent.py 保持一致）
-    _FILTER_WORDS = {
-        "PENDING": ("待支付", "未支付", "未付款", "没付款", "没支付", "待付款"),
-        "CANCELLED": ("已取消", "取消过", "退订的", "退款的"),
-        "FINISHED": ("已完成", "完成的", "已支付", "已付款", "付过款", "已入住", "住过的"),
-    }
-    # 明确要"翻历史/看清单"的说法——与"查我当前那笔订单"区分开
-    _ORDER_LIST_WORDS = (
-        "历史", "所有", "全部", "记录", "列表", "有哪些", "都有", "一共",
-        "以前", "之前的", "以往", "过往", "老订单", "订单簿", "清单",
-    )
-
-    def _detect_order_filter(self, extracted: dict, raw_text: str) -> str:
-        """从提取结果或原文识别订单状态筛选，识别不出默认 ALL。"""
-        flt = str(extracted.get("order_status") or "").upper()
-        if flt in ("ALL", "PENDING", "FINISHED", "CANCELLED"):
-            return flt
-        for bucket, words in self._FILTER_WORDS.items():
-            if any(w in (raw_text or "") for w in words):
-                return bucket
-        return "ALL"
-
-    def _wants_order_list(self, extracted: dict, raw_text: str) -> bool:
-        """历史清单词或具体状态筛选 → 清单；否则视为查当前那笔订单。"""
-        text = raw_text or ""
-        if any(w in text for w in self._ORDER_LIST_WORDS):
-            return True
-        return self._detect_order_filter(extracted, raw_text) != "ALL"
-
-    def _valid_person_name(self, name: str) -> bool:
-        """姓名候选校验：2-4 个汉字且不含业务/时间类词语。"""
-        if not name or not re.fullmatch(r'[\u4e00-\u9fa5]{2,4}', name):
-            return False
-        if name in self._NAME_STOPWORDS:
-            return False
-        return not any(w in name for w in self._NAME_DENY_WORDS)
-
-    def _looks_like_new_search(self, text: str) -> bool:
-        """识别"一句话发起新搜索"：提到酒店且带位置/价格/日期/晚数等信号。"""
-        if not re.search(r"酒店|宾馆|住宿|旅店", text):
-            return False
-        # 必须再带一个位置/时间信号，避免把"这家酒店有300以内的房吗"误判为新搜索
-        return bool(re.search(
-            r"附近|住.{0,4}晚|周末|周[一二三四五六日天]|"
-            r"\d{4}\s*[-/.]\s*\d{1,2}|\d{1,2}月\d{1,2}日",
-            text))
-
     def _exit_booking_stage(self, user_input: str) -> Optional[str]:
-        """
-        选房/入住人收集阶段的逃生口（必须在房型、姓名解析之前调用）：
-        - 新搜索条件句 → 清空预订状态并返回 None，由 run() 继续走意图识别
-        - "重新查询"等无新条件指令 → 沿用原条件直接重搜
-        - "不订了" → 彻底放弃
-        """
-        text = user_input.strip()
-        st = self.shared_state
-        if self._looks_like_new_search(text):
-            st.selected_hotel = None
-            st.pending_booking = {}
-            st.params = BookingParams()
-            st.stage = "intent"
-            return None
-        if any(w in text for w in self._RESEARCH_WORDS):
-            st.selected_hotel = None
-            st.pending_booking = {}
+        """选房/入住人收集阶段的逃生口；命中时 shared_state 已更新。"""
+        action = booking_exit_action(self.shared_state, user_input.strip())
+        if action == "research":
             return self._handle_booking_intent(user_input)
-        if any(w in text for w in self._QUIT_BOOKING_WORDS):
-            self._reset_booking_state()
-            return ("好的，本次预订已取消。下次想订酒店时，直接告诉我城市和入住"
-                    "日期就可以～")
+        if action == "quit":
+            return quit_booking_message()
+        # "new_search" 与未命中都返回 None，由 run() 继续识别意图
         return None
 
     def __init__(self):
@@ -580,14 +489,12 @@ class SupervisorAgent:
 
         # ===== Step 1：意图理解（Supervisor 的核心能力）=====
         intent, extracted = self.llm.extract_intent_and_params(user_input)
-        self._merge_params(extracted, user_input)
+        merge_params(self.shared_state, extracted, user_input)
 
         # 澄清阶段用户只补一句"24号""住三天"时，常被判成闲聊；
         # 只要带了预订参数就继续走预订流程，避免追问后又被踢回帮助菜单
         if intent == "chat" and self.shared_state.stage == "clarify" and any(
-                k in extracted for k in
-                ("city", "check_in", "check_out", "_nights", "min_star",
-                 "max_price", "facilities", "location")):
+                k in extracted for k in CLARIFY_INTENT_KEYS):
             intent = "book"
 
         # ===== Step 2：根据意图分发任务给对应 Worker =====
@@ -610,7 +517,7 @@ class SupervisorAgent:
         if not params.is_complete():
             self.shared_state.stage = "clarify"
             missing = params.missing_fields()
-            response = self._generate_clarify_question(missing)
+            response = generate_clarify_question(missing)
             self.shared_state.conversation_history.append(f"助手：{response}")
             return response
 
@@ -654,7 +561,7 @@ class SupervisorAgent:
             self.workers["booking"].receive(msg)
             result = self.workers["booking"].process(self.shared_state)
             if result and result.msg_type == "result":
-                self._reset_booking_state()
+                reset_booking_state(self.shared_state)
                 return result.data["text"]
             return "支付失败，请稍后重试。"
 
@@ -668,9 +575,9 @@ class SupervisorAgent:
             result = self.workers["booking"].process(self.shared_state)
             if result and result.content == "remote_unsupported":
                 order_id = result.data.get("order_id", "")
-                self._reset_booking_state()
+                reset_booking_state(self.shared_state)
                 return real_order_cancel_guide(order_id)
-            self._reset_booking_state()
+            reset_booking_state(self.shared_state)
             return "订单已取消。"
 
         # 逃生口：重新查询/换酒店/一句话发起新搜索/彻底放弃
@@ -683,50 +590,28 @@ class SupervisorAgent:
         hotel = self.shared_state.selected_hotel
         pending = self.shared_state.pending_booking
 
-        room_type = None
-        guest_name = None
+        # 多 Agent 链路只下模拟单，但多档报价时要沿用用户选中的那一档价格
+        room_type, rate_plan = (
+            match_room_choice(hotel, user_input) if hotel else (None, None))
 
-        if hotel:
-            # 优先按序号选房（实时房型列表提示"回复序号"，如"1，入住人张三"）
-            m_num = re.search(r'\d+', user_input)
-            if m_num:
-                idx = int(m_num.group())
-                if 1 <= idx <= len(hotel.room_types):
-                    room_type = hotel.room_types[idx - 1]
-            # 再按房型名完整包含，最后按床型关键词兜底（"大床"→"大床房"）
-            if not room_type:
-                for rt in hotel.room_types:
-                    if rt in user_input:
-                        room_type = rt
-                        break
-            if not room_type:
-                for keyword, room_key in self._BED_KEYWORDS:
-                    if keyword in user_input:
-                        room_type = next(
-                            (rt for rt in hotel.room_types if room_key in rt), None)
-                        if room_type:
-                            break
-
-        # 显式说法：入住人张三 / 我叫张三 / 张三入住
-        # （"入住"前缀必须带"人"，否则"入住时间改到…"会被误抓成姓名）
-        for pat in (r'入住人\s*[:：是叫]?\s*([\u4e00-\u9fa5]{2,4})',
-                    r'(?:我叫|名字是|姓名是|名字叫|叫)\s*([\u4e00-\u9fa5]{2,4})',
-                    r'([\u4e00-\u9fa5]{2,4})\s*(?:入住|住店|来住)'):
-            m = re.search(pat, user_input)
-            if m and self._valid_person_name(m.group(1)):
-                guest_name = m.group(1)
-                break
-        # 上一轮已给房型、本轮只回复裸姓名（如"陈老二"）
-        if not guest_name and pending.get("room_type"):
-            t = user_input.strip().strip("。.!！?？,， ")
-            if self._valid_person_name(t):
-                guest_name = t
+        guest_name = extract_guest_name(
+            user_input, waiting_for_name=bool(pending.get("room_type")))
 
         # 与上一轮暂存的另一半信息合并
         if not guest_name:
             guest_name = pending.get("guest_name")
         if not room_type:
             room_type = pending.get("room_type")
+            if room_type and not rate_plan and hotel:
+                # 先选“2-2”再补姓名时，按 ratePlanId 恢复所选档位
+                plan_id = pending.get("rate_plan_id")
+                rate_plan = next(
+                    (rp for rp in hotel.rate_plans
+                     if plan_id and rp.rate_plan_id == plan_id), None)
+                if rate_plan is None:
+                    rate_plan = next(
+                        (rp for rp in hotel.rate_plans
+                         if rp.room_name == room_type), None)
 
         if room_type and guest_name:
             self.shared_state.pending_booking = {}
@@ -734,7 +619,16 @@ class SupervisorAgent:
             msg = AgentMessage(
                 sender="Supervisor", receiver="BookingAgent",
                 msg_type="task", content="create_order",
-                data={"room_type": room_type, "guest_name": guest_name}
+                data={
+                    "room_type": room_type,
+                    "guest_name": guest_name,
+                    "price_per_night": (rate_plan.price_per_night
+                                        if rate_plan else None),
+                    "plan_note": (f"报价：第 {rate_plan.plan_no} 档"
+                                  f"（{rate_plan.meal or '餐食未知'}）"
+                                  if rate_plan and getattr(rate_plan, "plan_no", 0)
+                                  else ""),
+                }
             )
             self.workers["booking"].receive(msg)
             result = self.workers["booking"].process(self.shared_state)
@@ -748,7 +642,10 @@ class SupervisorAgent:
             return None
 
         elif room_type and not guest_name:
-            self.shared_state.pending_booking = {"room_type": room_type}
+            self.shared_state.pending_booking = {
+                "room_type": room_type,
+                "rate_plan_id": rate_plan.rate_plan_id if rate_plan else "",
+            }
             return f"{room_type}已记下～入住人写谁？（告诉我姓名就可以下单了）"
         elif not room_type and guest_name and hotel:
             self.shared_state.pending_booking = {"guest_name": guest_name}
@@ -783,13 +680,13 @@ class SupervisorAgent:
         """
         order_id = extracted.get("order_id", "")
         scope = "detail" if order_id else (
-            "list" if self._wants_order_list(extracted, raw_text) else "current")
+            "list" if wants_order_list(extracted, raw_text) else "current")
         msg = AgentMessage(
             sender="Supervisor", receiver="ServiceAgent",
             msg_type="task", content="query_order",
             data={
                 "order_id": order_id,
-                "order_status": self._detect_order_filter(extracted, raw_text),
+                "order_status": detect_order_filter(extracted, raw_text),
                 "scope": scope,
             }
         )
@@ -850,18 +747,17 @@ class SupervisorAgent:
 
         return "取消操作失败，请联系客服。"
 
-    # 这些字段出现，说明用户本轮确实在补充预订信息（而非闲聊）
-    _BOOKING_PARAM_KEYS = (
-        "city", "check_in", "check_out", "min_star",
-        "max_price", "facilities", "keyword", "guest_name",
-    )
-
     def _handle_chat(self, user_input: str, extracted: Optional[dict] = None) -> str:
         """处理闲聊和酒店选择"""
         extracted = extracted or {}
+        # "我想住3天"这类改晚数说法：merge_params 已重算离店日期，
+        # 直接回预订流程重新搜索，不能落到下面的序号提示或闲聊
+        if "_nights" in extracted:
+            return self._handle_booking_intent(user_input)
         # 酒店选择（推荐阶段用户回复序号）
         if self.shared_state.stage == "recommend" and self.shared_state.search_results:
-            selection = self._parse_hotel_selection(user_input)
+            selection = parse_hotel_selection(
+                user_input, self.shared_state.search_results, allow_bare_number=True)
             if selection:
                 self.shared_state.selected_hotel = selection
                 self.shared_state.stage = "booking"
@@ -869,7 +765,6 @@ class SupervisorAgent:
                 hotel = selection
 
                 p = self.shared_state.params
-                nights = self._calc_nights(p.check_in, p.check_out)
 
                 # 道旅酒店实时拉房型报价（含每档房间实拍图）；失败回退搜索缓存
                 live_detail = get_hotel_detail(
@@ -878,170 +773,21 @@ class SupervisorAgent:
                     hotel = live_detail
                     self.shared_state.selected_hotel = hotel
 
-                image_line = f"实拍图：{hotel.image_url}\n" if hotel.image_url else ""
-                header = (
-                    f"好的，你选择了：{hotel.name}\n"
-                    f"地址：{hotel.address}\n"
-                    f"入住：{p.check_in} → {p.check_out}（{nights}晚）\n"
-                    f"{image_line}"
-                )
-
-                if hotel.rate_plans:
-                    # 实时报价模式：逐房型展示价格/餐食/退改/房间实拍（前8档）
-                    max_rooms = 8
-                    shown = hotel.rate_plans[:max_rooms]
-                    room_lines = [
-                        f"可选房型（实时报价，按价格排序，共{len(hotel.rate_plans)}种）："]
-                    for i, rp in enumerate(shown, 1):
-                        cancel_text = "可免费取消" if rp.cancelable else "不可取消"
-                        meal_text = rp.meal or "餐食未知"
-                        bed_text = f"，{rp.bed_type}" if rp.bed_type else ""
-                        line = (
-                            f"{i}. {rp.room_name} — {rp.price_per_night:g}元/晚"
-                            f"（{meal_text}，{cancel_text}{bed_text}）"
-                        )
-                        if rp.image_url:
-                            line += f"\n   房间实拍：{rp.image_url}"
-                        room_lines.append(line)
-                    if len(hotel.rate_plans) > max_rooms:
-                        room_lines.append(
-                            f"... 另有 {len(hotel.rate_plans) - max_rooms} 种更高价位房型，"
-                            f"需要的话告诉我预算或床型帮你筛")
-                    if any(rp.image_url for rp in shown):
-                        room_lines.append(
-                            "（房间实拍链接可在终端中 Ctrl+点击 打开查看）")
-                    room_lines.append(
-                        "\n请告诉我：选择哪个房型（回复序号或房型名）+ 入住人姓名？"
-                        "\n（例如：1，入住人张三）")
-                    response = header + "\n" + "\n".join(room_lines)
-                else:
-                    # 模拟库/高德回退：沿用酒店每晚最低价与房型名
-                    total = calculate_total_price(hotel, p.check_in, p.check_out)
-                    response = (
-                        header
-                        + f"房价：{hotel.price_per_night}元/晚 × {nights}晚 = {total}元\n\n"
-                        f"可选房型：{'、'.join(hotel.room_types)}\n\n"
-                        f"请告诉我：\n1. 选择哪个房型？\n2. 入住人姓名？\n"
-                        f"（例如：海景大床房，入住人张三）"
-                    )
+                response = render_hotel_selection(hotel, p)
                 self.shared_state.conversation_history.append(f"助手：{response}")
                 return response
 
-            # 序号超出范围
-            import re
-            if re.search(r'\d+', user_input):
+            # 序号超出范围：仅"像在选序号"时才提示，带数字的其他说法不算
+            if is_selection_attempt(user_input):
                 total = len(self.shared_state.search_results)
                 return f"请输入 1-{total} 之间的序号，或直接告诉我酒店名称。"
 
         # 参数澄清阶段：仅当本轮消息确实携带预订信息时才继续预订流程
         if self.shared_state.stage in ("clarify", "intent") and any(
-                k in extracted for k in self._BOOKING_PARAM_KEYS):
+                k in extracted for k in BOOKING_PARAM_KEYS):
             return self._handle_booking_intent(user_input)
 
         # 真正的闲聊
-        response = self._chat_reply(user_input)
+        response = chat_reply(self.llm, user_input)
         self.shared_state.conversation_history.append(f"助手：{response}")
         return response
-
-    def _chat_reply(self, user_input: str) -> str:
-        """闲聊回复：谢谢/问候/告别给友好模板，其余交给真实 LLM 或能力介绍。"""
-        text = user_input.strip().lower()
-        if any(w in user_input for w in ("谢谢", "感谢", "多谢", "辛苦")):
-            return "不客气～还有酒店查询、预订或订单相关的需要，随时告诉我。"
-        if any(w in user_input for w in ("再见", "拜拜", "拜")) or text in ("bye", "goodbye"):
-            return "再见！祝你旅途愉快，需要订酒店时再来找我。"
-        if user_input.strip() in ("你好", "您好", "嗨", "你好啊") \
-                or text in ("hi", "hello"):
-            return (
-                "你好！我是酒店预订智能助手，可以帮你搜索预订酒店、查当前订单、"
-                "查历史订单、取消订单。\n"
-                "想订哪里的酒店？直接告诉我就行。"
-            )
-        if self.llm.use_real_llm:
-            reply = self.llm.generate_response(
-                "你是一个酒店预订智能助手，语气亲切简洁。请简短回应用户的寒暄或无关问题"
-                "（不超过两句话），并自然引导用户说出订房需求。不要编造酒店信息。",
-                user_input)
-            if reply and reply != "好的，我明白了。":
-                return reply
-        return (
-            "我主要能帮你：搜索预订酒店（如：帮我订下周末成都 300 元以内的酒店）、"
-            "查当前订单（我的订单/订单状态）、查历史订单清单、取消订单。"
-            "告诉我你的需求吧。"
-        )
-
-    def _parse_hotel_selection(self, user_input: str) -> Optional[Hotel]:
-        """解析用户的酒店选择"""
-        import re
-        num_match = re.search(r'(\d+)', user_input)
-        if num_match:
-            idx = int(num_match.group(1)) - 1
-            if 0 <= idx < len(self.shared_state.search_results):
-                return self.shared_state.search_results[idx]
-        for hotel in self.shared_state.search_results:
-            if hotel.name in user_input or hotel.hotel_id in user_input:
-                return hotel
-        return None
-
-    def _merge_params(self, extracted: dict, user_input: str = ""):
-        """合并提取的参数到共享状态"""
-        p = self.shared_state.params
-        if "city" in extracted:
-            p.city = extracted["city"]
-        if "check_in" in extracted:
-            new_ci = extracted["check_in"]
-            # 已有入住日期、正等离店日期时，用户只回一个日期（"27号""后天"）
-            # 应落到 check_out；否则会覆盖入住日期，导致反复追问离店日期
-            wants_check_in = any(w in user_input for w in ("入住", "改到", "提前", "推迟"))
-            if (p.check_in and not p.check_out and new_ci > p.check_in
-                    and "check_out" not in extracted and not wants_check_in):
-                p.check_out = new_ci
-            else:
-                p.check_in = new_ci
-        if "check_out" in extracted:
-            p.check_out = extracted["check_out"]
-        # 用户只说"住三天"时，用已有的入住日期推算离店日期
-        if extracted.get("_nights") and p.check_in and not p.check_out:
-            p.check_out = shift_date(p.check_in, int(extracted["_nights"]))
-        if "min_star" in extracted:
-            p.min_star = extracted["min_star"]
-        if "max_price" in extracted:
-            p.max_price = extracted["max_price"]
-        if "facilities" in extracted:
-            existing = set(p.facilities)
-            existing.update(extracted["facilities"])
-            p.facilities = list(existing)
-        if "keyword" in extracted:
-            p.keyword = extracted["keyword"]
-        if "location" in extracted:
-            p.location = extracted["location"]
-
-    def _generate_clarify_question(self, missing: list) -> str:
-        """生成参数追问"""
-        if len(missing) == 1:
-            templates = {
-                "城市": "请问你想去哪个城市？",
-                "入住日期": "请问你计划哪天入住？（如：下周末、2026-10-15）",
-                "离店日期": "请问你计划哪天离店？或住几晚？",
-            }
-            return templates.get(missing[0], f"请问{missing[0]}是什么？")
-        fields_str = "、".join(missing)
-        return f"好的，我还需要确认一些信息：{fields_str}。请告诉我这些信息，我帮你搜索。"
-
-    def _calc_nights(self, check_in: str, check_out: str) -> int:
-        from datetime import datetime
-        try:
-            d1 = datetime.strptime(check_in, "%Y-%m-%d")
-            d2 = datetime.strptime(check_out, "%Y-%m-%d")
-            return (d2 - d1).days
-        except (ValueError, TypeError):
-            return 0
-
-    def _reset_booking_state(self):
-        """重置预订状态"""
-        self.shared_state.params = BookingParams()
-        self.shared_state.search_results = []
-        self.shared_state.selected_hotel = None
-        self.shared_state.current_order = None
-        self.shared_state.pending_booking = {}
-        self.shared_state.stage = "intent"

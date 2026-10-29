@@ -566,19 +566,6 @@ def _to_number(value: Any) -> Optional[float]:
     return float(m.group(0)) if m else None
 
 
-def _to_bool(value: Any) -> Optional[bool]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    s = str(value).strip().lower()
-    if s in ("true", "1", "yes", "y", "可免费取消"):
-        return True
-    if s in ("false", "0", "no", "n", "不可取消"):
-        return False
-    return None
-
-
 # ---------------------------------------------------------------------------
 # 命令行入口：python rollinggo_book.py login | status | logout | orders
 # ---------------------------------------------------------------------------

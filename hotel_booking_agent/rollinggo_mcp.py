@@ -28,19 +28,25 @@ try:
 except ImportError:
     pass
 
-# 携程图片爬虫回退：道旅无图时从携程详情页爬真实图集。
-# 零依赖（仅 requests + re），30 天磁盘缓存，失败静默返回空。
-# 一次请求同时拿酒店封面图集与「房型名→实拍图」映射：
-#   - 封面：Hotel.image_url 缺失且高德也无图时回填
-#   - 房型图：rate_plans 里 roomInfo.images 缺失的条目按名称模糊匹配回填
-# 携程搜索页 SSR 只渲染前 5 家热门酒店，冷门酒店大概率匹配不上，
-# 由 0.85 相似度阈值保证不误匹配给错图。
+# 图片回退链：道旅（主源）→ 携程（二级）→ 高德（三级，需 AMAP_API_KEY）。
+# 携程详情页一次请求同时拿酒店封面图集与「房型名→实拍图」映射：
+#   - 封面：Hotel.image_url 缺失时回填
+#   - 房型图：道旅 roomInfo.images 通常只有 1 张，按房型名模糊匹配携程
+#     官方相册后补齐成多图图组（每个房型最多 8 张）
+# hotelId 由 m 站联想搜索接口定位（同城 + 名称匹配），
+# 0.85 相似度阈值保证不误匹配给错图。
 try:
     from ctrip_crawler import fetch_all_images as _ctrip_all
-    from ctrip_crawler import match_room_url as _ctrip_match_room
+    from ctrip_crawler import match_room_urls as _ctrip_match_rooms
 except ImportError:
     _ctrip_all = None  # 爬虫模块缺失时优雅降级
-    _ctrip_match_room = None
+    _ctrip_match_rooms = None
+
+# 图片三级源：高德 POI 实拍图（需 AMAP_API_KEY；无 Key 时返回空）
+try:
+    from amap_poi import fetch_hotel_photo as _amap_photo
+except ImportError:
+    _amap_photo = None
 
 # 国内站默认 .cn；若用的是 global.rollinggo.store 的国际 Key（mcp_ 开头），
 # 可在 .env 设置 ROLLINGGO_MCP_URL=https://mcp.rollinggo.ai/mcp
@@ -182,7 +188,9 @@ _POI_TYPE_RULES = (
     ("地铁站", "地铁站"),
     ("景区", "景点"), ("景点", "景点"), ("古镇", "景点"), ("古城", "景点"),
     ("故宫", "景点"), ("会展中心", "景点"), ("体育中心", "景点"),
-    ("大学城", "景点"), ("步行街", "景点"), ("商业街", "景点"), ("商圈", "景点"),
+    ("大学城", "景点"), ("大学", "景点"), ("学院", "景点"), ("学校", "景点"),
+    ("医院", "景点"), ("研究所", "景点"),
+    ("步行街", "景点"), ("商业街", "景点"), ("商圈", "景点"),
     ("广场", "景点"), ("公园", "景点"), ("夜市", "景点"), ("老街", "景点"),
     # "中街""太原街""春熙路"这类具体街道没有类型后缀，也按地标处理，
     # 否则会退化成城市搜索，拿不到 distanceInMeters，无法展示距离
@@ -507,9 +515,10 @@ def search_real_hotels(params: BookingParams, size: int = 20) -> List[Hotel]:
     """
     调用 searchHotels 并做质量校正：
     1) 城市硬校验——剔除服务端地理编码跑偏的跨城酒店（如"大连西安路"→西安）
-    2) POI 模式按锚点近邻过滤——剔除混入"附近"结果的下辖县镇酒店
-    3) POI 搜索质量差（0 同城/无地标命中）时自动补一次城市搜索
-    4) 预算本地兜底 + 地标词命中优先排序
+    2) POI 模式优先用道旅返回的 distanceInMeters 收敛结果；没有距离时才用
+       地标词/城市中心估锚点，避免大学、医院这类地标被城市中心酒店带偏
+    3) POI 搜索确实失效（无同城/无距离/无地标命中）时才补一次城市搜索
+    4) 预算本地兜底 + 距离/地标词排序
     """
     from geo_data import get_city_coord, haversine_km
 
@@ -521,11 +530,15 @@ def search_real_hotels(params: BookingParams, size: int = 20) -> List[Hotel]:
     items = _call_search(client, _build_arguments(params, size))
     same = [it for it in items if _is_same_city_item(it, params.city, city_coord)]
 
-    # POI 被服务端错误编码到外地（0 同城）或地标零命中时，补城市搜索
+    # POI 质量判断：道旅返回 distanceInMeters 说明 POI 已被正确定位；否则
+    # 才看酒店名/地址是否命中地标词。像“沈阳化工大学”这种地标，附近酒店
+    # 名称通常不含“化工大学”，不能因此误判成 POI 失效而补城市搜索。
+    poi_has_distance = any(
+        _to_float(it.get("distanceInMeters")) > 0 for it in same)
     has_landmark_hit = any(
         any(k in f"{it.get('name') or ''}{it.get('address') or ''}" for k in loc_keys)
         for it in same)
-    if poi and (not same or (loc_keys and not has_landmark_hit)):
+    if poi and not (same and (poi_has_distance or has_landmark_hit)):
         try:
             city_items = _call_search(client, _city_search_arguments(params, size))
             known_ids = {it.get("hotelId") for it in same}
@@ -538,19 +551,28 @@ def search_real_hotels(params: BookingParams, size: int = 20) -> List[Hotel]:
         except Exception as e:
             print(f"[城市兜底搜索失败] {e}")
 
-    # POI 模式：按锚点剔除下辖县镇等离群点（坐标缺失时放弃硬剔）
+    # POI 模式：剔除离群点。有 API 距离时直接按距离收敛；没有距离时才用
+    # 锚点估算（名称命中/城市中心），坐标缺失时放弃硬剔。
     if poi and city_coord:
-        anchor = _estimate_poi_anchor(same, city_coord, loc_keys)
-        kept = []
-        for it in same:
-            la, lo = _to_float(it.get("latitude")), _to_float(it.get("longitude"))
-            if la and lo and anchor:
-                if haversine_km(la, lo, *anchor) <= _POI_LOCAL_KM:
+        if poi_has_distance:
+            kept = []
+            for it in same:
+                d = _to_float(it.get("distanceInMeters"))
+                if not d or d <= _POI_LOCAL_KM * 1000:
                     kept.append(it)
-            else:
-                kept.append(it)
-        # 全部被剔说明锚点不可信（如小县城地标坐标稀疏），退回未剔集合
-        same = kept or same
+            same = kept or same
+        else:
+            anchor = _estimate_poi_anchor(same, city_coord, loc_keys)
+            kept = []
+            for it in same:
+                la, lo = _to_float(it.get("latitude")), _to_float(it.get("longitude"))
+                if la and lo and anchor:
+                    if haversine_km(la, lo, *anchor) <= _POI_LOCAL_KM:
+                        kept.append(it)
+                else:
+                    kept.append(it)
+            # 全部被剔说明锚点不可信（如小县城地标坐标稀疏），退回未剔集合
+            same = kept or same
 
     hotels = []
     for it in same:
@@ -602,7 +624,7 @@ def _location_hit(h: Hotel, loc_keys: List[str]) -> int:
 # 地理类型后缀：剥掉后得到地标实体核心，"中街步行街"→"中街"、"三亚湾海边"→"三亚湾"
 _GEO_SUFFIX_RE = re.compile(
     r'(步行街|商业街|主题公园|海洋公园|会展中心|体育中心|火车站|高铁站|地铁站|'
-    r'大学城|机场|商圈|景区|景点|广场|古镇|古城|夜市|老街|海边|海滩|沙滩|'
+    r'大学城|大学|学院|学校|医院|研究所|机场|商圈|景区|景点|广场|古镇|古城|夜市|老街|海边|海滩|沙滩|'
     r'湖边|江边|附近|周边|旁边|一带|市中心|市区|路|街|湾|站)$'
 )
 
@@ -647,66 +669,178 @@ def _rank_by_location(hotels: List["Hotel"], location: str) -> List["Hotel"]:
 
 # ========== 酒店详情（实时房型报价 / 退改政策）==========
 
-def _extract_room_image(info: dict) -> str:
+def _extract_room_images(info: dict) -> List[str]:
     """
-    取房型实拍图。实测 roomInfo.images 为单个 URL 字符串；
-    兼容数组 / 逗号分隔多图（取第一张），无图返回空串。
+    取房型实拍图组。实测 roomInfo.images 多为单个 URL 字符串，
+    也兼容数组 / JSON 数组字符串 / 逗号分隔多图；统一去重后返回。
     """
     imgs = info.get("images") if isinstance(info, dict) else None
-    if isinstance(imgs, list):
-        for x in imgs:
-            url = str(x or "").strip()
-            if url:
-                return url
-        return ""
-    if isinstance(imgs, str):
-        s = imgs.strip()
+    out: List[str] = []
+
+    def add(value) -> None:
+        s = str(value or "").strip()
+        if not s:
+            return
         if s.startswith("["):
             try:
                 arr = json.loads(s)
-                if isinstance(arr, list) and arr:
-                    return str(arr[0]).strip()
-            except ValueError:
-                pass
-        # 多图逗号分隔时取第一张（单 URL 不含逗号）
-        return s.split(",")[0].strip() if s else ""
-    return ""
+            except (ValueError, TypeError):
+                arr = None
+            if isinstance(arr, list):
+                for x in arr:
+                    add(x)
+                return
+        for part in re.split(r"[,;\s]+", s):
+            part = part.strip()
+            if part and part not in out:
+                out.append(part)
+
+    if isinstance(imgs, list):
+        for x in imgs:
+            add(x)
+    else:
+        add(imgs)
+    return out
+
+
+# 每个房型最多展示几档报价：太低会漏掉“含早 + 可取消”的组合，
+# 太高会让聊天消息过长；实测同房型去重后通常 1~4 档。
+_MAX_PLANS_PER_ROOM = 4
+
+
+def _meal_bucket(meal: str) -> str:
+    """把各种餐食文案归一成可比较的档位，未知不能被当成“无早”。"""
+    s = (meal or "").strip()
+    if not s:
+        return "餐食未知"
+    if "早晚餐" in s or "早午晚" in s or "三餐" in s:
+        return "含早晚餐"
+    if "不含早" in s or "无早" in s:
+        return "无早"
+    if "含早" in s or "早餐" in s or "双早" in s or "单早" in s:
+        return "含早"
+    return s
 
 
 def _to_rate_plan(plan: dict) -> RoomRatePlan:
     """把单个 roomRatePlans 报价映射为 RoomRatePlan"""
     info = plan.get("roomInfo") or {}
+    meal = str(plan.get("mealTypeStr") or "").strip()
+    cancel_policy = str(plan.get("cancelPolicy") or "").strip()
+    raw_cancelable = plan.get("cancelable")
+    if raw_cancelable is None:
+        # 字段缺失时用退改文案推断；两者都没有则标记为“退改未知”，
+        # 不能直接当成“不可取消”误导用户。
+        cancel_known = bool(cancel_policy)
+        cancelable = ("免费取消" in cancel_policy) if cancel_policy else False
+    else:
+        cancel_known = True
+        cancelable = bool(raw_cancelable)
     return RoomRatePlan(
         room_name=str(plan.get("roomName") or "未知房型"),
         price_per_night=_to_float(plan.get("averagePrice")),
-        meal=str(plan.get("mealTypeStr") or ""),
-        cancelable=bool(plan.get("cancelable")),
-        cancel_policy=str(plan.get("cancelPolicy") or ""),
+        meal=meal,
+        cancelable=cancelable,
+        cancel_policy=cancel_policy,
         bed_type=str(plan.get("bedTypeDescription") or ""),
         max_occupancy=int(_to_float(info.get("maxOccupancy"))),
         room_size=str(info.get("size") or ""),
         on_request=bool(plan.get("isOnRequest")),
         rate_plan_id=str(plan.get("ratePlanId") or ""),
-        image_url=_extract_room_image(info),
+        image_urls=_extract_room_images(info),
+        meal_category=_meal_bucket(meal),
+        cancel_known=cancel_known,
     )
+
+
+def _pick_room_plans(plans: List[RoomRatePlan],
+                     limit: int = _MAX_PLANS_PER_ROOM) -> List[RoomRatePlan]:
+    """
+    同房型内挑代表性报价：最低价必须有，再尽量覆盖“可取消”“含早”两个
+    关键权益，最后按价格补足。这样即使用户只看到 3 档，也不会漏掉退改
+    或餐食上的重要选择。
+    """
+    ordered = sorted(plans, key=lambda x: x.price_per_night)
+    chosen = [ordered[0]]
+
+    def ensure(pred) -> None:
+        if any(pred(p) for p in chosen):
+            return
+        cand = next((p for p in ordered if pred(p) and p not in chosen), None)
+        if cand is not None and len(chosen) < limit:
+            chosen.append(cand)
+
+    ensure(lambda p: p.cancelable is True)
+    ensure(lambda p: p.meal_category in ("含早", "含早晚餐"))
+    for p in ordered:
+        if len(chosen) >= limit:
+            break
+        if p not in chosen:
+            chosen.append(p)
+    return sorted(chosen, key=lambda x: x.price_per_night)
 
 
 def _aggregate_rate_plans(plans_raw: list) -> List[RoomRatePlan]:
     """
     同一家酒店可能返回上百条报价（同房型 × 含早/退改组合）。
-    按房型名聚合，每个房型保留最便宜的一档作为代表，按价格升序返回。
+    按「房型 + 餐食 + 退改 + 申请确认 + 床型 + 入住人数」分桶，每桶保留
+    最低价；每个房型最多保留 4 档代表性报价，按房型最低价、再按报价
+    价格升序返回（扁平列表，用 room_no / plan_no 定位）。
+
+    同房型各档报价的 image 字段可能是不同实拍图，统一合并到房型图组，
+    展示时每个房型只出现一次。
     """
-    cheapest: Dict[str, RoomRatePlan] = {}
-    for p in plans_raw:
+    # 外层按“房型 + 床型 + 最大入住人数”分组，避免把 1 大床和 2 床
+    # 的报价放进同一个房型标题下比较
+    buckets: Dict[tuple, Dict[tuple, RoomRatePlan]] = {}
+    room_images: Dict[tuple, List[str]] = {}
+    first_seen: Dict[tuple, int] = {}
+    for idx, p in enumerate(plans_raw):
         if not isinstance(p, dict):
             continue
         rp = _to_rate_plan(p)
         if rp.price_per_night <= 0:
             continue
-        existed = cheapest.get(rp.room_name)
+        room = (rp.room_name, rp.bed_type, rp.max_occupancy)
+        first_seen.setdefault(room, idx)
+        room_images[room] = _merge_room_images(
+            room_images.get(room, []), rp.image_urls)
+        key = (rp.meal_category, rp.cancel_known, rp.cancelable,
+               rp.on_request)
+        bucket = buckets.setdefault(room, {})
+        existed = bucket.get(key)
         if existed is None or rp.price_per_night < existed.price_per_night:
-            cheapest[rp.room_name] = rp
-    return sorted(cheapest.values(), key=lambda x: x.price_per_night)
+            bucket[key] = rp
+
+    rooms = []
+    for room, bucket in buckets.items():
+        plans = _pick_room_plans(list(bucket.values()))
+        images = room_images.get(room, [])[:8]
+        for plan_no, rp in enumerate(plans, 1):
+            rp.plan_no = plan_no
+            rp.is_lowest = (plan_no == 1)
+            rp.image_urls = images
+        rooms.append((plans[0].price_per_night, first_seen[room], plans))
+    rooms.sort(key=lambda x: (x[0], x[1]))
+
+    out: List[RoomRatePlan] = []
+    for room_no, (_, _, plans) in enumerate(rooms, 1):
+        for rp in plans:
+            rp.room_no = room_no
+        out.extend(plans)
+    return out
+
+
+def _merge_room_images(primary: List[str],
+                       extra: List[str],
+                       limit: int = 8) -> List[str]:
+    """合并房型图组：道旅首图优先，携程相册其余图追加，去重后截断。"""
+    out: List[str] = []
+    for url in list(primary or []) + list(extra or []):
+        u = str(url or "").strip()
+        if u and u not in out:
+            out.append(u)
+    return out[:limit]
 
 
 def enrich_hotel_detail(hotel: Hotel, check_in: str,
@@ -736,27 +870,37 @@ def enrich_hotel_detail(hotel: Hotel, check_in: str,
                                   if isinstance(data, dict) else [])
     if plans:
         hotel.rate_plans = plans
-        hotel.room_types = [rp.room_name for rp in plans]
+        # 报价按房型分多档后，room_types 必须去重（否则“房型不存在”校验
+        # 会拿到带重复名的列表，展示也乱）
+        hotel.room_types = list(dict.fromkeys(rp.room_name for rp in plans))
         # 详情最低价更新为实时报价的最低价（搜索价可能是缓存/近似值）
         hotel.price_per_night = plans[0].price_per_night
     if isinstance(data, dict) and data.get("bookingUrl"):
         hotel.booking_url = data["bookingUrl"]
 
-    # ----- 携程图片回退：封面缺失或任一房型图缺失时，爬一次携程详情页 -----
-    # 一次详情页请求同时拿到封面图集和房型图映射，缓存 30 天
+    # ----- 携程图片回退：封面缺失或房型图组不完整时，爬一次携程详情页 -----
+    # 一次详情页请求同时拿到封面图集和房型图映射，缓存 30 天。
+    # 道旅 roomInfo.images 实测只有 1 张，所以房型图不能只在“无图”时补：
+    # 必须拉一次相册，把同房型的多张实拍图合并进图组。
     need_cover = not hotel.image_url
-    need_rooms = any(not rp.image_url for rp in (hotel.rate_plans or []))
-    if (need_cover or need_rooms) and _ctrip_all is not None:
+    if _ctrip_all is not None:
         try:
             covers, room_map = _ctrip_all(hotel)
             if need_cover and covers:
                 hotel.image_url = covers[0]
-            if need_rooms and room_map and _ctrip_match_room is not None:
+            if room_map and _ctrip_match_rooms is not None:
                 for rp in hotel.rate_plans:
-                    if not rp.image_url:
-                        rp.image_url = _ctrip_match_room(rp.room_name, room_map)
+                    album = _ctrip_match_rooms(rp.room_name, room_map)
+                    rp.image_urls = _merge_room_images(rp.image_urls, album)
         except Exception:
             # 爬虫网络/解析异常绝不阻塞订房主流程
+            pass
+
+    # ----- 高德补图：道旅、携程都没图时的最后一级 -----
+    if not hotel.image_url and _amap_photo is not None:
+        try:
+            hotel.image_url = _amap_photo(hotel)
+        except Exception:
             pass
 
     return hotel
