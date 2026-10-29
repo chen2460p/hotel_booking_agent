@@ -3,7 +3,6 @@
 
 from dataclasses import dataclass, field
 from typing import List, Optional
-from datetime import date
 
 
 @dataclass
@@ -11,7 +10,7 @@ class RoomRatePlan:
     """
     房型报价计划（来自道旅 getHotelDetail 的实时报价）
     同一房型可能有多个报价（含早/不含早、可取消/不可取消），
-    适配器按房型聚合并保留最便宜的一档作为代表。
+    适配器按房型聚合并保留多档代表性报价，供用户对比选择。
     """
     room_name: str          # 房型名称，如"行政单房公寓（双床）"
     price_per_night: float  # 每晚均价（元）
@@ -23,7 +22,20 @@ class RoomRatePlan:
     room_size: str = ""     # 面积（平方米，接口可能给区间）
     on_request: bool = False  # 是否需申请确认（非即时确认）
     rate_plan_id: str = ""  # 报价计划ID（真实下单时需要）
-    image_url: str = ""     # 该房型实拍图直链（道旅 roomInfo.images，无图留空）
+    # 该房型实拍图组，首图即封面。道旅 roomInfo.images 通常只给 1 张，
+    # 携程官方相册按房型名匹配后可补到多张；无图时为空列表
+    image_urls: List[str] = field(default_factory=list)
+    # 多档报价展示/选择用：房型序号（1..N）与房型内报价序号（1..M）
+    room_no: int = 0
+    plan_no: int = 0
+    is_lowest: bool = False     # 是否本房型最低价
+    meal_category: str = ""     # 归一后的餐食档：无早/含早/含早晚餐/餐食未知
+    cancel_known: bool = True   # False 表示接口没给退改信息，展示“退改未知”
+
+    @property
+    def image_url(self) -> str:
+        """房型首图（兼容只关心封面的旧调用）。"""
+        return self.image_urls[0] if self.image_urls else ""
 
 
 @dataclass
@@ -40,7 +52,7 @@ class Hotel:
     rating: float           # 用户评分（0-5）
     review_count: int       # 评论数
     recommend_rate: str = ""    # 好评率，如 "92%"（仅真实评价来源有值）
-    rating_source: str = ""     # 评分来源，如 "高德地图"/"百度地图"；空表示内置模拟/未知
+    rating_source: str = ""     # 评分来源，如 "携程"/"百度地图"/"高德地图"；空表示内置模拟/未知
     # 实时详情（仅道旅详情接口返回；模拟/高德数据为空）
     rate_plans: List[RoomRatePlan] = field(default_factory=list)
     booking_url: str = ""   # 真实预订页链接

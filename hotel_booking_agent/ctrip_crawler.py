@@ -8,24 +8,29 @@
 
 ====================
 
-携程酒店图片爬虫 —— 搜索页 SSR 拿 hotelId，详情页 SSR 拿图集。
+携程酒店图片/评分爬虫 —— 联想搜索接口拿 hotelId 与评分，详情页 SSR 拿图集。
 
 设计要点：
-- 零依赖（仅 requests + re），无 WAF 反爬风险：携程详情页对脚本请求放行
+- 零依赖（仅 requests + re），无 WAF 反爬风险：携程详情页与联想接口对脚本请求放行
   （同程 ly.com 实测为 Nuxt SPA 壳 + 签名接口 + WAF 403，不作为数据源）
-- 名称+城市匹配：搜索页 HTML 里有 data-offline-hotelId + hotelName 卡片，按编辑距离最近匹配
+- hotelId 定位：m.ctrip.com 联想搜索接口（action=online）返回 JSON，
+  一次请求同时给出 hotelId、评分（commentScore）、点评数（commentCount）、
+  评价标签（commentlevel）、星级、封面缩略图与坐标；按名称相似度 + 同城过滤匹配
+  （旧方案解析搜索页 SSR 只渲染热门酒店，实测 4 家全部定位失败，已废弃）
 - 图集筛选：只取 dimg04.c-ctrip.com 的真实酒店图，剔除 webresource/pages 这类 UI 资源
 - 房型图组：详情页 SSR 官方相册 JSON 里有「房型名 → 实拍图列表」（imgTitle 为完整房型名），
-  按名称模糊匹配回填道旅缺失的房型图（match_room_url）
+  按名称模糊匹配补全道旅房型图组（match_room_urls，一个房型多张图）
 - 磁盘缓存（项目内 cache/ctrip_imgs.json，30 天）：图片变化慢，避免每次搜索都重爬
 - 失败静默：网络/解析异常一律返回 []，绝不阻塞订房主流程
 - 不替代道旅主图源，仅作回退：酒店封面在 RollingGo/高德均无图时启用，
-  房型图在 roomInfo.images 缺失时启用
+  房型图用于把道旅的单张 roomInfo.images 补齐成多图图组
 
 调用入口：
-  from ctrip_crawler import fetch_all_images, match_room_url
+  from ctrip_crawler import fetch_all_images, match_room_urls, fetch_rating
   covers, rooms = fetch_all_images(hotel)   # (封面直链列表, {房型名: [直链]})
-  url = match_room_url("高级大床房", rooms)  # 模糊匹配单个房型的首图
+  urls = match_room_urls("高级大床房", rooms)  # 模糊匹配整个房型图组
+  url = match_room_url("高级大床房", rooms)    # 只取首图（旧接口）
+  rec = fetch_rating(hotel)                  # {"rating","count","level","hotel_id"}
   # 兼容旧接口：
   from ctrip_crawler import enrich_hotel_images
   urls = enrich_hotel_images(hotel)          # 仅封面直链列表
@@ -57,10 +62,18 @@ _HDR = {
     "Accept-Language": "zh-CN,zh;q=0.9",
     "Referer": "https://hotels.ctrip.com/hotels/list",
 }
-_SEARCH_URL = "https://hotels.ctrip.com/hotels/list"
+# 联想搜索（m 站）：返回 JSON，含 hotelId / 评分 / 点评数 / 星级 / 封面缩略图
+_GLOBAL_SEARCH_URL = "https://m.ctrip.com/restapi/h5api/globalsearch/search"
+_JSON_HDR = {
+    "User-Agent": _UA,
+    "Accept": "application/json",
+    "Referer": "https://m.ctrip.com/hotels/",
+}
 _DETAIL_TPL = "https://hotels.ctrip.com/hotels/{hotel_id}.html"
 _TIMEOUT = (5, 10)
 _CACHE_TTL = 30 * 24 * 3600
+_RATING_TTL = 7 * 24 * 3600          # 评分变化慢，7 天足够
+_NEG_RATING_TTL = 3 * 24 * 3600     # 确认无评分的负缓存
 # imgTitle 含"房"但实为设施的固定词，拉黑防混入房型图组
 _ROOM_FACILITY_WORDS = {"健身房", "厨房", "书房"}
 # 道旅客型名常见的修饰前缀（如"高级大床房"→"大床房"），匹配前逐级剥离
@@ -73,26 +86,25 @@ _mem_cache: dict = {}
 _cache_lock = threading.Lock()
 _disk_loaded = False
 
-# 携程城市ID映射（搜索页 URL 必须带 cityId 才能拿到对应城市的酒店）
-# 实测从 hotel.city 中文名直接搜也能命中，但带 cityId 更精准
-_CITY_IDS = {
-    "北京": 1, "上海": 2, "广州": 32, "深圳": 26, "成都": 28, "杭州": 14,
-    "重庆": 27, "西安": 18, "南京": 11, "武汉": 9, "天津": 3, "苏州": 15,
-    "长沙": 19, "青岛": 22, "厦门": 23, "大连": 4, "昆明": 24, "三亚": 20,
-    "济南": 17, "郑州": 36, "合肥": 16, "福州": 21, "南昌": 12, "南宁": 25,
-    "贵阳": 33, "兰州": 47, "海口": 30, "沈阳": 6, "哈尔滨": 8, "长春": 7,
-    "石家庄": 5, "太原": 10, "呼和浩特": 13, "拉萨": 39, "银川": 41,
-    "乌鲁木齐": 38, "西宁": 40, "银川": 41, "温州": 49, "宁波": 50,
-}
+
+def _ensure_disk_loaded() -> None:
+    """磁盘缓存进程内只懒加载一次（调用方须持 _cache_lock）。"""
+    global _disk_loaded
+    if _disk_loaded:
+        return
+    for k, v in _load_cache().items():
+        _mem_cache.setdefault(k, v)
+    _disk_loaded = True
 
 
 def _load_cache() -> dict:
     try:
         with open(_CACHE_PATH, "r", encoding="utf-8") as f:
             items = json.load(f).get("items", {})
-        # v2 起记录含 rooms 字段；旧版记录（无 rooms）直接丢弃，保持结构统一
+        # 记录按用途分两种：图片（rooms/ts）与评分（rating/rating_ts），
+        # 两种都保留；既无 rooms 也无 rating 的旧版残留记录丢弃
         return {k: v for k, v in items.items() if isinstance(v, dict)
-                and "rooms" in v}
+                and ("rooms" in v or "rating" in v)}
     except Exception:
         return {}
 
@@ -110,24 +122,41 @@ def _save_cache(items: dict) -> None:
 
 def _cached_get(key: str) -> Optional[tuple]:
     """命中返回 (封面列表, 房型图映射)；负缓存返回 ([], {})；无缓存返回 None。"""
-    global _disk_loaded
     with _cache_lock:
-        if not _disk_loaded:
-            for k, v in _load_cache().items():
-                _mem_cache.setdefault(k, v)
-            _disk_loaded = True
+        _ensure_disk_loaded()
         rec = _mem_cache.get(key)
-    if not rec:
+    if not rec or "rooms" not in rec:
         return None
     if time.time() - rec.get("ts", 0) > _CACHE_TTL:
         return None
     return (rec.get("urls", []), rec.get("rooms", {}))
 
 
-def _cache_put(key: str, urls: list, rooms: dict) -> None:
+def _cache_update(key: str, **fields) -> None:
+    """合并写入：图片与评分共用一条记录，互不覆盖。"""
     with _cache_lock:
-        _mem_cache[key] = {"urls": urls, "rooms": rooms, "ts": int(time.time())}
+        rec = dict(_mem_cache.get(key) or {})
+        rec.update(fields)
+        _mem_cache[key] = rec
         _save_cache(_mem_cache)
+
+
+def _cache_put(key: str, urls: list, rooms: dict) -> None:
+    _cache_update(key, urls=urls, rooms=rooms, ts=int(time.time()))
+
+
+def _rating_cached_get(key: str) -> Optional[dict]:
+    """返回评分缓存记录（rating 为 0 表示确认无评分）；无缓存/过期返回 None。"""
+    with _cache_lock:
+        _ensure_disk_loaded()
+        rec = _mem_cache.get(key)
+    if not rec or "rating" not in rec:
+        return None
+    rating = rec.get("rating") or {}
+    ttl = _RATING_TTL if rating.get("rating", 0) > 0 else _NEG_RATING_TTL
+    if time.time() - rec.get("rating_ts", 0) > ttl:
+        return None
+    return rating
 
 
 def _norm(name: str) -> str:
@@ -143,58 +172,120 @@ def _name_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, na, nb).ratio()
 
 
-def _parse_search_hotels(html: str, city_name: str) -> List[dict]:
-    """从搜索页 SSR HTML 解析酒店卡片列表。
+def _search_hotels(keyword: str) -> List[dict]:
+    """携程 m 站联想搜索（JSON）：一次请求拿到 hotelId、评分、点评数、星级。
 
-    搜索页 SSR 把每家酒店渲染成卡片，包含：
-      data-offline-hotelId="128128509" 和 <span class="hotelName">全季酒店(...)</span>
-    两步法：先找所有 hotelId 位置，再向后在 1500 字符窗口内提取最近 hotelName。
+    返回条目示例：
+      {"id":78106107,"word":"沈阳中街故宫玫瑰亚朵酒店","type":"hotel",
+       "cityId":451,"cityName":"沈阳","commentScore":4.7,
+       "commentCount":6451,"commentlevel":"超棒","starRating":"高档型",
+       "imageUrl":"https://dimg11.c-ctrip.com/...","lat":...,"lon":...}
+    失败返回 []，绝不抛异常。
     """
-    out = []
-    hid_pat = re.compile(r'data-offline-hotelId="(\d{4,12})"')
-    name_pat = re.compile(r'class="hotelName">([^<]+)</span>')
-    for m in hid_pat.finditer(html):
-        hid = m.group(1)
-        # 向后 1500 字符内找 hotelName
-        window = html[m.end():m.end() + 1500]
-        nm = name_pat.search(window)
-        if nm:
-            out.append({"hotel_id": hid, "name": nm.group(1).strip()})
-    return out
+    if not keyword:
+        return []
+    try:
+        r = requests.get(_GLOBAL_SEARCH_URL, params={
+            "source": "mobileweb",
+            "action": "online",
+            "contentType": "json",
+            "keyword": keyword,
+        }, headers=_JSON_HDR, timeout=_TIMEOUT)
+        if r.status_code != 200:
+            return []
+        items = r.json().get("data") or []
+    except Exception:
+        return []
+    return [d for d in items
+            if isinstance(d, dict) and d.get("type") == "hotel" and d.get("id")]
+
+
+def _same_city(a: str, b: str) -> bool:
+    """城市名比对：容忍"沈阳"/"沈阳市"这类后缀差异。"""
+    na, nb = _norm(a), _norm(b)
+    if not na or not nb:
+        return False
+    na = na[:-1] if na.endswith("市") else na
+    nb = nb[:-1] if nb.endswith("市") else nb
+    return na == nb
+
+
+def _pick_hotel(hotel_name: str, city: str,
+                candidates: List[dict]) -> Optional[dict]:
+    """同城过滤 + 名称匹配，取最可信的一家；不达标返回 None。
+
+    匹配规则（宁缺毋滥，宁可无图/无评分也不给错）：
+    - 有城市信息时硬过滤：候选里没有同城的一律拒绝，避免跨城误匹配
+    - 强匹配：归一后互相包含且长度比 ≥ 0.6（"XX酒店" vs "XX酒店(中街店)"）
+    - 弱匹配：编辑距离相似度 ≥ 0.85（"沈阳故宫玫瑰亚朵酒店" vs
+      "沈阳中街故宫玫瑰亚朵酒店" = 0.91）
+    """
+    if not candidates:
+        return None
+    pool = [c for c in candidates if _same_city(c.get("cityName"), city)] \
+        if city else candidates
+    if not pool:
+        return None
+    nn = _norm(hotel_name)
+    best, best_key = None, None
+    for c in pool:
+        cn = _norm(c.get("word") or "")
+        if not nn or not cn:
+            continue
+        sim = _name_similarity(hotel_name, c.get("word") or "")
+        shorter, longer = sorted((len(nn), len(cn)))
+        strong = (nn in cn or cn in nn) and shorter / longer >= 0.6
+        if not strong and sim < 0.85:
+            continue
+        key = (2 if strong else 1, sim)
+        if best_key is None or key > best_key:
+            best, best_key = c, key
+    return best
 
 
 def _find_hotel_id(hotel_name: str, city: str) -> Optional[str]:
-    """从携程搜索页 SSR 找到最匹配的 hotelId。"""
-    cid = _CITY_IDS.get(city or "", "")
-    # 用城市名兜底（搜索结果会基于城市名匹配）
-    params = {
-        "checkIn": "2026-12-19",
-        "checkOut": "2026-12-20",
-        "city": cid or 1,
-        "cityName": city or "北京",
-    }
+    """定位携程 hotelId：联想搜索 + 同城名称匹配。"""
+    hit = _pick_hotel(hotel_name, city, _search_hotels(hotel_name))
+    return str(hit["id"]) if hit else None
+
+
+def fetch_rating(hotel: Hotel) -> Optional[dict]:
+    """携程真实用户评分：{"rating","count","level","hotel_id"}；查不到返回 None。
+
+    评分取自联想搜索接口的 commentScore / commentCount / commentlevel，
+    与详情页 hotelComment.comment 的 score / totalComment 一致（点评数有
+    几条缓存延迟，误差可忽略）。7 天缓存，确认无评分做 3 天负缓存。
+    """
+    if not hotel or not hotel.name:
+        return None
+    key = f"{hotel.city or ''}|{hotel.name}"
+    cached = _rating_cached_get(key)
+    if cached is not None:
+        return cached if cached.get("rating", 0) > 0 else None
+    hit = _pick_hotel(hotel.name, hotel.city or "", _search_hotels(hotel.name))
+    now = int(time.time())
+    if not hit:
+        _cache_update(key, rating={"rating": 0}, rating_ts=now)
+        return None
     try:
-        r = requests.get(_SEARCH_URL, params=params, headers=_HDR, timeout=_TIMEOUT)
-    except Exception:
+        score = float(hit.get("commentScore") or 0)
+    except (TypeError, ValueError):
+        score = 0.0
+    if score <= 0:
+        _cache_update(key, rating={"rating": 0}, rating_ts=now)
         return None
-    if r.status_code != 200 or len(r.text) < 10000:
-        return None
-    hotels = _parse_search_hotels(r.text, city or "")
-    if not hotels:
-        return None
-    # 按 name 编辑距离匹配，取最相似的
-    scored = [(h, _name_similarity(hotel_name, h["name"])) for h in hotels]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    # 调试：打印 top3 候选（自测用，正式调用静默）
-    if __name__ == "__main__":
-        print(f"[ctrip_debug] search_got={len(hotels)} top3: {[(s[0]['name'], round(s[1],2)) for s in scored[:3]]}")
-    # 阈值 0.85：宁缺毋滥。实测：
-    #   自身完全匹配 = 1.0 ✓
-    #   "全季酒店" vs "如家商旅酒店" = 0.58 ✗（避免误匹配给错图）
-    #   "外滩茂悦" vs "外滩璞硯" = 0.71 ✗（不同酒店不误匹配）
-    if scored[0][1] >= 0.85:
-        return scored[0][0]["hotel_id"]
-    return None
+    try:
+        count = int(hit.get("commentCount") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    rec = {
+        "rating": score,
+        "count": count,
+        "level": str(hit.get("commentlevel") or ""),
+        "hotel_id": str(hit.get("id")),
+    }
+    _cache_update(key, rating=rec, rating_ts=now)
+    return rec
 
 
 def _parse_detail_images(html: str) -> List[str]:
@@ -244,7 +335,7 @@ def _parse_room_images(html: str) -> Dict[str, List[str]]:
         lst = rooms.setdefault(title, [])
         if url not in lst:
             lst.append(url)
-    # 每个房型最多保留 8 张（回填只用首图，多留几张备用）
+    # 每个房型最多保留 8 张：相册原始条目可能更多，展示用图组截断到 8 张
     return {t: u[:8] for t, u in rooms.items()}
 
 
@@ -265,23 +356,27 @@ def _candidate_room_names(room_name: str) -> List[str]:
     return names
 
 
-def match_room_url(room_name: str, room_map: Dict[str, List[str]]) -> str:
-    """道旅房型名 → 携程相册房型首图。
+def match_room_urls(room_name: str, room_map: Dict[str, List[str]],
+                    limit: int = 8) -> List[str]:
+    """道旅房型名 → 携程相册里该房型的整组实拍图。
 
     匹配策略：归一后编辑距离 + 子串强匹配，修饰前缀逐级剥离重试。
     道旅客型名通常是通用短名（如"大床房"），携程是营销长名
     （如"一室宣光‖100寸巨幕‖全景大床房（语音智控+舒达床垫）"），
     短名 ⊂ 长名时视为强匹配。同分时取名称更短（更贴近通用名）的。
     阈值 0.45 宁缺毋滥：子串命中约 0.8+ 通过，无关名称 0.2~0.3 拒绝。
+
+    返回命中房型的全部图片（最多 limit 张），未匹配返回 []。
     """
     n = _norm(room_name)
     if not n or not room_map:
-        return ""
+        return []
     candidates = [_norm(x) for x in _candidate_room_names(room_name)]
     candidates = [x for x in candidates if x]
     if not candidates:
-        return ""
-    best_url, best_score, best_len = "", 0.0, 0
+        return []
+    best_urls: List[str] = []
+    best_score, best_len = 0.0, 0
     for title, urls in room_map.items():
         if not urls:
             continue
@@ -295,8 +390,14 @@ def match_room_url(room_name: str, room_map: Dict[str, List[str]]) -> str:
                 s += 0.5
             score = max(score, s)
         if score > best_score or (score == best_score and best_len and len(t) < best_len):
-            best_url, best_score, best_len = urls[0], score, len(t)
-    return best_url if best_score >= 0.45 else ""
+            best_urls, best_score, best_len = urls, score, len(t)
+    return list(best_urls[:limit]) if best_score >= 0.45 else []
+
+
+def match_room_url(room_name: str, room_map: Dict[str, List[str]]) -> str:
+    """兼容旧接口：只返回匹配房型的首图。"""
+    urls = match_room_urls(room_name, room_map, limit=1)
+    return urls[0] if urls else ""
 
 
 def _fetch_detail_data(hotel_id: str) -> tuple:
@@ -318,7 +419,7 @@ def fetch_all_images(hotel: Hotel) -> tuple:
       covers, rooms = fetch_all_images(hotel)
       if covers and not hotel.image_url:
           hotel.image_url = covers[0]
-      url = match_room_url("高级大床房", rooms)
+      urls = match_room_urls("高级大床房", rooms)
 
     失败/无匹配一律返回 ([], {})，不抛异常。
     """
@@ -346,11 +447,9 @@ def enrich_hotel_images(hotel: Hotel) -> List[str]:
 # ---------- CLI 自测入口 ----------
 if __name__ == "__main__":
     test_cases = [
-        # SSR 渲染的酒店（应能命中）
+        # 连锁/单体（联想接口应能命中）
         ("如家商旅酒店(北京花乡桥郭公庄地铁站店)", "北京"),
-        # 冷门酒店（SSR 不渲染，匹配不上）
         ("全季酒店(北京郎辛庄地铁站店)", "北京"),
-        # 上海酒店
         ("上海外滩茂悦大酒店", "上海"),
     ]
     for name, city in test_cases:
@@ -360,6 +459,7 @@ if __name__ == "__main__":
             rating=0, review_count=0,
         )
         print(f"\n=== 自测: {h.name} ({h.city}) ===")
+        print(f"rating: {fetch_rating(h)}")
         covers, room_map = fetch_all_images(h)
         print(f"covers: got {len(covers)} images")
         for u in covers[:3]:

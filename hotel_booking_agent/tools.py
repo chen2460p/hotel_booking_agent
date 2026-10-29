@@ -2,7 +2,7 @@
 # 真实场景中这些会调用酒店 API（如携程/飞猪），这里用内存数据模拟
 
 from typing import List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 import time
 import uuid
 
@@ -132,7 +132,7 @@ def _enrich_ratings_safely(hotels: List[Hotel]) -> None:
     try:
         n = enrich_hotels_rating(hotels)
         if n:
-            print(f"[评分] 已为 {n} 家酒店补全真实住客评分（来源：高德/百度地图）")
+            print(f"[评分] 已为 {n} 家酒店补全真实住客评分（来源：携程/百度/高德）")
     except Exception as e:
         print(f"[评分服务异常，已忽略] {type(e).__name__}: {e}")
 
@@ -556,47 +556,66 @@ def format_order_rows(rows: List[dict], max_show: int = 10) -> str:
     return "\n".join(lines)
 
 
-def format_hotel_list(hotels: List[Hotel], max_show: int = 5) -> str:
+HOTEL_PREVIEW = 5   # 首屏展示家数；其余由前端“展开全部”按需补评分后展示
+
+
+def _format_hotel_block(i: int, h: Hotel) -> str:
+    """格式化单家酒店；序号由调用方传入，展开时分段展示可延续编号。"""
+    # 高德 POI 数据中星级/价格/评分为 0 表示未知，展示层做友好兜底
+    star_text = f"{h.star}星" if h.star else "星级未知"
+    price_text = f"{h.price_per_night:g}元/晚" if h.price_per_night else "价格以实际预订为准"
+    if h.rating:
+        meta = []
+        if h.review_count:
+            meta.append(f"{h.review_count}条真实评价")
+        if h.recommend_rate:
+            meta.append(f"好评率{h.recommend_rate}")
+        if h.rating_source:
+            meta.append(f"来源：{h.rating_source}")
+        rating_text = f"评分：{h.rating:g}"
+        if meta:
+            rating_text += f"（{'，'.join(meta)}）"
+    else:
+        rating_text = "暂无评分"
+    facilities_str = "、".join(h.facilities[:4]) if h.facilities else "信息待补充"
+    distance_text = ""
+    if h.distance_m and h.distance_to:
+        # 距离由数据方给出，取整到 10 米，避免伪精确
+        dist_m = int(round(h.distance_m / 10.0) * 10)
+        distance_text = f"\n   距离：距{h.distance_to}约{dist_m}米"
+    block = (
+        f"{i}. {h.name}（{star_text}）\n"
+        f"   价格：{price_text} | {rating_text}\n"
+        f"   地址：{h.address}{distance_text}\n"
+        f"   设施：{facilities_str}\n"
+        f"   房型：{'、'.join(h.room_types)}"
+    )
+    if h.image_url:
+        block += f"\n   实拍图：{h.image_url}"
+    return block
+
+
+def format_hotel_list(hotels: List[Hotel], max_show: int = HOTEL_PREVIEW) -> str:
     """工具8：格式化酒店列表为可读文本（供 Agent 展示给用户）"""
     if not hotels:
         return "没有找到符合条件的酒店，建议放宽筛选条件。"
-    lines = []
-    for i, h in enumerate(hotels[:max_show], 1):
-        # 高德 POI 数据中星级/价格/评分为 0 表示未知，展示层做友好兜底
-        star_text = f"{h.star}星" if h.star else "星级未知"
-        price_text = f"{h.price_per_night:g}元/晚" if h.price_per_night else "价格以实际预订为准"
-        if h.rating:
-            meta = []
-            if h.review_count:
-                meta.append(f"{h.review_count}条真实评价")
-            if h.recommend_rate:
-                meta.append(f"好评率{h.recommend_rate}")
-            if h.rating_source:
-                meta.append(f"来源：{h.rating_source}")
-            rating_text = f"评分：{h.rating:g}"
-            if meta:
-                rating_text += f"（{'，'.join(meta)}）"
-        else:
-            rating_text = "暂无评分"
-        facilities_str = "、".join(h.facilities[:4]) if h.facilities else "信息待补充"
-        distance_text = ""
-        if h.distance_m and h.distance_to:
-            # 距离由数据方给出，取整到 10 米，避免伪精确
-            dist_m = int(round(h.distance_m / 10.0) * 10)
-            distance_text = f"\n   距离：距{h.distance_to}约{dist_m}米"
-        block = (
-            f"{i}. {h.name}（{star_text}）\n"
-            f"   价格：{price_text} | {rating_text}\n"
-            f"   地址：{h.address}{distance_text}\n"
-            f"   设施：{facilities_str}\n"
-            f"   房型：{'、'.join(h.room_types)}"
-        )
-        if h.image_url:
-            block += f"\n   实拍图：{h.image_url}"
-        lines.append(block)
+    lines = [_format_hotel_block(i, h)
+             for i, h in enumerate(hotels[:max_show], 1)]
     if len(hotels) > max_show:
         lines.append(f"... 还有 {len(hotels) - max_show} 家，可告知更多偏好帮你筛选")
     # 有真实图片时提示链接可点击（模拟库无实拍图则不提示，避免噪音）
     if any(h.image_url for h in hotels[:max_show]):
         lines.append("（实拍图链接可在终端中 Ctrl+点击 打开查看，图片由数据方提供）")
     return "\n".join(lines)
+
+
+def format_hotel_slice(hotels: List[Hotel], start: int,
+                       count: int) -> str:
+    """格式化 hotels[start:start+count]，编号从 start+1 延续。
+
+    供 Web 端“展开全部”分段调用：每段先补真实评分再格式化，
+    保证展开部分与首屏使用同一套展示规则。
+    """
+    rows = hotels[start:start + count]
+    return "\n".join(_format_hotel_block(start + i, h)
+                     for i, h in enumerate(rows, 1))
