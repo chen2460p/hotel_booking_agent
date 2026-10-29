@@ -15,18 +15,19 @@ from models import AgentState
 from tools import (
     search_hotels,
     create_order, pay_order, cancel_order, get_order_status,
-    format_hotel_list, list_history_orders, format_order_rows,
+    list_history_orders, format_order_rows,
     sync_real_order_status, real_order_cancel_guide,
 )
 from llm import LLMClient
 from agent_common import (
     CLARIFY_INTENT_KEYS, BOOKING_PARAM_KEYS, ORDER_FILTER_NAMES,
-    ORDER_STATUS_TEXT, merge_params, calc_nights,
+    ORDER_STATUS_TEXT, merge_params,
     generate_clarify_question, detect_order_filter, wants_order_list,
     format_order_detail, extract_guest_name, parse_hotel_selection,
     match_room_choice, booking_exit_action, quit_booking_message,
-    load_hotel_selection_detail,
-    render_hotel_selection, chat_reply, reset_booking_state, is_selection_attempt,
+    load_hotel_selection_detail, location_fix_action, city_fix_action,
+    render_hotel_results, render_hotel_selection, chat_reply,
+    reset_booking_state, is_selection_attempt,
 )
 from rag import get_rag
 
@@ -93,21 +94,8 @@ class SearchAgent(BaseAgent):
                     data={"count": 0}
                 )
 
-            # 格式化搜索结果
-            nights = calc_nights(params.check_in, params.check_out)
-            # 位置本身已带城市名时不重复拼（“沈阳”+“沈阳化工大学附近”）
-            location = (params.location or "").strip()
-            if location:
-                area_text = (f"{location}，" if location.startswith(params.city)
-                             else f"{params.city}{location}，")
-            else:
-                area_text = ""
-            result_text = (
-                f"为你找到 {len(results)} 家符合条件的酒店"
-                f"（{area_text}{params.check_in} 入住，{params.check_out} 离店，共{nights}晚）：\n\n"
-                f"{format_hotel_list(results)}\n\n"
-                f"请告诉我你想选择哪一家（回复序号或酒店名）。"
-            )
+            # 格式化搜索结果（与单 Agent / 返回列表共用）
+            result_text = render_hotel_results(params, results)
 
             return AgentMessage(
                 sender=self.name, receiver="Supervisor",
@@ -446,6 +434,9 @@ class SupervisorAgent:
     def _exit_booking_stage(self, user_input: str) -> Optional[str]:
         """选房/入住人收集阶段的逃生口；命中时 shared_state 已更新。"""
         action = booking_exit_action(self.shared_state, user_input.strip())
+        if action == "back":
+            return render_hotel_results(
+                self.shared_state.params, self.shared_state.search_results or [])
         if action == "research":
             return self._handle_booking_intent(user_input)
         if action == "quit":
@@ -491,6 +482,18 @@ class SupervisorAgent:
         intent, extracted = self.llm.extract_intent_and_params(user_input)
         merge_params(self.shared_state, extracted, user_input)
 
+        # 地名疑似笔误：先确认，确认后再搜索
+        fix_action, fix_reply = location_fix_action(self.shared_state, user_input)
+        if fix_action == "reply":
+            self.shared_state.conversation_history.append(f"助手：{fix_reply}")
+            return fix_reply
+        if fix_action == "accepted":
+            return self._handle_booking_intent(user_input)
+        city_action, city_reply = city_fix_action(self.shared_state, user_input)
+        if city_action == "reply":
+            self.shared_state.conversation_history.append(f"助手：{city_reply}")
+            return city_reply
+
         # 澄清阶段用户只补一句"24号""住三天"时，常被判成闲聊；
         # 只要带了预订参数就继续走预订流程，避免追问后又被踢回帮助菜单
         if intent == "chat" and self.shared_state.stage == "clarify" and any(
@@ -517,7 +520,7 @@ class SupervisorAgent:
         if not params.is_complete():
             self.shared_state.stage = "clarify"
             missing = params.missing_fields()
-            response = generate_clarify_question(missing)
+            response = generate_clarify_question(missing, params)
             self.shared_state.conversation_history.append(f"助手：{response}")
             return response
 

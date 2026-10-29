@@ -13,8 +13,9 @@
 端点）。真实订单只能引导用户到 rollinggo.cn 订单详情页手动取消，
 助手侧绝不能只在本地标记"已取消"（会造成与网页状态不一致的假象）。
 
-鉴权：OAuth 授权码 + PKCE（client_id=rollinggoskill），通过 rollinggo.store
-中转完成授权。token 与官方 CLI 共享，存放在：
+鉴权：OAuth 授权码 + PKCE（client_id=rollinggoskill），通过
+api.rollinggo.store 中转完成授权（旧版 rollinggo.store 已停止提供该接口，
+POST /skill/oauth/init 会返回 405）。token 与官方 CLI 共享，存放在：
   Windows: %USERPROFILE%\\.hotel-cli\\token.json
 
 首次使用请在项目目录执行：
@@ -49,7 +50,10 @@ except Exception:
     pass
 
 MCP_BASE = os.getenv("ROLLINGGO_MCP_URL", "https://mcp.rollinggo.cn/mcp").rstrip("/")
-OAUTH_SERVER = os.getenv("ROLLINGGO_OAUTH_SERVER", "https://rollinggo.store").rstrip("/")
+OAUTH_SERVER = os.getenv("ROLLINGGO_OAUTH_SERVER", "https://api.rollinggo.store").rstrip("/")
+# 兼容旧配置：老版本默认值 rollinggo.store 已不再提供 OAuth 接口
+if OAUTH_SERVER.lower() in ("https://rollinggo.store", "http://rollinggo.store"):
+    OAUTH_SERVER = "https://api.rollinggo.store"
 OAUTH_AUTHORIZE = os.getenv(
     "ROLLINGGO_OAUTH_AUTHORIZE", "https://api.rollinggo.cn/oauth2/authorize"
 )

@@ -121,4 +121,6 @@ class AgentState:
     booking_context: dict = field(default_factory=dict)
     # 选房阶段跨轮暂存：用户只给了房型或只给了入住人时，先记下等下一轮补全
     pending_booking: dict = field(default_factory=dict)
+    # 地名疑似笔误时暂存纠正建议，等用户确认后再搜索
+    pending_location_fix: dict = field(default_factory=dict)
     stage: str = "intent"  # 当前阶段：intent意图理解 / clarify参数澄清 / search搜索 / recommend推荐 / booking预订 / booking_confirm验价待确认 /售后

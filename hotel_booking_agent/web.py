@@ -101,7 +101,8 @@ def _hotel_counts(agent: HotelBookingAgent, reply: str) -> tuple:
     但回复并不是酒店列表，此时不应给前端“展开全部”按钮。
     """
     state = agent.state
-    if state.stage != "recommend" or "请告诉我你想选择哪一家" not in reply:
+    # 用结果标题判断是否本次酒店列表，避免依赖具体引导语（引导语会随模板调整）
+    if state.stage != "recommend" or "符合条件的酒店" not in reply:
         return 0, 0
     total = len(getattr(state, "search_results", None) or [])
     return total, min(tools.HOTEL_PREVIEW, total)
