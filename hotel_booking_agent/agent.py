@@ -24,6 +24,7 @@ from agent_common import (
     detect_order_filter, wants_order_list, format_order_detail,
     extract_guest_name, parse_hotel_selection, match_room_choice,
     booking_exit_action, quit_booking_message, is_selection_attempt,
+    extract_order_id, load_hotel_selection_detail,
     render_hotel_selection, chat_reply, reset_booking_state,
 )
 import rollinggo_book as rlg
@@ -90,9 +91,9 @@ class HotelBookingAgent:
 
         # 道旅真实订单号通常是一长串字母数字，LLM/规则没提取到时兜底抓一次
         if intent in ("order_query", "cancel") and not extracted.get("order_id"):
-            m = re.search(r'(?<![A-Za-z0-9])([A-Z0-9]{8,})(?![A-Za-z0-9])', user_input.upper())
-            if m:
-                extracted["order_id"] = m.group(1)
+            order_id = extract_order_id(user_input)
+            if order_id:
+                extracted["order_id"] = order_id
 
         # 将提取到的参数合并到当前状态（支持多轮累积补充）
         merge_params(self.state, extracted, user_input)
@@ -392,11 +393,8 @@ class HotelBookingAgent:
         p = self.state.params
         # 实时详情：各房型的含早/退改报价
         self._emit_stage("pricing", "正在获取实时房型报价…")
-        live_detail = get_hotel_detail(
-            hotel.hotel_id, p.check_in, p.check_out)
-        if live_detail is not None:
-            hotel = live_detail
-            self.state.selected_hotel = hotel
+        hotel = load_hotel_selection_detail(hotel, p)
+        self.state.selected_hotel = hotel
 
         response = render_hotel_selection(hotel, p, show_login_hint=True)
         self.state.conversation_history.append(f"助手：{response}")
@@ -701,9 +699,9 @@ class HotelBookingAgent:
         """
         if "订单" not in text:
             return None
-        m = re.search(r'(?<![A-Za-z0-9])([A-Z0-9]{8,})(?![A-Za-z0-9])', text.upper())
-        if m:
-            body = self._handle_order_query({"order_id": m.group(1)}, text)
+        order_id = extract_order_id(text)
+        if order_id:
+            body = self._handle_order_query({"order_id": order_id}, text)
         elif any(w in text for w in
                  ("查", "历史", "记录", "列表", "有哪些", "我的", "看看")):
             body = self._handle_order_list({}, text)

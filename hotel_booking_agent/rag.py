@@ -26,6 +26,13 @@ except ImportError:
     pass
 
 
+def _tokenize(text: str) -> List[str]:
+    """模拟模式的中文分词：提取 2-4 字词组 + 单字。"""
+    words = re.findall(r'[\u4e00-\u9fa5]{2,4}', text)
+    chars = re.findall(r'[\u4e00-\u9fa5]', text)
+    return words + chars
+
+
 # ========== 模拟酒店评价语料 ==========
 # 真实场景中这些数据来自爬虫、用户评论、攻略文章等
 REVIEW_CORPUS = [
@@ -164,18 +171,12 @@ class HotelReviewRAG:
         用关键词权重模拟向量相似度，无需外部依赖
         """
         # 对所有文档分词（简单的中文分词：按标点和单字/双字词）
-        def tokenize(text):
-            # 提取中文词组（2-4字）和单字
-            words = re.findall(r'[\u4e00-\u9fa5]{2,4}', text)
-            chars = re.findall(r'[\u4e00-\u9fa5]', text)
-            return words + chars
-
         # 计算文档频率 DF
         doc_count = len(self.chunks)
         df = Counter()
         self.chunk_tokens = []
         for chunk in self.chunks:
-            tokens = tokenize(chunk["text"])
+            tokens = _tokenize(chunk["text"])
             self.chunk_tokens.append(tokens)
             for token in set(tokens):
                 df[token] += 1
@@ -275,12 +276,7 @@ class HotelReviewRAG:
 
     def _mock_retrieve(self, query: str) -> List[Tuple[int, float]]:
         """模拟 TF-IDF 余弦相似度检索"""
-        def tokenize(text):
-            words = re.findall(r'[\u4e00-\u9fa5]{2,4}', text)
-            chars = re.findall(r'[\u4e00-\u9fa5]', text)
-            return words + chars
-
-        tokens = tokenize(query)
+        tokens = _tokenize(query)
         tf = Counter(tokens)
         total = max(len(tokens), 1)
         query_vec = {

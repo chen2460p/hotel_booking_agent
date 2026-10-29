@@ -38,7 +38,10 @@ from typing import Dict, List, Optional
 
 import requests
 
+from amap_poi import is_enabled as amap_enabled, search_pois
+from geo_data import haversine_km as _haversine_km
 from models import Hotel
+from text_utils import normalize_name as _norm_name
 
 # 携程评分（首选源，无需 Key）；模块缺失时优雅降级
 try:
@@ -53,9 +56,7 @@ try:
 except ImportError:
     pass
 
-_AMAP_SEARCH_URL = "https://restapi.amap.com/v3/place/text"
 _BAIDU_SEARCH_URL = "https://api.map.baidu.com/place/v2/search"
-_ACCOMMODATION_TYPE = "100000"      # 高德住宿服务大类
 _TIMEOUT = (5, 8)                   # (连接, 读取) 秒
 _MAX_WORKERS = 5                    # 批量富化并发数
 _ENRICH_LIMIT = 8                   # 每次搜索最多富化前 N 家（节省免费额度）
@@ -123,16 +124,8 @@ _disk_loaded = False             # 磁盘缓存进程内只懒加载一次
 
 # ========== Key 与开关 ==========
 
-def amap_api_key() -> str:
-    return os.environ.get("AMAP_API_KEY", "").strip()
-
-
 def baidu_api_key() -> str:
     return os.environ.get("BAIDU_MAP_AK", "").strip()
-
-
-def amap_enabled() -> bool:
-    return bool(amap_api_key())
 
 
 def baidu_enabled() -> bool:
@@ -227,15 +220,6 @@ def hotel_to_bd09(hotel: "Hotel") -> Optional[tuple]:
     return wgs84_to_bd09(hotel.latitude, hotel.longitude)
 
 
-def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    r = 6371.0
-    dl, dn = math.radians(lng2 - lng1), math.radians(lat2 - lat1)
-    a = (math.sin(dn / 2) ** 2 +
-         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
-         math.sin(dl / 2) ** 2)
-    return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
 # ========== 缓存 ==========
 
 def _cache_key(hotel: Hotel) -> str:
@@ -296,11 +280,6 @@ def _cache_put(key: str, rec: dict) -> None:
 
 
 # ========== 名称归一与双匹配 ==========
-
-def _norm_name(name: str) -> str:
-    """名称归一：去括号/标点/空格，只留中英文数字与汉字核心。"""
-    return re.sub(r"[^\u4e00-\u9fa5a-zA-Z0-9]", "", name or "")
-
 
 def _name_score(a: str, b: str) -> int:
     """名称相似度分级：3 完全相同；2 互相包含；1 高重叠；0 不相似。"""
@@ -378,29 +357,12 @@ def _rating_from_ctrip(hotel: Hotel) -> Optional[dict]:
 def _fetch_amap_pois(hotel: Hotel) -> List[dict]:
     """按酒店名 + 城市做高德文本检索（extensions=all 取 biz_ext.rating）。"""
     _amap_bucket.acquire()  # ← 节流：高德 AK QPS
-    resp = requests.get(
-        _AMAP_SEARCH_URL,
-        params={
-            "key": amap_api_key(),
-            "keywords": hotel.name,
-            "types": _ACCOMMODATION_TYPE,
-            "city": hotel.city or "",
-            "citylimit": "true",
-            "offset": 20,
-            "page": 1,
-            "extensions": "all",
-            "output": "json",
-        },
-        timeout=_TIMEOUT,
-    )
-    data = resp.json()
-    # 高德固定用 status=="1" 表示成功
-    if str(data.get("status")) != "1":
-        _notice(f"[高德评分服务] 接口返回 status={data.get('status')} "
-                f"infocode={data.get('infocode')} {data.get('info') or ''}"
-                f"（本次酒店列表不显示真实评分，不影响订房）")
+    try:
+        return search_pois(hotel.name, hotel.city or "", offset=20,
+                           timeout=_TIMEOUT)
+    except Exception as e:
+        _notice(f"[高德评分服务] {e}（本次酒店列表不显示真实评分，不影响订房）")
         return []
-    return data.get("pois") or []
 
 
 def _amap_candidates(pois: List[dict]) -> List[tuple]:

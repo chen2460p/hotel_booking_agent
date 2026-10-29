@@ -107,6 +107,30 @@ def _hotel_counts(agent: HotelBookingAgent, reply: str) -> tuple:
     return total, min(tools.HOTEL_PREVIEW, total)
 
 
+def _current_order_text(agent: HotelBookingAgent) -> str:
+    """当前订单摘要（无订单返回空串）。"""
+    order = agent.state.current_order
+    if not order:
+        return ""
+    return (f"当前订单 {order.order_id}：{order.hotel_name} · "
+            f"{order.room_type} · ¥{order.total_price:g}")
+
+
+def _chat_payload(agent: HotelBookingAgent, reply: str,
+                  session_id: str) -> dict:
+    """普通接口与 SSE 接口共用的结果构造。"""
+    total, shown = _hotel_counts(agent, reply)
+    return {
+        "reply": reply,
+        "current_order": _current_order_text(agent),
+        "session_id": session_id,
+        "storage_backend": storage.storage_backend(),
+        "storage_enabled": storage.storage_available(),
+        "hotel_total": total,
+        "hotel_shown": shown,
+    }
+
+
 # ---------- 页面路由 ----------
 # HTML 页面一律 no-cache：前端模板更新后浏览器立即拿到新版，
 # 避免缓存旧 JS（如旧版图片正则不认 .jpg-t 导致图片渲染成链接）
@@ -137,17 +161,7 @@ async def api_chat(req: ChatRequest):
     session_id = (req.session_id or "").strip() or str(uuid.uuid4())
     agent = _get_or_create_agent(session_id)
     reply = agent.run(req.user_input.strip()) or "(助手无回复)"
-    current = ""
-    if agent.state.current_order:
-        o = agent.state.current_order
-        current = f"当前订单 {o.order_id}：{o.hotel_name} · {o.room_type} · ¥{o.total_price:g}"
-    total, shown = _hotel_counts(agent, reply)
-    return ChatResponse(
-        reply=reply, current_order=current, session_id=session_id,
-        storage_backend=storage.storage_backend(),
-        storage_enabled=storage.storage_available(),
-        hotel_total=total, hotel_shown=shown,
-    )
+    return ChatResponse(**_chat_payload(agent, reply, session_id))
 
 
 @app.post("/api/chat/stream")
@@ -174,18 +188,7 @@ async def api_chat_stream(req: ChatRequest):
         try:
             agent.on_stage = on_stage
             reply = agent.run(req.user_input.strip()) or "(助手无回复)"
-            current = ""
-            if agent.state.current_order:
-                o = agent.state.current_order
-                current = f"当前订单 {o.order_id}：{o.hotel_name} · {o.room_type} · ¥{o.total_price:g}"
-            total, shown = _hotel_counts(agent, reply)
-            q.put(("result", {
-                "reply": reply, "current_order": current,
-                "session_id": session_id,
-                "storage_backend": storage.storage_backend(),
-                "storage_enabled": storage.storage_available(),
-                "hotel_total": total, "hotel_shown": shown,
-            }))
+            q.put(("result", _chat_payload(agent, reply, session_id)))
         except Exception as e:            # 后台线程异常也要送到前端
             q.put(("error", {"message": f"{type(e).__name__}: {e}"}))
         finally:

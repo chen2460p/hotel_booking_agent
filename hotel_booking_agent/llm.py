@@ -19,17 +19,7 @@ try:
 except ImportError:
     pass
 
-
-# 姓名候选中出现这些词时判定不是入住人（"入住时间改到…"等时间/业务表达）
-_NAME_DENY_WORDS = (
-    "时间", "日期", "改到", "改成", "推迟", "提前", "查询", "搜索",
-    "重新", "酒店", "宾馆", "房型", "入住", "离店", "周末", "预算",
-    "价格", "附近", "一下", "看看", "选择", "序号", "名称", "取消",
-    "订单", "支付", "帮忙", "帮我", "可以", "能不", "怎么", "什么",
-    "多少", "哪里", "哪个", "今天", "明天", "后天", "上午", "下午",
-    "晚上", "中午", "早上", "凌晨", "几点", "小时", "星期", "推荐",
-    "便宜",
-)
+from text_rules import NAME_DENY_WORDS, NAME_PATTERNS, match_order_status
 
 
 def shift_date(check_in: str, days: int) -> Optional[str]:
@@ -378,23 +368,17 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
 
         # ---- 订单状态筛选（仅查订单场景）----
         if intent == "order_query":
-            if any(w in text for w in ["待支付", "未支付", "未付款", "待付款"]):
-                params["order_status"] = "PENDING"
-            elif any(w in text for w in ["已取消", "取消过", "退款"]):
-                params["order_status"] = "CANCELLED"
-            elif any(w in text for w in
-                     ["已完成", "完成的", "已支付", "已付款", "已入住", "住过的"]):
-                params["order_status"] = "FINISHED"
-            elif any(w in text for w in ["全部", "所有", "历史"]):
-                params["order_status"] = "ALL"
+            status = match_order_status(text)
+            if status:
+                params["order_status"] = status
 
         # ---- 入住人姓名提取（简单规则："入住人XXX"）----
         # 注意必须带"人"字，否则"入住时间改到…"会被误抓成"时间改到"；
         # 再用业务/时间类词语做一次排除。agent/multi_agent 内有更严格的校验。
-        name_match = re.search(r'入住人\s*[:：是叫]?\s*([一-龥]{2,4})', text)
+        name_match = re.search(NAME_PATTERNS[0], text)
         if name_match:
             cand = name_match.group(1)
-            if not any(w in cand for w in _NAME_DENY_WORDS):
+            if not any(w in cand for w in NAME_DENY_WORDS):
                 params["guest_name"] = cand
 
         return intent, params

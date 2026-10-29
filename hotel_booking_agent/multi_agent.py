@@ -9,12 +9,11 @@
 # 通信方式：共享状态 + 直接消息（对应八股中的多 Agent 通信机制）
 # 协调模式：Supervisor-Worker（工头制，生产环境最常用模式）
 
-import re
 from typing import Optional, List
 from dataclasses import dataclass, field
 from models import AgentState
 from tools import (
-    search_hotels, get_hotel_detail,
+    search_hotels,
     create_order, pay_order, cancel_order, get_order_status,
     format_hotel_list, list_history_orders, format_order_rows,
     sync_real_order_status, real_order_cancel_guide,
@@ -26,6 +25,7 @@ from agent_common import (
     generate_clarify_question, detect_order_filter, wants_order_list,
     format_order_detail, extract_guest_name, parse_hotel_selection,
     match_room_choice, booking_exit_action, quit_booking_message,
+    load_hotel_selection_detail,
     render_hotel_selection, chat_reply, reset_booking_state, is_selection_attempt,
 )
 from rag import get_rag
@@ -767,11 +767,8 @@ class SupervisorAgent:
                 p = self.shared_state.params
 
                 # 道旅酒店实时拉房型报价（含每档房间实拍图）；失败回退搜索缓存
-                live_detail = get_hotel_detail(
-                    hotel.hotel_id, p.check_in, p.check_out)
-                if live_detail is not None:
-                    hotel = live_detail
-                    self.shared_state.selected_hotel = hotel
+                hotel = load_hotel_selection_detail(hotel, p)
+                self.shared_state.selected_hotel = hotel
 
                 response = render_hotel_selection(hotel, p)
                 self.shared_state.conversation_history.append(f"助手：{response}")
