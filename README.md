@@ -87,6 +87,8 @@
     ├── multi_agent.py         # 多 Agent：Supervisor/Search/Booking/Service/Review
     ├── agent_common.py        # 单/多 Agent 共用：参数合并、选店选房、姓名/订单解析、渲染
     ├── cli_common.py          # 两个终端入口共用：显示宽度计算与欢迎横幅
+    ├── text_rules.py          # 姓名/订单状态规则（llm 与 agent_common 共用）
+    ├── text_utils.py          # 名称归一/相似度（携程、高德、评分匹配共用）
     ├── llm.py                 # LLM 封装：DashScope 真实模式 + 规则引擎模拟模式
     ├── models.py              # dataclass：Hotel / RoomRatePlan / BookingParams / Order / AgentState
     ├── tools.py               # 工具层：三级回退搜索、详情、计价、下单、内存订单库

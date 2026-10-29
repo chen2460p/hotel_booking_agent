@@ -29,11 +29,7 @@
   from ctrip_crawler import fetch_all_images, match_room_urls, fetch_rating
   covers, rooms = fetch_all_images(hotel)   # (封面直链列表, {房型名: [直链]})
   urls = match_room_urls("高级大床房", rooms)  # 模糊匹配整个房型图组
-  url = match_room_url("高级大床房", rooms)    # 只取首图（旧接口）
   rec = fetch_rating(hotel)                  # {"rating","count","level","hotel_id"}
-  # 兼容旧接口：
-  from ctrip_crawler import enrich_hotel_images
-  urls = enrich_hotel_images(hotel)          # 仅封面直链列表
 """
 import os
 import re
@@ -46,6 +42,7 @@ from typing import Dict, List, Optional
 import requests
 
 from models import Hotel
+from text_utils import normalize_name as _norm, name_similarity
 
 try:
     from dotenv import load_dotenv
@@ -72,8 +69,6 @@ _JSON_HDR = {
 _DETAIL_TPL = "https://hotels.ctrip.com/hotels/{hotel_id}.html"
 _TIMEOUT = (5, 10)
 _CACHE_TTL = 30 * 24 * 3600
-_RATING_TTL = 7 * 24 * 3600          # 评分变化慢，7 天足够
-_NEG_RATING_TTL = 3 * 24 * 3600     # 确认无评分的负缓存
 # imgTitle 含"房"但实为设施的固定词，拉黑防混入房型图组
 _ROOM_FACILITY_WORDS = {"健身房", "厨房", "书房"}
 # 道旅客型名常见的修饰前缀（如"高级大床房"→"大床房"），匹配前逐级剥离
@@ -101,10 +96,9 @@ def _load_cache() -> dict:
     try:
         with open(_CACHE_PATH, "r", encoding="utf-8") as f:
             items = json.load(f).get("items", {})
-        # 记录按用途分两种：图片（rooms/ts）与评分（rating/rating_ts），
-        # 两种都保留；既无 rooms 也无 rating 的旧版残留记录丢弃
+        # 只保留图片记录；评分缓存统一由 hotel_rating 负责，避免双层 TTL
         return {k: v for k, v in items.items() if isinstance(v, dict)
-                and ("rooms" in v or "rating" in v)}
+                and "rooms" in v}
     except Exception:
         return {}
 
@@ -132,44 +126,12 @@ def _cached_get(key: str) -> Optional[tuple]:
     return (rec.get("urls", []), rec.get("rooms", {}))
 
 
-def _cache_update(key: str, **fields) -> None:
-    """合并写入：图片与评分共用一条记录，互不覆盖。"""
-    with _cache_lock:
-        rec = dict(_mem_cache.get(key) or {})
-        rec.update(fields)
-        _mem_cache[key] = rec
-        _save_cache(_mem_cache)
-
-
 def _cache_put(key: str, urls: list, rooms: dict) -> None:
-    _cache_update(key, urls=urls, rooms=rooms, ts=int(time.time()))
-
-
-def _rating_cached_get(key: str) -> Optional[dict]:
-    """返回评分缓存记录（rating 为 0 表示确认无评分）；无缓存/过期返回 None。"""
     with _cache_lock:
-        _ensure_disk_loaded()
-        rec = _mem_cache.get(key)
-    if not rec or "rating" not in rec:
-        return None
-    rating = rec.get("rating") or {}
-    ttl = _RATING_TTL if rating.get("rating", 0) > 0 else _NEG_RATING_TTL
-    if time.time() - rec.get("rating_ts", 0) > ttl:
-        return None
-    return rating
-
-
-def _norm(name: str) -> str:
-    """名称归一：去括号/标点/空格。"""
-    return re.sub(r"[^\u4e00-\u9fa5a-zA-Z0-9]", "", name or "")
-
-
-def _name_similarity(a: str, b: str) -> float:
-    """名称相似度：归一后取 SequenceMatcher 比率。"""
-    na, nb = _norm(a), _norm(b)
-    if not na or not nb:
-        return 0.0
-    return difflib.SequenceMatcher(None, na, nb).ratio()
+        _mem_cache[key] = {
+            "urls": urls, "rooms": rooms, "ts": int(time.time()),
+        }
+        _save_cache(_mem_cache)
 
 
 def _search_hotels(keyword: str) -> List[dict]:
@@ -232,7 +194,7 @@ def _pick_hotel(hotel_name: str, city: str,
         cn = _norm(c.get("word") or "")
         if not nn or not cn:
             continue
-        sim = _name_similarity(hotel_name, c.get("word") or "")
+        sim = name_similarity(hotel_name, c.get("word") or "")
         shorter, longer = sorted((len(nn), len(cn)))
         strong = (nn in cn or cn in nn) and shorter / longer >= 0.6
         if not strong and sim < 0.85:
@@ -254,38 +216,29 @@ def fetch_rating(hotel: Hotel) -> Optional[dict]:
 
     评分取自联想搜索接口的 commentScore / commentCount / commentlevel，
     与详情页 hotelComment.comment 的 score / totalComment 一致（点评数有
-    几条缓存延迟，误差可忽略）。7 天缓存，确认无评分做 3 天负缓存。
+    几条缓存延迟，误差可忽略）。缓存统一由 hotel_rating 负责，本函数只查接口。
     """
     if not hotel or not hotel.name:
         return None
-    key = f"{hotel.city or ''}|{hotel.name}"
-    cached = _rating_cached_get(key)
-    if cached is not None:
-        return cached if cached.get("rating", 0) > 0 else None
     hit = _pick_hotel(hotel.name, hotel.city or "", _search_hotels(hotel.name))
-    now = int(time.time())
     if not hit:
-        _cache_update(key, rating={"rating": 0}, rating_ts=now)
         return None
     try:
         score = float(hit.get("commentScore") or 0)
     except (TypeError, ValueError):
         score = 0.0
     if score <= 0:
-        _cache_update(key, rating={"rating": 0}, rating_ts=now)
         return None
     try:
         count = int(hit.get("commentCount") or 0)
     except (TypeError, ValueError):
         count = 0
-    rec = {
+    return {
         "rating": score,
         "count": count,
         "level": str(hit.get("commentlevel") or ""),
         "hotel_id": str(hit.get("id")),
     }
-    _cache_update(key, rating=rec, rating_ts=now)
-    return rec
 
 
 def _parse_detail_images(html: str) -> List[str]:
@@ -394,12 +347,6 @@ def match_room_urls(room_name: str, room_map: Dict[str, List[str]],
     return list(best_urls[:limit]) if best_score >= 0.45 else []
 
 
-def match_room_url(room_name: str, room_map: Dict[str, List[str]]) -> str:
-    """兼容旧接口：只返回匹配房型的首图。"""
-    urls = match_room_urls(room_name, room_map, limit=1)
-    return urls[0] if urls else ""
-
-
 def _fetch_detail_data(hotel_id: str) -> tuple:
     """GET 详情页，一次提取 (封面图集, 房型图映射)。"""
     try:
@@ -438,12 +385,6 @@ def fetch_all_images(hotel: Hotel) -> tuple:
     return covers, rooms
 
 
-def enrich_hotel_images(hotel: Hotel) -> List[str]:
-    """兼容旧接口：仅返回封面直链列表（首张可用作封面图）。"""
-    covers, _ = fetch_all_images(hotel)
-    return covers
-
-
 # ---------- CLI 自测入口 ----------
 if __name__ == "__main__":
     test_cases = [
@@ -469,8 +410,9 @@ if __name__ == "__main__":
             print(f"  {t} -> {len(u)} 张, 首图 {u[0][:80]}")
         # 模拟道旅客型名，验证匹配
         for rg_name in ["大床房", "双床房", "高级大床房", "行政套房", "亲子房", "海景房"]:
-            url = match_room_url(rg_name, room_map)
-            print(f"  match[{rg_name}] -> {'✓ ' + url[:70] if url else '✗ 无匹配'}")
+            urls = match_room_urls(rg_name, room_map)
+            print(f"  match[{rg_name}] -> {len(urls)} 张"
+                  f"{'，首图 ' + urls[0][:70] if urls else '（无匹配）'}")
         # 再调一次应该走缓存
         t0 = time.time()
         covers2, rooms2 = fetch_all_images(h)
