@@ -30,7 +30,8 @@
 ## 功能特性
 
 - **自然语言预订**：「帮我订下周六成都的酒店，预算 300 以内，住两晚」→ LLM 自动提取城市/日期/预算/星级（含口语日期换算：明天、后天、这周末、下周末、"住三天"晚数推断）；多轮对话里先答入住再补离店不会互相覆盖
-- **真实酒店搜索**：道旅 `searchHotels` 返回全国城市实时可订酒店、展示价、星级、设施标签；支持按星级、每晚预算服务端筛选；**带 POI（故宫/中街/春熙路/高铁站/大学/医院）搜索时每条酒店附带直线距离，并按"近→远"排序**；POI 搜索有距离结果时不再补城市搜索，避免市中心酒店混入
+- **真实酒店搜索**：道旅 `searchHotels` 返回全国城市实时可订酒店、展示价、星级、设施标签；支持按星级、每晚预算服务端筛选；**带 POI（故宫/中街/春熙路/高铁站/大学/中小学/医院）搜索时每条酒店附带直线距离，并按"近→远"排序**；POI 搜索有距离结果时不再补城市搜索，避免市中心/下辖县酒店混入
+- **地名笔误确认**：如「南宁是第二中学」这种「市/是」笔误，或「大年市西安路」这种城市名笔误（→大连市），先提示「我猜你想说的是『大连市西安路』附近，对吗？」，用户确认后才搜索，避免按错地名查出一堆无关酒店
 - **实时房型报价**：道旅 `getHotelDetail` 返回同房型下含早/退改等上百条报价，程序按房型聚合、每房型保留最多 4 档代表性报价（最低价 / 含早 / 可取消 / 申请确认），**同房型多档对比**并标出差价；每个房型配**多张实拍图**（道旅 `roomInfo.images` 单图 + 携程官方相册按房型名模糊匹配补齐，每房型最多 8 张）
 - **真实验价 + 下单**：道旅 OAuth REST 接口 `/hotelpriceconfirm`（锁价拿 `referenceNo`）→ `/hotelbook`（创建订单拿 `orderNo` + `paymentUrl`）→ `/hotelorders`（查单）
 - **历史订单查询**：对话里说「查我的历史订单 / 查待支付的订单 / 查已取消的订单」即可拉取道旅账号全部真实订单（跨会话保留），支持按状态筛选；未登录时降级展示本次会话的本地订单并引导登录
@@ -105,7 +106,7 @@
 
 ```powershell
 pip install requests python-dotenv
-pip install dashscope      # 可选：不装则 LLM 与 RAG 自动用规则/TF-IDF 模拟模式
+pip install dashscope      # 可选：RAG 真实 Embedding 需要；不装则 RAG 用 TF-IDF 模拟
 ```
 
 > 无需 Node.js：道旅 OAuth 登录已在 `rollinggo_book.py` 中用 Python 原生实现（授权码 + PKCE，起本地回调服务），不依赖官方 `@rollinggo/hotel` CLI。
@@ -120,8 +121,8 @@ Copy-Item .env.example .env   # PowerShell
 
 | 配置项 | 必填 | 使用模块 | 作用 |
 |---|---|---|---|
-| `DASHSCOPE_API_KEY` | 否 | llm.py / rag.py | 通义千问 Key；留空 → 意图识别用规则引擎、Embedding 用 TF-IDF。**默认模型 qwen-plus**（qwen-turbo 易触发 429 限流，可通过 `DASHSCOPE_MODEL` 覆盖） |
-| `DASHSCOPE_MODEL` | 可选 | llm.py | 覆盖默认 LLM 模型名（如 `qwen-turbo` / `qwen-max`），限流或预算变动时改这里即可 |
+| `DASHSCOPE_API_KEY` | 否 | llm.py / rag.py | 通义千问 Key；留空 → 意图识别用规则引擎、Embedding 用 TF-IDF。**默认模型 qwen3.8-flash**（走 DashScope OpenAI 兼容接口，可通过 `DASHSCOPE_MODEL` 覆盖） |
+| `DASHSCOPE_MODEL` | 可选 | llm.py | 覆盖默认 LLM 模型名（如 `qwen3.8-flash` / `qwen3.8-max` / `qwen-plus`） |
 | `AMAP_API_KEY` | 选填 | amap_poi.py | 高德「**Web 服务**」类型 Key；道旅不可用时的 POI 回退（无价格） |
 | `ROLLINGGO_API_KEY` | 真实搜索必填 | rollinggo_mcp.py | 道旅开发者 Key（`mcp_` 开头），用于酒店搜索与实时房价 |
 | `ROLLINGGO_MCP_URL` | 可选 | 两个 rollinggo 模块 | 默认 `https://mcp.rollinggo.cn/mcp`；国际站改 `https://mcp.rollinggo.ai/mcp` |
@@ -169,6 +170,9 @@ python main_multi.py
        → 拉取该酒店实时房型报价（含早/床型/面积/退改，按价格排序，最多展示 8 个房型）
          每个房型最多 4 档报价：最低价 / 含早 / 可取消 / 申请确认，并标出差价
 
+你 > 返回上一级     # 不喜欢这家：回到原酒店列表，不重新搜索
+       → 重新展示之前的搜索结果，可直接选另一家
+
 你 > 2-1，入住人陈晨   # 第 2 个房型的第 1 档；只回复 2 默认该房型最低价
        → 自动调用验价接口锁房：展示【最终总价】（含税费，可能与列表价不同）、
          退改截止时间、账号常用入住人/邮箱（须确认后才使用）
@@ -181,7 +185,7 @@ python main_multi.py
 你 > 取消          # 验价后任何时候都可放弃，referenceNo 随即作废
 ```
 
-也可以在多轮对话中补充：「换一家」「第 3 种房型」「2 含早」「2 可取消」「2-1」「使用常用入住人 1」「换个邮箱 xxx@xx.com」。
+也可以在多轮对话中补充：「换一家」「返回上一级」「第 3 种房型」「2 含早」「2 可取消」「2-1」「使用常用入住人 1」「换个邮箱 xxx@xx.com」。
 
 历史订单查询：
 
@@ -250,7 +254,7 @@ orderNo + paymentUrl（通用收银台，用户自行打开支付）
 | 文件 | 关键内容 |
 |---|---|
 | `models.py` | 全部 dataclass；`Hotel` 含 `distance_m`（距 POI 直线距离米）与 `distance_to`（参照地标名）；`BookingParams.is_complete()/missing_fields()` 驱动参数追问；`Order.source` 区分 mock/rollinggo |
-| `llm.py` | `LLMClient.extract_intent_and_params()`：意图 book/search/order_query/cancel/chat + 结构化参数；默认模型 qwen-plus（429 限流可通过 `DASHSCOPE_MODEL` 覆盖）；含口语日期换算（今天/明天/后天/住三天）+ 错误日志直接打印 status/code/message |
+| `llm.py` | `LLMClient.extract_intent_and_params()`：意图 book/search/order_query/cancel/chat + 结构化参数；默认模型 qwen3.8-flash（OpenAI 兼容接口，`DASHSCOPE_MODEL` 可覆盖）；含口语日期换算（今天/明天/后天/住三天）+ 错误日志直接打印 status/code/message |
 | `tools.py` | `search_hotels()` 三级回退；`get_hotel_detail(live=True)` 实时富化；`create_order()` 模拟单；`create_real_order()` 道旅真单；`list_history_orders()` 历史订单（远程+本地合并、状态筛选）；运行时酒店缓存 `_RUNTIME_HOTEL_CACHE`；内存 `ORDER_DB`；`format_hotel_list()` 在有 POI 距离时输出距离行 |
 | `rollinggo_mcp.py` | `RollingGoMCPClient`：MCP 握手、JSON/SSE 双解析；搜索参数构造（`hotelTags.maxPricePerNight` 等）；报价按「房型 + 餐食 + 退改 + 申请确认 + 床型 + 入住人数」分桶，每房型保留最多 4 档代表性报价；POI 距离透传（`distanceInMeters`）；地标识别扩展到 街/路/大道；排序策略：有 POI 距离时按"近→远"、未知沉底，否则地标词命中优先 |
 | `rollinggo_book.py` | OAuth PKCE 登录与本地回调服务；token 存取（与官方 CLI 共享 `~/.hotel-cli/token.json`）；`price_confirm() / create_booking() / list_orders() / get_order_detail() / parse_orders()`；CLI 支持 `login/status/logout/orders` |

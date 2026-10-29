@@ -12,6 +12,8 @@ import json
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
+import requests
+
 # 从 .env 文件加载环境变量（优先脚本所在目录，兼容从其他工作目录启动）
 try:
     from dotenv import load_dotenv
@@ -20,6 +22,14 @@ except ImportError:
     pass
 
 from text_rules import NAME_DENY_WORDS, NAME_PATTERNS, match_order_status
+from geo_data import find_city, infer_city_from_location
+
+# DashScope OpenAI 兼容接口：qwen3.8-flash 等新模型走原生 Generation.call 会报
+# "url error"，统一用 compatible-mode 更稳，也不再依赖 dashscope SDK 做对话。
+_COMPAT_URL = os.environ.get(
+    "DASHSCOPE_COMPAT_URL",
+    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+)
 
 
 def shift_date(check_in: str, days: int) -> Optional[str]:
@@ -36,23 +46,47 @@ class LLMClient:
     def __init__(self):
         """初始化时检测是否有 API Key，自动选择模式"""
         self.api_key = os.environ.get("DASHSCOPE_API_KEY", "")
-        # qwen-turbo 免费额度耗尽时接口会返回 429 Throttling.RateQuota，
-        # 默认换成额度更充足的 qwen-plus；可用 .env 的 DASHSCOPE_MODEL 覆盖
-        self.model = os.environ.get("DASHSCOPE_MODEL", "qwen-plus")
+        # qwen3.8-flash：DashScope 新版 Flash 模型；可用 .env 的 DASHSCOPE_MODEL 覆盖
+        self.model = os.environ.get("DASHSCOPE_MODEL", "qwen3.8-flash")
         self.use_real_llm = bool(self.api_key)
         if self.use_real_llm:
             print(f"[系统] 检测到 DASHSCOPE_API_KEY，使用真实 LLM 模式（模型：{self.model}）")
-            try:
-                import dashscope
-                dashscope.api_key = self.api_key
-                self.dashscope = dashscope
-            except ImportError:
-                print("[系统] 未安装 dashscope 库，回退到模拟模式")
-                print("[系统] 安装命令：pip install dashscope")
-                self.use_real_llm = False
         else:
             print("[系统] 未检测到 DASHSCOPE_API_KEY，使用模拟模式（规则引擎）")
             print("[系统] 设置环境变量 DASHSCOPE_API_KEY 可启用真实 LLM")
+
+    def _chat(self, prompt: str, json_mode: bool = False) -> Optional[str]:
+        """调用 DashScope OpenAI 兼容接口；失败返回 None，由调用方回退规则引擎。"""
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        try:
+            resp = requests.post(
+                _COMPAT_URL,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=(8, 90),
+            )
+            if resp.status_code != 200:
+                print(f"[LLM 调用失败] status={resp.status_code} "
+                      f"body={resp.text[:300]}，回退规则引擎")
+                return None
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                print(f"[LLM 调用失败] 无 choices：{str(data)[:300]}，回退规则引擎")
+                return None
+            content = (choices[0].get("message") or {}).get("content") or ""
+            return content.strip() or None
+        except Exception as e:
+            print(f"[LLM 调用失败] {type(e).__name__}: {e}，回退规则引擎")
+            return None
 
     def extract_intent_and_params(self, user_input: str) -> Tuple[str, dict]:
         """
@@ -102,34 +136,29 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
 
 示例返回：{{"intent":"book","city":"沈阳","check_in":"{tomorrow:%Y-%m-%d}","check_out":"{day_after:%Y-%m-%d}","max_price":1000}}"""
 
-        try:
-            response = self.dashscope.Generation.call(
-                model=self.model,
-                prompt=prompt,
-                result_format="message",
-                response_format={"type": "json_object"}
-            )
-            # 限流/鉴权失败时 output 为 None，直接取 .choices 会报无意义的
-            # 'NoneType' object has no attribute 'choices'，这里打印真实原因
-            if getattr(response, "output", None) is None:
-                print(f"[LLM 调用失败] status={getattr(response, 'status_code', None)} "
-                      f"code={getattr(response, 'code', None)} "
-                      f"message={getattr(response, 'message', None)}，回退规则引擎")
-                return self._extract_with_rules(user_input)
-            text = response.output.choices[0].message.content
-            # 尝试解析 JSON
-            json_match = re.search(r'\{.*\}', text, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-                intent = data.get("intent", "chat")
-                params = {k: v for k, v in data.items() if k != "intent" and v}
-                # LLM 对"24号""住三天"这类口语日期容易漏提，用规则引擎补齐缺失字段
-                _, rule_params = self._extract_with_rules(user_input)
-                for k, v in rule_params.items():
-                    params.setdefault(k, v)
-                return intent, params
-        except Exception as e:
-            print(f"[LLM 调用失败，回退规则引擎] {e}")
+        text = self._chat(prompt, json_mode=True)
+        if text:
+            try:
+                # 尝试解析 JSON
+                json_match = re.search(r'\{.*\}', text, re.DOTALL)
+                if json_match:
+                    data = json.loads(json_match.group())
+                    intent = data.get("intent", "chat")
+                    params = {k: v for k, v in data.items() if k != "intent" and v}
+                    # LLM 对"24号""住三天"这类口语日期容易漏提，用规则引擎补齐缺失字段
+                    _, rule_params = self._extract_with_rules(user_input)
+                    for k, v in rule_params.items():
+                        if k == "location" and isinstance(v, str):
+                            cur = params.get("location") or ""
+                            # LLM 常把“来宾高级中学附近”剥成“高级中学附近”，
+                            # 规则结果更完整时保留完整地标，距离展示才不会退化
+                            if cur and len(v) > len(cur) and cur in v:
+                                params[k] = v
+                                continue
+                        params.setdefault(k, v)
+                    return intent, params
+            except Exception as e:
+                print(f"[LLM 返回解析失败，回退规则引擎] {e}")
 
         return self._extract_with_rules(user_input)
 
@@ -173,27 +202,27 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
             intent = "search"
 
         # ---- 城市提取 ----
-        cities = ["三亚", "北京", "上海", "杭州", "广州", "深圳", "成都", "西安", "南京", "武汉", "厦门", "青岛", "大理", "丽江", "沈阳", "大连", "哈尔滨", "长春", "天津", "重庆", "苏州", "长沙"]
-        for city in cities:
-            if city in text:
-                params["city"] = city
-                break
+        city = find_city(text)
+        if city:
+            params["city"] = city
 
         # ---- 位置/商圈提取（城市以下的位置修饰：市中心、地标+附近等）----
         location_phrases = []
         location_patterns = (
             r'[一-龥A-Za-z0-9]{2,12}?(?:步行街|商业街|商圈|广场|火车站|高铁站|机场|'
-            r'大学城|会展中心|体育中心|地铁站|景区|景点|主题公园|海洋公园|古镇|古城|夜市|老街|'
+            r'大学城|大学|学院|学校|中学|小学|高中|初中|幼儿园|医院|会展中心|体育中心|地铁站|景区|景点|主题公园|海洋公园|古镇|古城|夜市|老街|'
             r'海边|海滩|沙滩|湖边|江边|湾)'
             r'(?:附近|周边|旁边|一带)?',
             r'[一-龥]{2,10}?(?:附近|周边|旁边|一带)',
             r'市中心|市区中心|老城区|古城区',
         )
-        # 命中片段开头可能连带的动词/意愿词
+        # 命中片段开头可能连带的动词/意愿词（长词在前，避免只剥掉“帮我”）
         _LEAD_VERBS = (
+            "帮我查询", "帮我查", "帮忙查询", "帮忙查", "请帮我查询", "请帮我查",
             "帮我订", "帮忙订", "我要订", "我想订", "想要订", "想订", "要订",
             "预订", "预定", "帮订", "找一下", "找一找", "查查", "查一下",
-            "搜一下", "我想去", "想要去", "我要去", "想去", "找", "查", "搜", "去",
+            "搜一下", "我想去", "想要去", "我要去", "想去", "查询",
+            "找", "查", "搜", "去",
         )
         # 城市名后若紧跟这些字，说明城市名是地名实体的一部分（如"三亚湾"），不可剥离
         _GEO_ENTITY_CHARS = "湾江湖海山岛桥港口溪潭"
@@ -212,7 +241,11 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
                 # 但"三亚湾"是地名实体，不能剥成"湾"
                 if params.get("city") and p.startswith(params["city"]):
                     rest = p[len(params["city"]):]
-                    if rest and rest[0] not in _GEO_ENTITY_CHARS:
+                    # 带地标类型的完整名称保留城市前缀（"来宾高级中学"），
+                    # 否则距离展示会退化成泛泛的"高级中学"；
+                    # "成都春熙路"这类纯街道仍剥成"春熙路"
+                    if (rest and rest[0] not in _GEO_ENTITY_CHARS
+                            and not infer_city_from_location(p)):
                         p = rest.lstrip("的")
                 if len(p) >= 2:
                     location_phrases.append(p)
@@ -263,6 +296,26 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
                     params["check_in"] = d.strftime("%Y-%m-%d")
 
         # 3. 只有日：24号 / 24日（"帮我订24号沈阳的酒店"）
+        #    先支持“3号到6号 / 3号-6号”这类日期区间，避免只抓到入住日
+        if "check_in" not in params and "check_out" not in params:
+            range_match = re.search(
+                r'(?<!\d)(\d{1,2})\s*[号日]?\s*(?:到|至|[-—~])\s*'
+                r'(\d{1,2})\s*[号日]', text)
+            if range_match:
+                d1 = _future_day_only(int(range_match.group(1)))
+                d2 = _future_day_only(int(range_match.group(2)))
+                if d1 and d2:
+                    if d2 <= d1:
+                        try:
+                            d2 = d2.replace(
+                                month=d2.month % 12 + 1,
+                                year=d2.year + (1 if d2.month == 12 else 0))
+                        except ValueError:
+                            pass
+                    if d2 > d1:
+                        params["check_in"] = d1.strftime("%Y-%m-%d")
+                        params["check_out"] = d2.strftime("%Y-%m-%d")
+
         if "check_in" not in params:
             day_match = re.search(r'(?<!\d)(\d{1,2})\s*[号日](?!\d)', text)
             if day_match:
@@ -389,22 +442,10 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
         模拟模式下用模板回复，真实模式下调用 LLM
         """
         if self.use_real_llm:
-            try:
-                prompt = f"{context}\n\n用户：{user_input}\n助手："
-                response = self.dashscope.Generation.call(
-                    model=self.model,
-                    prompt=prompt,
-                    result_format="message"
-                )
-                # 与意图提取路径一致：限流时 output 为 None，打印真实原因再兜底
-                if getattr(response, "output", None) is None:
-                    print(f"[LLM 回复生成失败] status={getattr(response, 'status_code', '?')} "
-                          f"code={getattr(response, 'code', '?')} "
-                          f"message={getattr(response, 'message', '?')}")
-                else:
-                    return response.output.choices[0].message.content
-            except Exception as e:
-                print(f"[LLM 回复生成失败] {e}")
+            prompt = f"{context}\n\n用户：{user_input}\n助手："
+            text = self._chat(prompt)
+            if text:
+                return text
 
         # 模拟模式：返回简单确认
         return "好的，我明白了。"

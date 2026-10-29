@@ -13,12 +13,15 @@ from typing import List, Optional
 
 from models import BookingParams, Hotel, RoomRatePlan
 from llm import shift_date
+from geo_data import (
+    find_city, find_similar_city, get_city_coord, infer_city_from_location,
+)
 from text_rules import (
     NAME_STOPWORDS, NAME_DENY_WORDS, NAME_PATTERNS as _NAME_PATTERNS,
     ORDER_FILTER_NAMES, ORDER_LIST_WORDS,
     ORDER_STATUS_TEXT, match_order_status, extract_order_id,
 )
-from tools import calculate_total_price, get_hotel_detail
+from tools import calculate_total_price, get_hotel_detail, format_hotel_list
 
 
 # ========== 预订参数 ==========
@@ -34,6 +37,167 @@ BOOKING_PARAM_KEYS = (
     "city", "check_in", "check_out", "min_star",
     "max_price", "facilities", "keyword", "guest_name",
 )
+
+# 位置描述里常被 LLM 连带提取进来的口语前缀
+_LOCATION_LEAD_WORDS = (
+    "帮我查询", "帮忙查询", "请帮我查询", "我查询", "查询",
+    "帮我查", "帮忙查", "我查", "查一下", "查查",
+    "搜索一下", "搜索", "搜一下", "搜", "找一下", "找一找", "找",
+    "我想去", "我要去", "想去", "我要", "我想", "看看", "在",
+)
+# 地名实体后缀：用于判断“南宁是第二中学”里的“是”是不是“市”的笔误
+_LOCATION_ENTITY_WORDS = (
+    "中学", "小学", "高中", "初中", "大学", "学院", "学校", "幼儿园",
+    "医院", "机场", "火车站", "高铁站", "地铁站", "车站", "广场", "公园",
+    "景区", "景点", "酒店", "饭店", "大厦", "政府", "中心", "步行街",
+    "街", "路", "湾", "站",
+)
+
+
+def normalize_location(location: str, city: str = "") -> str:
+    """清理地点里连带提取的“我查询/帮我查”等口语前缀。"""
+    loc = (location or "").strip(" 　")
+    changed = True
+    while changed and loc:
+        changed = False
+        for word in _LOCATION_LEAD_WORDS:
+            if loc.startswith(word) and len(loc) - len(word) >= 2:
+                loc = loc[len(word):].lstrip(" 　的")
+                changed = True
+                break
+    return loc
+
+
+def suggest_location_fix(location: str, city: str) -> str:
+    """
+    高置信度地名笔误纠正：城市名后紧跟“是/事”且后面是地标实体时，
+    认为用户想写“市”，返回纠正后的完整地名；否则返回空串。
+    例：南宁是第二中学附近 → 南宁市第二中学附近
+    """
+    loc = normalize_location(location, city)
+    core = (city or "").rstrip("市")
+    if not loc or not core:
+        return ""
+    m = re.match(rf"^{re.escape(core)}(?:市)?\s*([是事])\s*(.+)$", loc)
+    if not m:
+        return ""
+    rest = m.group(2).strip()
+    if len(rest) < 2 or not any(w in rest for w in _LOCATION_ENTITY_WORDS):
+        return ""
+    return f"{core}市{rest}"
+
+
+def location_fix_prompt(fix: dict) -> str:
+    """地名纠错确认话术。"""
+    suggested = str(fix.get("suggested") or "").strip()
+    display = re.sub(r"(附近|周边|旁边|一带)$", "", suggested)
+    suffix = "附近" if display != suggested else ""
+    return (
+        f"我猜你想说的是「{display}」{suffix}，对吗？\n"
+        "回复「对」我就按这个搜索；如果不对，请直接告诉我正确的地名。"
+    )
+
+
+def location_fix_reply(text: str) -> str:
+    """判断用户对纠错建议的回答：accept / reject / 空串（未明确回答）。"""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if any(w in t for w in ("不对", "不是", "错了", "错", "重新", "改一下", "改成", "换一个")):
+        return "reject"
+    if t in ("对", "是", "是的", "对的", "没错", "正确", "可以", "好", "嗯",
+             "按这个", "就这个"):
+        return "accept"
+    if t.startswith(("对", "是的", "没错", "正确", "按这个", "就这个")):
+        return "accept"
+    return ""
+
+
+def location_fix_action(state, text: str):
+    """
+    地名纠错确认的统一入口（单/多 Agent 共用）。
+
+    返回 (action, reply)：
+      ("reply", 文本)   需要直接回复用户（确认/拒绝/重复确认）
+      ("accepted", "")  已采用纠正后的地名，调用方继续预订/搜索流程
+      ("none", "")      无需处理，继续原流程
+    """
+    params = state.params
+    fix = getattr(state, "pending_location_fix", None) or {}
+    if fix:
+        if any(w in text for w in QUIT_BOOKING_WORDS):
+            reset_booking_state(state)
+            return "reply", quit_booking_message()
+        current = normalize_location(params.location, params.city)
+        # 用户没回答“对/不对”，而是重新给了一个地点：以新地点为准
+        if current and current != fix.get("original"):
+            state.pending_location_fix = {}
+        else:
+            answer = location_fix_reply(text)
+            if answer == "accept":
+                if fix.get("city"):
+                    params.city = fix["city"]
+                params.location = fix.get("suggested") or params.location
+                state.pending_location_fix = {}
+                return "accepted", ""
+            if answer == "reject":
+                state.pending_location_fix = {}
+                return ("reply", "好的，请重新告诉我正确的地名"
+                                 "（例如：南宁市第二中学附近）。")
+            return "reply", location_fix_prompt(fix)
+
+    suggestion = suggest_location_fix(params.location, params.city)
+    if suggestion:
+        state.pending_location_fix = {
+            "original": normalize_location(params.location, params.city),
+            "suggested": suggestion,
+        }
+        return "reply", location_fix_prompt(state.pending_location_fix)
+    return "none", ""
+
+
+_CITY_TOKEN_RE = re.compile(r"^([\u4e00-\u9fa5]{2,4})市")
+
+
+def city_fix_action(state, text: str):
+    """
+    显式城市名纠错：输入里出现「大年市」这种不是已知城市的 X市 时，
+    先猜测相近城市并让用户确认；识别不出则要求用户重新确认城市。
+    """
+    norm = normalize_location(text)
+    m = _CITY_TOKEN_RE.match(norm)
+    if not m:
+        return "none", ""
+    core = m.group(1)
+    old_city = (state.params.city or "").rstrip("市")
+    if get_city_coord(core):
+        # 显式写了合法城市：优先于 LLM 从“西安路”里误抓的“西安”
+        loc = normalize_location(state.params.location, state.params.city)
+        if old_city and old_city != core and loc.startswith(old_city + "市"):
+            loc = f"{core}市{loc[len(old_city) + 1:].lstrip(' 　的')}"
+            state.params.location = loc
+        elif loc.startswith("市"):
+            state.params.location = f"{core}{loc}"
+        state.params.city = core
+        return "none", ""
+
+    suggestion = find_similar_city(core)
+    original_loc = normalize_location(state.params.location, state.params.city)
+    loc = original_loc
+    for prefix in (core + "市", core, old_city + "市"):
+        if prefix and loc.startswith(prefix):
+            loc = loc[len(prefix):].lstrip(" 　的")
+            break
+    if not suggestion:
+        return ("reply", f"「{core}市」我没查到，请确认城市名后再搜索"
+                         "（例如：大连市西安路附近）。")
+    suggested = f"{suggestion}市{loc}" if loc else f"{suggestion}市"
+    state.pending_location_fix = {
+        "original": original_loc,
+        "suggested": suggested,
+        "city": suggestion,
+    }
+    return "reply", location_fix_prompt(state.pending_location_fix)
 
 
 def merge_params(state, extracted: dict, user_input: str = "") -> None:
@@ -81,6 +245,17 @@ def merge_params(state, extracted: dict, user_input: str = "") -> None:
         p.keyword = extracted["keyword"]
     if "location" in extracted:
         p.location = extracted["location"]
+    # 清理 LLM 误带进 location 的口语前缀（“我查询南宁…”）
+    p.location = normalize_location(p.location, p.city)
+    # LLM 剥离城市前缀时可能留下孤立的“市”（“大连市西安路”→“市西安路”），
+    # 补回城市名，保证距离展示和 POI 解析拿到完整地标
+    if p.city and p.location.startswith("市"):
+        p.location = f"{p.city.rstrip('市')}{p.location}"
+    # LLM/规则有时只给了“来宾高级中学附近”却没给城市：从位置或原句补城市，
+    # 避免明明说了地点还反复追问“哪个城市”
+    if not p.city:
+        p.city = (infer_city_from_location(p.location or "")
+                  or find_city(user_input))
 
 
 def calc_nights(check_in: str, check_out: str) -> int:
@@ -93,17 +268,40 @@ def calc_nights(check_in: str, check_out: str) -> int:
         return 0
 
 
-def generate_clarify_question(missing: List[str]) -> str:
-    """生成参数追问问题（模板；模拟模式无需 LLM）。"""
+def generate_clarify_question(missing: List[str], params=None) -> str:
+    """生成参数追问：优先用已识别的地点/城市，避免固定列清单式的生硬模板。"""
+    city = getattr(params, "city", "") or ""
+    location = getattr(params, "location", "") or ""
+    if city and location:
+        place = location if location.startswith(city.rstrip("市")) else f"{city}{location}"
+    else:
+        place = city or location
     if len(missing) == 1:
-        templates = {
-            "城市": "请问你想去哪个城市？",
-            "入住日期": "请问你计划哪天入住？（如：下周末、2026-10-15）",
-            "离店日期": "请问你计划哪天离店？或住几晚？",
-        }
-        return templates.get(missing[0], f"请问{missing[0]}是什么？")
-    fields_str = "、".join(missing)
-    return f"好的，我还需要确认一些信息：{fields_str}。请告诉我这些信息，我帮你搜索。"
+        if missing[0] == "城市":
+            return "请问你想去哪个城市？"
+        if missing[0] == "入住日期":
+            return (f"好的，按{place}来搜。计划哪天入住？"
+                    if place else "计划哪天入住？（如：下周末、2026-10-15）")
+        if missing[0] == "离店日期":
+            if getattr(params, "check_in", ""):
+                return f"入住 {params.check_in} 收到，计划住几晚/哪天离店？"
+            return "计划哪天离店？或住几晚？"
+        return f"请问{missing[0]}是什么？"
+    if set(missing) == {"入住日期", "离店日期"}:
+        if place:
+            return (f"好的，按{place}来搜。还需要入住和离店日期——"
+                    "告诉我哪天到、住几晚就行。")
+        return "好的，还需要入住和离店日期——告诉我哪天到、住几晚就行。"
+    if "城市" in missing:
+        rest = [m for m in missing if m != "城市"]
+        if place:
+            return (f"地点我先记下了（{place}），还需要确认城市；"
+                    f"{'、'.join(rest)}也一起告诉我吧。")
+        return f"好的，先确认一下：{'、'.join(missing)}？告诉我之后我直接搜。"
+    if place:
+        return (f"好的，按{place}来搜；还差{'、'.join(missing)}，"
+                "一起告诉我就行。")
+    return f"好的，先确认一下：{'、'.join(missing)}？告诉我之后我直接搜。"
 
 
 def reset_booking_state(state) -> None:
@@ -114,6 +312,7 @@ def reset_booking_state(state) -> None:
     state.current_order = None
     state.booking_context = {}
     state.pending_booking = {}
+    state.pending_location_fix = {}
     state.stage = "intent"
 
 
@@ -466,6 +665,12 @@ RESEARCH_WORDS = (
 )
 # 彻底放弃本次预订
 QUIT_BOOKING_WORDS = ("不订了", "取消预订", "算了不订", "不买了")
+# 选房阶段想回到上一级酒店列表：只回列表，不重新搜索
+BACK_TO_HOTEL_WORDS = (
+    "返回上一级", "返回上一页", "上一级", "上一页",
+    "返回酒店列表", "回到酒店列表", "返回酒店", "返回列表",
+    "重新选酒店", "重选酒店", "返回重新选", "返回",
+)
 _QUIT_MESSAGE = ("好的，本次预订已取消。下次想订酒店时，直接告诉我城市和入住"
                  "日期就可以～")
 
@@ -490,6 +695,7 @@ def booking_exit_action(state, text: str) -> Optional[str]:
     返回：
       "new_search" 新搜索条件句 → 调用方交回主流程重新识别意图
       "research"   重查指令     → 调用方沿用原条件重搜
+      "back"       返回酒店列表 → 调用方直接展示原搜索结果
       "quit"       彻底放弃     → 调用方直接回复 _QUIT_MESSAGE
       None         未命中
     """
@@ -497,13 +703,25 @@ def booking_exit_action(state, text: str) -> Optional[str]:
         state.selected_hotel = None
         state.booking_context = {}
         state.pending_booking = {}
+        state.pending_location_fix = {}
         state.params = BookingParams()   # 新旧条件不混杂
         state.stage = "intent"
         return "new_search"
+    if any(w in text for w in BACK_TO_HOTEL_WORDS):
+        if getattr(state, "search_results", None):
+            state.selected_hotel = None
+            state.booking_context = {}
+            state.pending_booking = {}
+            state.pending_location_fix = {}
+            state.stage = "recommend"
+            return "back"
+        # 没有上一级列表可回：按重查处理，避免用户卡在选房阶段
+        return "research"
     if any(w in text for w in RESEARCH_WORDS):
         state.selected_hotel = None
         state.booking_context = {}
         state.pending_booking = {}
+        state.pending_location_fix = {}
         # stage 交给调用方重新置位；沿用原参数重搜
         return "research"
     if any(w in text for w in QUIT_BOOKING_WORDS):
@@ -517,6 +735,37 @@ def quit_booking_message() -> str:
 
 
 # ========== 展示 ==========
+
+def render_hotel_results(params, results: List[Hotel]) -> str:
+    """渲染酒店搜索结果列表（搜索完成与“返回酒店列表”共用）。"""
+    if not results:
+        return "没有找到符合条件的酒店，建议放宽筛选条件。"
+    nights = calc_nights(params.check_in, params.check_out)
+    location = (params.location or "").strip()
+    city_core = (params.city or "").rstrip("市")
+    if location:
+        area_text = (f"{location}，" if location.startswith(city_core)
+                     else f"{params.city}{location}，")
+    else:
+        area_text = ""
+    nearest_hint = ""
+    located = [h for h in results if h.distance_m]
+    if location and located:
+        nearest = min(located, key=lambda h: h.distance_m)
+        dist = int(round(nearest.distance_m / 10.0) * 10)
+        nearest_hint = (
+            f"按距{location.replace('附近', '')}由近到远排列，"
+            f"最近的是 {nearest.name}（约{dist}米）。\n"
+        )
+    return (
+        f"为你找到 {len(results)} 家符合条件的酒店"
+        f"（{area_text}{params.check_in} 入住，{params.check_out} 离店，共{nights}晚）：\n\n"
+        f"{nearest_hint}"
+        f"{format_hotel_list(results)}\n\n"
+        f"回复序号或酒店名选一家；想按价格、星级或距离再筛，"
+        f"直接告诉我就行。"
+    )
+
 
 def load_hotel_selection_detail(hotel: Hotel, params) -> Hotel:
     """选中酒店后拉实时详情；失败/无详情时回退搜索阶段对象。"""
@@ -591,7 +840,8 @@ def render_hotel_selection(hotel: Hotel, params,
                 "如 1-2；只回复 1 默认最低价）")
         room_lines.append(
             "\n请告诉我：选择哪个房型（回复序号或房型名）+ 入住人姓名？"
-            "\n（例如：1，入住人张三）")
+            "\n（例如：1，入住人张三）"
+            "\n（不喜欢这家酒店？回复「返回上一级」回到酒店列表重新选）")
         if show_login_hint:
             import rollinggo_book as rlg
             if rlg.is_logged_in():

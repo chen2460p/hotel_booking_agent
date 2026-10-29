@@ -19,6 +19,10 @@ from typing import Dict, List, Optional, Tuple
 
 from models import Order
 
+# 相对 SQLite 路径统一按项目目录解析，避免 Web（cwd=hotel_booking_agent）和
+# CLI（cwd=项目根目录）各写一个 orders.db。
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # ---------- 懒加载 ----------
 _mem_db: Dict[str, Order] = {}
 _conn = None
@@ -48,7 +52,7 @@ def _init_once() -> None:
         if sqlite_m:
             path = sqlite_m.group(1)
             if path and not os.path.isabs(path):
-                path = os.path.abspath(path)
+                path = os.path.join(_BASE_DIR, path)
             _backend = "sqlite"
             _try_sqlite(path)
             return

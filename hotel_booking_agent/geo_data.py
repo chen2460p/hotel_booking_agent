@@ -240,6 +240,10 @@ _CITY_ALIASES = {
 }
 
 
+import difflib
+import re
+
+
 def get_city_coord(city: str):
     """返回城市中心城区 (纬度, 经度)，查不到返回 None。入参可带"市/州"等后缀。"""
     if not city:
@@ -253,6 +257,75 @@ def get_city_coord(city: str):
     if name in CITY_COORDS:
         return CITY_COORDS[name]
     return CITY_COORDS.get(_CITY_ALIASES.get(name))
+
+
+# 城市名后紧跟这些地标类型时，才把前缀城市名当作“用户想去的地方”，
+# 避免把“上海路”这类街道名误判成要去上海
+_CITY_PREFIX_LANDMARKS = (
+    "机场", "火车站", "高铁站", "地铁站", "车站", "站", "大学", "学院", "学校",
+    "中学", "小学", "高中", "初中", "幼儿园", "医院", "研究所", "广场",
+    "公园", "景区", "景点", "古镇", "古城", "步行街", "商圈", "中心",
+    "政府", "博物馆", "体育馆", "大厦", "饭店", "酒店", "故宫",
+)
+
+
+def infer_city_from_location(location: str) -> str:
+    """从“来宾高级中学附近”这类位置描述推断城市；推断不出返回空串。"""
+    loc = re.sub(r"附近|周边|旁边|一带", "", (location or "").strip())
+    if not loc:
+        return ""
+    for city in sorted(CITY_COORDS, key=len, reverse=True):
+        if loc in (city, f"{city}市"):
+            return city
+        if not loc.startswith(city):
+            continue
+        rest = loc[len(city):].lstrip("市")
+        if not rest or any(w in rest for w in _CITY_PREFIX_LANDMARKS):
+            return city
+    return ""
+
+
+def find_city(text: str) -> str:
+    """在整句里查找已知城市名（取最早出现的，同位置取更长名）。"""
+    t = text or ""
+    best, best_pos = "", len(t) + 1
+    for city in CITY_COORDS:
+        pos = t.find(city)
+        if pos < 0:
+            continue
+        if pos < best_pos or (pos == best_pos and len(city) > len(best)):
+            best, best_pos = city, pos
+    return best
+
+
+# 同分候选的优先顺序：旅游/省会城市优先，减少“大年市→大庆市”这类硬猜
+_CITY_PRIORITY = (
+    "大连", "青岛", "厦门", "三亚", "桂林", "北京", "上海", "广州", "深圳",
+    "成都", "杭州", "西安", "南京", "武汉", "重庆", "天津", "苏州", "长沙",
+    "昆明", "丽江", "大理", "南宁", "哈尔滨", "沈阳", "长春", "郑州", "济南",
+)
+
+
+def find_similar_city(name: str) -> str:
+    """给疑似写错的城市名找一个最接近的已知城市；找不到返回空串。"""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    scored = []
+    for order, city in enumerate(CITY_COORDS):
+        if abs(len(city) - len(name)) > 1:
+            continue
+        score = difflib.SequenceMatcher(None, name, city).ratio()
+        if score >= 0.45:
+            try:
+                priority = _CITY_PRIORITY.index(city)
+            except ValueError:
+                priority = len(_CITY_PRIORITY)
+            scored.append((-score, priority, order, city))
+    if not scored:
+        return ""
+    scored.sort()
+    return scored[0][3]
 
 
 def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
