@@ -9,12 +9,14 @@
 # 通信方式：共享状态 + 直接消息（对应八股中的多 Agent 通信机制）
 # 协调模式：Supervisor-Worker（工头制，生产环境最常用模式）
 
+import time
 from typing import Optional, List
 from dataclasses import dataclass, field
 from models import AgentState
 from tools import (
     search_hotels,
-    create_order, pay_order, cancel_order, get_order_status,
+    create_order, pay_order, cancel_order, get_order_status, find_order,
+    pre_cancel_real_order, confirm_cancel_real_order,
     list_history_orders, format_order_rows,
     sync_real_order_status, real_order_cancel_guide,
 )
@@ -324,7 +326,8 @@ class ServiceAgent(BaseAgent):
         # 任务2：取消订单（售后，需要二次确认）
         if msg.msg_type == "task" and msg.content == "cancel_aftersale":
             order_id = msg.data.get("order_id", "")
-            order = get_order_status(order_id)
+            # 远端订单不写本地库，必须回退查道旅详情
+            order = find_order(order_id)
 
             if not order:
                 return AgentMessage(
@@ -343,17 +346,100 @@ class ServiceAgent(BaseAgent):
                     data={"order_id": order_id}
                 )
 
-            # 道旅未开放取消接口：不能只在本地标记取消，直接给指引
+            # 真实订单：pre-cancel 询价 → 用户确认 → confirm-cancel
             if order.source == "rollinggo":
+                if msg.data.get("confirmed", False):
+                    pending = shared_state.pending_cancel or {}
+                    if (not pending or pending.get("order_id") != order.order_id
+                            or (pending.get("expires_at")
+                                and time.time() > float(pending["expires_at"]))):
+                        shared_state.pending_cancel = {}
+                        return AgentMessage(
+                            sender=self.name, receiver="Supervisor",
+                            msg_type="result", content="cancel_failed",
+                            data={"order_id": order_id,
+                                  "text": "取消凭证已失效，请重新回复订单号发起取消。"}
+                        )
+                    result = confirm_cancel_real_order(
+                        order.order_id,
+                        pending.get("booking_id", ""),
+                        pending.get("confirm_id", ""),
+                    )
+                    shared_state.pending_cancel = {}
+                    if result.get("ok"):
+                        shared_state.current_order = None
+                        return AgentMessage(
+                            sender=self.name, receiver="Supervisor",
+                            msg_type="result", content="cancelled",
+                            data={"order_id": order_id,
+                                  "text": result.get("message") or "订单已成功取消。"}
+                        )
+                    return AgentMessage(
+                        sender=self.name, receiver="Supervisor",
+                        msg_type="result", content="cancel_failed",
+                        data={"order_id": order_id,
+                              "text": result.get("message") or "取消失败，请稍后重试。"}
+                    )
+
+                quote = pre_cancel_real_order(order.order_id)
+                if not quote.get("ok"):
+                    shared_state.pending_cancel = {}
+                    return AgentMessage(
+                        sender=self.name, receiver="Supervisor",
+                        msg_type="result", content="not_cancellable",
+                        data={"order_id": order_id,
+                              "text": quote.get("message") or
+                                      "该订单按规则无法在线取消，请联系客服。"}
+                    )
+
+                penalty = quote.get("penalty")
+                penalty_num = float(penalty or 0)
+                total = float(quote.get("total_price") or 0)
+                refund = max(total - penalty_num, 0)
+                unpaid = ("尚未支付" in (quote.get("message") or "")
+                          or order.status == "pending")
+                shared_state.pending_cancel = {
+                    "order_id": quote["order_id"],
+                    "source": "rollinggo",
+                    "booking_id": quote["booking_id"],
+                    "confirm_id": quote["confirm_id"],
+                    "expires_at": quote.get("expires_at") or 0,
+                    "penalty": penalty,
+                    "total_price": total,
+                }
+                lines = [
+                    "可以取消这笔道旅订单：",
+                    f"订单号：{quote.get('order_id') or order.order_id}",
+                    f"酒店：{quote.get('hotel_name') or order.hotel_name}",
+                    f"入住：{quote.get('check_in') or order.check_in} → "
+                    f"{quote.get('check_out') or order.check_out}",
+                    f"订单总价：¥{total:g}",
+                    f"取消罚金：{'以道旅页面为准' if penalty is None else f'¥{penalty_num:g}'}",
+                ]
+                if unpaid:
+                    lines.append("该订单尚未支付，取消不会扣款。")
+                elif penalty is None:
+                    lines.append("预计退款：以道旅实际结算为准")
+                else:
+                    lines.append(f"预计退款：¥{refund:g}（以道旅实际结算为准）")
+                if quote.get("message"):
+                    lines.append(f"道旅说明：{quote['message']}")
+                lines.append("")
+                lines.append("回复【确认取消】提交（取消不可撤销，凭证 10 分钟内有效），"
+                             "或回复【取消操作】放弃。")
                 return AgentMessage(
                     sender=self.name, receiver="Supervisor",
-                    msg_type="result", content="remote_unsupported",
-                    data={"order_id": order_id}
+                    msg_type="result", content="need_confirmation",
+                    data={"text": "\n".join(lines), "order_id": order_id}
                 )
 
             # 第一次请求：要求确认（高危操作防呆——确认层）
             if not msg.data.get("confirmed", False):
                 shared_state.current_order = order
+                shared_state.pending_cancel = {
+                    "order_id": order.order_id,
+                    "source": "mock",
+                }
                 confirm_text = (
                     f"确认要取消以下订单吗？\n"
                     f"订单号：{order.order_id}\n"
@@ -368,8 +454,18 @@ class ServiceAgent(BaseAgent):
                     data={"text": confirm_text, "order_id": order_id}
                 )
 
-            # 用户已确认，执行取消
+            # 用户已确认，执行本地模拟单取消；必须有上一轮确认上下文
+            pending = shared_state.pending_cancel or {}
+            if not pending or pending.get("order_id") != order.order_id \
+                    or pending.get("source") != "mock":
+                return AgentMessage(
+                    sender=self.name, receiver="Supervisor",
+                    msg_type="result", content="cancel_failed",
+                    data={"order_id": order_id,
+                          "text": "请先回复订单号发起取消，再回复【确认取消】。"}
+                )
             cancel_order(order_id)
+            shared_state.pending_cancel = {}
             shared_state.current_order = None
             return AgentMessage(
                 sender=self.name, receiver="Supervisor",
@@ -463,20 +559,22 @@ class SupervisorAgent:
         """主入口——处理用户输入，协调各 Worker Agent"""
         self.shared_state.conversation_history.append(f"用户：{user_input}")
 
+        # ===== 取消确认阶段（必须先于 booking 阶段，避免“确认取消”被当成选房输入）=====
+        if "确认取消" in user_input and (self.shared_state.pending_cancel
+                                          or self.shared_state.current_order):
+            return self._dispatch_cancel(confirmed=True)
+        if "取消操作" in user_input:
+            self.shared_state.pending_cancel = {}
+            self.shared_state.current_order = None
+            self.shared_state.stage = "intent"
+            return "好的，已取消操作。"
+
         # ===== 特殊阶段处理：预订确认阶段 =====
         if self.shared_state.stage == "booking":
             response = self._handle_booking_stage(user_input)
             if response:
                 self.shared_state.conversation_history.append(f"助手：{response}")
                 return response
-
-        # ===== 特殊阶段处理：取消确认阶段 =====
-        if "确认取消" in user_input and self.shared_state.current_order:
-            return self._dispatch_cancel(confirmed=True)
-        if "取消操作" in user_input:
-            self.shared_state.current_order = None
-            self.shared_state.stage = "intent"
-            return "好的，已取消操作。"
 
         # ===== Step 1：意图理解（Supervisor 的核心能力）=====
         intent, extracted = self.llm.extract_intent_and_params(user_input)
@@ -568,20 +666,11 @@ class SupervisorAgent:
                 return result.data["text"]
             return "支付失败，请稍后重试。"
 
-        # 取消订单
+        # 取消订单：模拟单和真实单都交给 ServiceAgent 走二次确认
         if "取消订单" in user_input and self.shared_state.current_order:
-            msg = AgentMessage(
-                sender="Supervisor", receiver="BookingAgent",
-                msg_type="task", content="cancel_order"
-            )
-            self.workers["booking"].receive(msg)
-            result = self.workers["booking"].process(self.shared_state)
-            if result and result.content == "remote_unsupported":
-                order_id = result.data.get("order_id", "")
-                reset_booking_state(self.shared_state)
-                return real_order_cancel_guide(order_id)
-            reset_booking_state(self.shared_state)
-            return "订单已取消。"
+            order = self.shared_state.current_order
+            return self._dispatch_cancel(
+                extracted={"order_id": order.order_id})
 
         # 逃生口：重新查询/换酒店/一句话发起新搜索/彻底放弃
         # （必须在房型、姓名解析之前，否则会被跨轮暂存信息困在选房状态）
@@ -712,7 +801,9 @@ class SupervisorAgent:
 
     def _dispatch_cancel(self, extracted: dict = None, confirmed: bool = False) -> str:
         """分发取消订单任务给 ServiceAgent"""
-        if confirmed and self.shared_state.current_order:
+        if confirmed and self.shared_state.pending_cancel:
+            order_id = self.shared_state.pending_cancel.get("order_id", "")
+        elif confirmed and self.shared_state.current_order:
             order_id = self.shared_state.current_order.order_id
         elif extracted:
             order_id = extracted.get("order_id", "")
@@ -741,12 +832,19 @@ class SupervisorAgent:
             if result.content == "remote_unsupported":
                 self.shared_state.stage = "intent"
                 return real_order_cancel_guide(result.data.get("order_id", ""))
+            if result.content == "not_cancellable":
+                self.shared_state.stage = "intent"
+                return result.data.get("text") or "该订单暂时无法在线取消。"
+            if result.content == "cancel_failed":
+                self.shared_state.stage = "intent"
+                return result.data.get("text") or "取消失败，请稍后重试或联系客服。"
             if result.content == "need_confirmation":
                 self.shared_state.stage = "booking"  # 复用 booking 阶段处理确认
                 return result.data["text"]
             if result.content == "cancelled":
                 self.shared_state.stage = "intent"
-                return f"订单 {result.data.get('order_id', '')} 已成功取消，退款将在1-3个工作日内原路返回。"
+                return (result.data.get("text") or
+                        f"订单 {result.data.get('order_id', '')} 已成功取消。")
 
         return "取消操作失败，请联系客服。"
 

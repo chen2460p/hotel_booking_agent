@@ -8,10 +8,12 @@
   POST {MCP_BASE}/hotelorders        查询订单列表
   POST {MCP_BASE}/hotelorderdetail   查询订单详情
 
-注意：道旅未开放"取消订单"接口（2026-10 实测 MCP tools/list 仅 3 个工具、
-所有 REST 取消路径候选均 404；OAuth scope 里的 hotel:order:cancel 暂无对应
-端点）。真实订单只能引导用户到 rollinggo.cn 订单详情页手动取消，
-助手侧绝不能只在本地标记"已取消"（会造成与网页状态不一致的假象）。
+取消订单（2026-11 起可用，需 OAuth 的 hotel:order:cancel scope）：
+  POST {MCP_BASE}/hotelprecancel     询价/取凭证 -> canCancel / penaltyAmount /
+                                     confirmId / bookingId（confirmId 10 分钟有效）
+  POST {MCP_BASE}/hotelcancelconfirm 确认取消   -> orderNo + bookingId + confirmId
+取消分两步：先询价并把罚金/退款展示给用户，用户明确确认后才提交确认取消；
+远端成功前绝不把本地订单标记为已取消（避免与道旅网页状态不一致）。
 
 鉴权：OAuth 授权码 + PKCE（client_id=rollinggoskill），通过
 api.rollinggo.store 中转完成授权（旧版 rollinggo.store 已停止提供该接口，
@@ -207,7 +209,15 @@ def login(open_browser: bool = True) -> str:
 # ---------------------------------------------------------------------------
 # REST 通用请求
 # ---------------------------------------------------------------------------
-def _request(endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Any:
+def _request(endpoint: str, payload: Optional[Dict[str, Any]] = None,
+             raise_on_error: bool = True) -> Any:
+    """
+    POST 到道旅 REST 接口。
+
+    raise_on_error=False 用于「业务失败也是一等结果」的接口：
+    例如 /hotelprecancel 对不可取消订单返回 success=false + canCancel=false
+    + 客服指引，调用方需要拿到这些字段，而不是直接抛异常。
+    """
     token = load_token()
     if not token or not token.get("access_token"):
         raise RollingGoAuthError(
@@ -233,7 +243,8 @@ def _request(endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Any:
         data = resp.json()
     except ValueError:
         raise RollingGoApiError(f"道旅接口返回非 JSON：{resp.text[:300]}")
-    _raise_if_business_error(data)
+    if raise_on_error:
+        _raise_if_business_error(data)
     return data
 
 
@@ -255,6 +266,18 @@ def _raise_if_business_error(data: Any) -> None:
     msg = (data.get("message") or data.get("msg")
            or data.get("errorMsg") or str(data)[:300])
     raise RollingGoApiError(f"道旅业务错误 code={code}：{msg}")
+
+
+def _is_success(data: Any) -> bool:
+    """不抛异常地判断业务是否成功（用于取消这类需要读取失败详情的接口）。"""
+    if not isinstance(data, dict):
+        return False
+    if data.get("success") is True:
+        return True
+    if data.get("success") is False:
+        return False
+    return data.get("code") in (None, 0, 200, 2000, "0", "200", "2000",
+                                "SUCCESS", "success")
 
 
 def _unwrap(data: Any) -> Any:
@@ -445,6 +468,59 @@ def get_order_detail(order_no: str) -> Any:
     return _request("/hotelorderdetail", {"orderNo": str(order_no)})
 
 
+def pre_cancel(order_no: str) -> Dict[str, Any]:
+    """
+    预取消：查询罚金并获取 10 分钟有效的取消凭证。
+
+    道旅对不可取消/已取消订单返回 HTTP 200 + success=false + canCancel=false，
+    所以这里必须 raise_on_error=False，把这些字段原样交给上层展示，而不是抛异常。
+    """
+    raw = _request("/hotelprecancel", {"orderNo": str(order_no)},
+                   raise_on_error=False)
+    raw = raw if isinstance(raw, dict) else {}
+    can_cancel = bool(raw.get("canCancel"))
+    confirm_id = str(raw.get("confirmId") or "")
+    booking_id = str(raw.get("bookingId") or "")
+    message = str(raw.get("message") or "")
+    # 凭证缺一不可：没有 confirmId/bookingId 时不能进入确认取消
+    if can_cancel and (not confirm_id or not booking_id):
+        can_cancel = False
+        message = message or "道旅未返回取消凭证，请稍后重试或联系客服。"
+    return {
+        "success": _is_success(raw),
+        "can_cancel": can_cancel,
+        "confirm_id": confirm_id,
+        "booking_id": booking_id,
+        "penalty": _to_number(raw.get("penaltyAmount")),
+        "message": message,
+        "order_no": str(raw.get("orderNo") or order_no),
+        "raw": raw,
+    }
+
+
+def confirm_cancel(order_no: str, booking_id: str, confirm_id: str,
+                   description: Optional[str] = None) -> Dict[str, Any]:
+    """
+    确认取消（不可逆）。必须传入 pre_cancel 返回的 bookingId + confirmId，
+    且 confirmId 只有 10 分钟有效。
+    """
+    payload: Dict[str, Any] = {
+        "orderNo": str(order_no),
+        "bookingId": str(booking_id),
+        "confirmId": str(confirm_id),
+    }
+    if description:
+        payload["description"] = str(description)
+    raw = _request("/hotelcancelconfirm", payload, raise_on_error=False)
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        "success": _is_success(raw),
+        "message": str(raw.get("message") or ""),
+        "order_no": str(raw.get("orderNo") or order_no),
+        "raw": raw,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 订单响应归一化（列表 / 详情共用）
 # ---------------------------------------------------------------------------
@@ -522,6 +598,8 @@ def parse_orders(raw: Any) -> List[Dict[str, Any]]:
             "status_text": humanize_order_status(status),
             "payment_url": str(_find_key(
                 it, ["paymentUrl", "payUrl", "cashierUrl", "payURL"], "")) or "",
+            "payment_deadline": str(_find_key(
+                it, ["paymentDeadline", "payDeadline", "expireTime", "expireDate"], "")) or "",
             "create_time": str(_find_key(
                 it, ["createTime", "createdAt", "orderTime", "bookingTime"], "")) or "",
             "source": "rollinggo",

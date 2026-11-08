@@ -8,14 +8,16 @@
 # - 工具：通过 tools.py 调用，每个工具做一件事
 
 import re
+import time
 from typing import Optional
 from models import AgentState, BookingParams, Hotel
 from tools import (
     search_hotels, get_hotel_detail,
     create_order, create_real_order, pay_order, cancel_order,
-    get_order_status,
+    get_order_status, find_order,
+    pre_cancel_real_order, confirm_cancel_real_order,
     list_history_orders, format_order_rows,
-    sync_real_order_status, real_order_cancel_guide,
+    sync_real_order_status,
 )
 from llm import LLMClient
 from agent_common import (
@@ -76,7 +78,10 @@ class HotelBookingAgent:
         self._emit_stage("thinking", "正在理解你的需求…")
 
         # 真实订单的支付只能由用户打开支付链接完成，任何时候都不能本地标记已支付
-        if ("支付" in user_input and self.state.current_order
+        # （含“取消/退订”的句子优先走取消流程，不能在支付提示处被截断）
+        if ("支付" in user_input and "取消" not in user_input
+                and "退订" not in user_input and "退款" not in user_input
+                and self.state.current_order
                 and self.state.current_order.source == "rollinggo"):
             order = self.state.current_order
             tail = f"\n支付链接：{order.payment_url}" if order.payment_url else \
@@ -85,6 +90,14 @@ class HotelBookingAgent:
                 f"订单 {order.order_id} 是道旅真实订单，我无法代为支付，"
                 f"请你亲自打开支付页面完成付款：{tail}"
             )
+            self.state.conversation_history.append(f"助手：{response}")
+            return response
+
+        # 取消确认优先于选房阶段：否则 stage=booking 时“确认取消”会被
+        # process_booking_confirmation 当成房型/入住人输入
+        if self.state.pending_cancel and (
+                "确认取消" in user_input or "取消操作" in user_input):
+            response = self._handle_cancel({}, user_input)
             self.state.conversation_history.append(f"助手：{response}")
             return response
 
@@ -132,7 +145,7 @@ class HotelBookingAgent:
         elif intent == "order_query":
             return self._handle_order_query(extracted, user_input)
         elif intent == "cancel":
-            return self._handle_cancel(extracted)
+            return self._handle_cancel(extracted, user_input)
         else:
             return self._handle_chat(user_input, extracted)
 
@@ -301,16 +314,33 @@ class HotelBookingAgent:
                 blocks.append("回复【查全部订单】可查看所有状态的订单。")
         return "\n".join(blocks)
 
-    def _handle_cancel(self, extracted: dict) -> str:
+    def _handle_cancel(self, extracted: dict, user_input: str = "") -> str:
         """
-        处理取消订单（售后场景 + 高危操作）
-        对应八股中的"高危操作四层防呆"——这里实现确认层
+        处理取消订单（售后场景 + 高危操作）。
+
+        真实订单走「pre-cancel 询价 → 展示罚金 → 确认取消 → confirm-cancel」；
+        本地模拟订单仍走原来的二次确认，不触碰远端。
         """
-        order_id = extracted.get("order_id")
+        # 1) 用户确认的是上一轮询价/二次确认过的那笔订单
+        if "确认取消" in user_input:
+            if self.state.pending_cancel:
+                if self.state.pending_cancel.get("source") == "mock":
+                    return self._confirm_mock_cancel()
+                return self._confirm_real_cancel()
+            return "当前没有待确认的取消操作。请先告诉我要取消的订单号。"
+        if "取消操作" in user_input:
+            self.state.pending_cancel = {}
+            self.state.current_order = None
+            return "好的，已取消操作。"
+
+        order_id = (extracted.get("order_id") or "").strip()
+        if not order_id and self.state.pending_cancel:
+            order_id = self.state.pending_cancel.get("order_id", "")
         if not order_id:
             return "请提供要取消的订单号。"
 
-        order = get_order_status(order_id)
+        # 本地没有时回退查道旅详情：Web 订单页的远端订单不写入本地库
+        order = find_order(order_id)
         if not order:
             return f"未找到订单号 {order_id}。"
 
@@ -320,30 +350,111 @@ class HotelBookingAgent:
         if order.status == "cancelled":
             return f"订单 {order_id} 已经是取消状态了。"
 
-        # 道旅未开放取消接口：不能只在本地标记取消，直接给出手动取消指引
         if order.source == "rollinggo":
-            return real_order_cancel_guide(order_id)
+            return self._real_cancel_quote(order)
 
-        # 高危操作：需要用户二次确认（确认层防呆）
-        if self.state.current_order and self.state.current_order.order_id == order_id:
-            # 用户已经确认过，执行取消
-            result = cancel_order(order_id)
-            if result == "ok":
-                self.state.current_order = None
-                return f"订单 {order_id} 已成功取消，退款将在1-3个工作日内原路返回。"
-            else:
-                return f"取消订单 {order_id} 失败，请联系客服。"
+        # 高危操作：模拟单也必须先二次确认（确认层防呆）
+        self.state.pending_cancel = {
+            "order_id": order.order_id,
+            "source": "mock",
+            "expires_at": time.time() + 600,
+        }
+        self.state.current_order = order
+        return (
+            f"确认要取消以下订单吗？\n"
+            f"订单号：{order.order_id}\n"
+            f"酒店：{order.hotel_name}\n"
+            f"入住：{order.check_in} → {order.check_out}\n"
+            f"总价：{order.total_price:g}元\n\n"
+            f"回复【确认取消】即可取消，或回复【取消操作】放弃。"
+        )
+
+    def _confirm_mock_cancel(self) -> str:
+        """确认取消本地模拟单；10 分钟内有效，避免误取消。"""
+        pending = self.state.pending_cancel or {}
+        if time.time() > float(pending.get("expires_at") or 0):
+            self.state.pending_cancel = {}
+            return "取消确认已过期，请重新回复【取消订单 订单号】。"
+        order_id = pending.get("order_id", "")
+        result = cancel_order(order_id)
+        if result == "ok":
+            reset_booking_state(self.state)
+            return f"订单 {order_id} 已成功取消。"
+        self.state.pending_cancel = {}
+        self.state.current_order = None
+        return f"取消订单 {order_id} 失败，请联系客服。"
+
+    def _real_cancel_quote(self, order) -> str:
+        """真实订单：先询价，展示罚金/退款，等待【确认取消】。"""
+        quote = pre_cancel_real_order(order.order_id)
+        if not quote.get("ok"):
+            self.state.pending_cancel = {}
+            return quote.get("message") or \
+                "该订单按规则无法在线取消，请联系道旅客服处理。"
+
+        penalty = quote.get("penalty")
+        penalty_num = float(penalty or 0)
+        total = float(quote.get("total_price") or 0)
+        refund = max(total - penalty_num, 0)
+        penalty_text = "以道旅页面为准" if penalty is None else f"¥{penalty_num:g}"
+        unpaid = ("尚未支付" in (quote.get("message") or "")
+                  or order.status == "pending")
+
+        self.state.pending_cancel = {
+            "order_id": quote["order_id"],
+            "source": "rollinggo",
+            "booking_id": quote["booking_id"],
+            "confirm_id": quote["confirm_id"],
+            "expires_at": quote.get("expires_at") or 0,
+            "penalty": penalty,
+            "total_price": total,
+        }
+
+        lines = [
+            "可以取消这笔道旅订单：",
+            f"订单号：{quote.get('order_id') or order.order_id}",
+            f"酒店：{quote.get('hotel_name') or order.hotel_name}",
+            f"入住：{quote.get('check_in') or order.check_in} → "
+            f"{quote.get('check_out') or order.check_out}",
+            f"订单总价：¥{total:g}",
+            f"取消罚金：{penalty_text}",
+        ]
+        if unpaid:
+            lines.append("该订单尚未支付，取消不会扣款。")
+        elif penalty is None:
+            lines.append("预计退款：以道旅实际结算为准")
         else:
-            # 第一次请求，要求确认
-            self.state.current_order = order
-            return (
-                f"确认要取消以下订单吗？\n"
-                f"订单号：{order.order_id}\n"
-                f"酒店：{order.hotel_name}\n"
-                f"入住：{order.check_in} → {order.check_out}\n"
-                f"总价：{order.total_price}元\n\n"
-                f"回复【确认取消】即可取消，或回复【取消操作】放弃。"
-            )
+            lines.append(f"预计退款：¥{refund:g}（以道旅实际结算为准）")
+        if quote.get("message"):
+            lines.append(f"道旅说明：{quote['message']}")
+        lines.append("")
+        lines.append("回复【确认取消】提交（取消不可撤销，凭证 10 分钟内有效），"
+                     "或回复【取消操作】放弃。")
+        return "\n".join(lines)
+
+    def _confirm_real_cancel(self) -> str:
+        """确认提交真实订单取消；失败时清空凭证，避免拿旧凭证反复试。"""
+        pending = self.state.pending_cancel or {}
+        if not pending:
+            return "当前没有待确认的取消操作。"
+        if time.time() > float(pending.get("expires_at") or 0):
+            self.state.pending_cancel = {}
+            return ("取消凭证已过期（10 分钟有效），请重新回复"
+                    "【取消订单 订单号】查询最新罚金。")
+
+        result = confirm_cancel_real_order(
+            pending.get("order_id", ""),
+            pending.get("booking_id", ""),
+            pending.get("confirm_id", ""),
+        )
+        order_id = pending.get("order_id", "")
+        self.state.pending_cancel = {}
+        if result.get("ok"):
+            reset_booking_state(self.state)
+            return (f"订单 {order_id} 已成功取消。\n"
+                    f"{result.get('message') or ''}\n"
+                    "如已支付，退款到账时间以道旅/银行处理为准。").strip()
+        return f"订单 {order_id} 取消失败：{result.get('message') or '请稍后重试或联系客服。'}"
 
     # 这些字段出现在提取结果中，说明用户本轮确实在补充预订信息（而非闲聊）
     _BOOKING_PARAM_KEYS = (
@@ -369,9 +480,11 @@ class HotelBookingAgent:
                 return f"请输入 1-{total} 之间的序号，或直接告诉我酒店名称。当前共有 {total} 家酒店可选。"
 
         # 检查是否是确认取消
-        if "确认取消" in user_input and self.state.current_order:
-            return self._handle_cancel({"order_id": self.state.current_order.order_id})
+        if "确认取消" in user_input and (self.state.pending_cancel
+                                          or self.state.current_order):
+            return self._handle_cancel({}, user_input)
         if "取消操作" in user_input:
+            self.state.pending_cancel = {}
             self.state.current_order = None
             return "好的，已取消操作。"
 
@@ -841,15 +954,10 @@ class HotelBookingAgent:
                 )
             return "支付失败，请稍后重试或联系客服。"
 
-        # 3) 取消当前订单（模拟/真实不同处理）
+        # 3) 取消当前订单：模拟单和真实单都先走二次确认
         if "取消订单" in user_input and self.state.current_order:
             order = self.state.current_order
-            if order.source == "rollinggo":
-                # 道旅真实订单：API 未开放取消，给手动取消指引
-                return real_order_cancel_guide(order.order_id)
-            cancel_order(order.order_id)
-            reset_booking_state(self.state)
-            return "订单已取消。"
+            return self._handle_cancel({"order_id": order.order_id}, user_input)
 
         if not self.state.selected_hotel:
             return None  # 未选酒店，让主流程处理

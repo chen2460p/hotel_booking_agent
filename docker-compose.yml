@@ -1,0 +1,53 @@
+# 酒店预订 Agent —— 单机部署编排
+#
+#   cp hotel_booking_agent/.env.example hotel_booking_agent/.env   # 首次：填 Key
+#   docker compose up -d --build
+#   http://127.0.0.1:8000
+#
+# 数据都在命名卷里，重建镜像不会丢订单 / 缓存 / 道旅登录态。
+
+# 显式项目名：目录名是中文时，Compose 从目录名推导项目名会得到空串并报
+# "project name must not be empty"。它同时是容器/卷/网络的前缀。
+name: hotel-booking
+
+services:
+  web:
+    build:
+      context: .
+      args:
+        WITH_DASHSCOPE: "1"     # RAG 真实 Embedding；不需要可改 0
+        WITH_PYMYSQL: "0"       # 订单库用 MySQL 时改 1
+    image: hotel-booking-agent:latest
+    container_name: hotel-booking-agent
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    # Key 从宿主机的 .env 注入，镜像里不含密钥
+    env_file:
+      - hotel_booking_agent/.env
+    environment:
+      TZ: Asia/Shanghai
+      # environment 优先级高于 env_file：强制订单库落在卷里，
+      # 否则 .env 里的 sqlite:///orders.db 会随镜像层一起丢。
+      DATABASE_URL: sqlite:////data/orders.db
+      ROLLINGGO_TOKEN_FILE: /home/app/.hotel-cli/token.json
+    volumes:
+      - hotel-data:/data                     # orders.db
+      - hotel-cache:/app/cache               # 携程图片 / 评分缓存
+      - hotel-token:/home/app/.hotel-cli     # 道旅 OAuth token.json
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  hotel-data:
+  hotel-cache:
+  hotel-token:

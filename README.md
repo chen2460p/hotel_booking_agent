@@ -35,6 +35,7 @@
 - **实时房型报价**：道旅 `getHotelDetail` 返回同房型下含早/退改等上百条报价，程序按房型聚合、每房型保留最多 4 档代表性报价（最低价 / 含早 / 可取消 / 申请确认），**同房型多档对比**并标出差价；每个房型配**多张实拍图**（道旅 `roomInfo.images` 单图 + 携程官方相册按房型名模糊匹配补齐，每房型最多 8 张）
 - **真实验价 + 下单**：道旅 OAuth REST 接口 `/hotelpriceconfirm`（锁价拿 `referenceNo`）→ `/hotelbook`（创建订单拿 `orderNo` + `paymentUrl`）→ `/hotelorders`（查单）
 - **历史订单查询**：对话里说「查我的历史订单 / 查待支付的订单 / 查已取消的订单」即可拉取道旅账号全部真实订单（跨会话保留），支持按状态筛选；未登录时降级展示本次会话的本地订单并引导登录
+- **真实订单取消**：说「取消订单 订单号」先走 pre-cancel 查询罚金/退款并拿 10 分钟凭证，用户明确回复「确认取消」后才提交 confirm-cancel；不可在线取消时原样展示道旅客服指引。Web 订单页同样支持两步取消
 - **资金安全设计**：验价与下单两步分离、强制二次确认、常用入住人须用户确认后才使用、**程序只拿到支付链接，绝不在程序内完成支付**
 - **三级数据源回退**：道旅（有价格）→ 高德 POI（仅名称地址）→ 内置模拟酒店库，任何 Key 缺失都不阻断运行
 - **RAG 酒店评价**：切块 → Embedding（DashScope `text-embedding-v2` 或 TF-IDF 模拟）→ 向量召回 → 重排 → 生成回答
@@ -92,9 +93,9 @@
     ├── text_utils.py          # 名称归一/相似度（携程、高德、评分匹配共用）
     ├── llm.py                 # LLM 封装：DashScope 真实模式 + 规则引擎模拟模式
     ├── models.py              # dataclass：Hotel / RoomRatePlan / BookingParams / Order / AgentState
-    ├── tools.py               # 工具层：三级回退搜索、详情、计价、下单、内存订单库
+    ├── tools.py               # 工具层：三级回退搜索、详情、计价、下单/取消、订单存储
     ├── rollinggo_mcp.py       # 道旅 MCP（Streamable HTTP）客户端：搜索 + 房型报价
-    ├── rollinggo_book.py      # 道旅 OAuth REST：登录/验价/下单/查单（也支持命令行）
+    ├── rollinggo_book.py      # 道旅 OAuth REST：登录/验价/下单/查单/取消（也支持命令行）
     ├── amap_poi.py            # 高德 Web 服务 POI 文本搜索适配器
     └── rag.py                 # 酒店评价 RAG（Embedding 召回 + 重排）
 ```
@@ -185,6 +186,17 @@ python main_multi.py
 你 > 取消          # 验价后任何时候都可放弃，referenceNo 随即作废
 ```
 
+真实订单创建后不想要了：
+
+```
+你 > 取消订单 H179328570303748911
+       → 调用 /hotelprecancel：展示取消罚金、预计退款、10 分钟有效凭证
+       → 尚未支付的订单通常可免费取消；不可在线取消时给客服电话/邮箱
+
+你 > 确认取消
+       → 调用 /hotelcancelconfirm：远端成功后才更新本地状态
+```
+
 也可以在多轮对话中补充：「换一家」「返回上一级」「第 3 种房型」「2 含早」「2 可取消」「2-1」「使用常用入住人 1」「换个邮箱 xxx@xx.com」。
 
 历史订单查询：
@@ -255,9 +267,9 @@ orderNo + paymentUrl（通用收银台，用户自行打开支付）
 |---|---|
 | `models.py` | 全部 dataclass；`Hotel` 含 `distance_m`（距 POI 直线距离米）与 `distance_to`（参照地标名）；`BookingParams.is_complete()/missing_fields()` 驱动参数追问；`Order.source` 区分 mock/rollinggo |
 | `llm.py` | `LLMClient.extract_intent_and_params()`：意图 book/search/order_query/cancel/chat + 结构化参数；默认模型 qwen3.8-flash（OpenAI 兼容接口，`DASHSCOPE_MODEL` 可覆盖）；含口语日期换算（今天/明天/后天/住三天）+ 错误日志直接打印 status/code/message |
-| `tools.py` | `search_hotels()` 三级回退；`get_hotel_detail(live=True)` 实时富化；`create_order()` 模拟单；`create_real_order()` 道旅真单；`list_history_orders()` 历史订单（远程+本地合并、状态筛选）；运行时酒店缓存 `_RUNTIME_HOTEL_CACHE`；内存 `ORDER_DB`；`format_hotel_list()` 在有 POI 距离时输出距离行 |
+| `tools.py` | `search_hotels()` 三级回退；`get_hotel_detail(live=True)` 实时富化；`create_order()` 模拟单；`create_real_order()` 道旅真单；`find_order()` 本地/远端订单查找；`pre_cancel_real_order() / confirm_cancel_real_order()` 真实单两步取消；`list_history_orders()` 历史订单（远程+本地合并、状态筛选）；运行时酒店缓存；`format_hotel_list()` 在有 POI 距离时输出距离行 |
 | `rollinggo_mcp.py` | `RollingGoMCPClient`：MCP 握手、JSON/SSE 双解析；搜索参数构造（`hotelTags.maxPricePerNight` 等）；报价按「房型 + 餐食 + 退改 + 申请确认 + 床型 + 入住人数」分桶，每房型保留最多 4 档代表性报价；POI 距离透传（`distanceInMeters`）；地标识别扩展到 街/路/大道；排序策略：有 POI 距离时按"近→远"、未知沉底，否则地标词命中优先 |
-| `rollinggo_book.py` | OAuth PKCE 登录与本地回调服务；token 存取（与官方 CLI 共享 `~/.hotel-cli/token.json`）；`price_confirm() / create_booking() / list_orders() / get_order_detail() / parse_orders()`；CLI 支持 `login/status/logout/orders` |
+| `rollinggo_book.py` | OAuth PKCE 登录与本地回调服务；token 存取（与官方 CLI 共享 `~/.hotel-cli/token.json`）；`price_confirm() / create_booking() / list_orders() / get_order_detail() / parse_orders()`；`pre_cancel() / confirm_cancel()` 两步取消；CLI 支持 `login/status/logout/orders` |
 | `amap_poi.py` | 高德文本搜索 v3（`restapi.amap.com/v3/place/text`），住宿大类 100000，星级词映射 |
 | `agent.py` | 主状态机：选店、验价确认卡编排、下单与取消（选择/解析/渲染细节走 `agent_common`） |
 | `multi_agent.py` | `AgentMessage` 消息队列 + `AgentState` 共享黑板；Supervisor 分发 Search/Booking/Service/Review 四个 Worker |
@@ -293,6 +305,9 @@ A：重新执行 `python rollinggo_book.py login`；token 文件在 `~/.hotel-cl
 
 **Q：Windows 终端中文乱码？**
 A：先执行 `$env:PYTHONUTF8 = "1"` 再运行程序。
+
+**Q：下单后不想支付，怎么取消？**
+A：在对话里回复「取消订单 订单号」，助手会先查取消罚金（未支付订单通常为 0）并给出 10 分钟凭证；确认后回复【确认取消】才会真正提交。Web 订单页的待支付订单也有「取消订单」按钮，同样先展示罚金再确认。不可在线取消的订单会显示道旅客服电话/邮箱。
 
 **Q：会真的扣钱吗？**
 A：只有你本人打开 `paymentUrl` 在收银台完成支付才会扣款；只验价或创建订单后不支付，不会产生费用。

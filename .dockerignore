@@ -1,0 +1,30 @@
+# 版本控制与 IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Python 缓存
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+
+# 密钥：绝不进镜像，运行时用 --env-file / compose env_file 注入
+hotel_booking_agent/.env
+hotel_booking_agent/.env.*
+!hotel_booking_agent/.env.example
+
+# 本地数据与运行时缓存（容器内用卷挂载）
+*.db
+*.db-shm
+*.db-wal
+*.bak
+hotel_booking_agent/cache/
+
+# 与镜像无关的本地文件
+个人资料/
+*.pdf
+*.png
+README.md
+DOCKER.md
+docker-compose.yml

@@ -116,6 +116,8 @@ class AgentState:
     search_results: List[Hotel] = field(default_factory=list)     # 最近一次搜索结果
     selected_hotel: Optional[Hotel] = None                        # 用户选中的酒店
     current_order: Optional[Order] = None                         # 当前订单
+    # 真实订单取消上下文：pre-cancel 返回的凭证/罚金，等用户【确认取消】
+    pending_cancel: dict = field(default_factory=dict)
     conversation_history: List[str] = field(default_factory=list) # 对话历史（短期记忆）
     # 真实预订多轮上下文：草稿（等邮箱）与待确认验价单（等【确认下单】）
     booking_context: dict = field(default_factory=dict)

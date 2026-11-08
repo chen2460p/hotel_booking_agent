@@ -22,7 +22,10 @@ from hotel_rating import (
 
 
 # ========== 模拟酒店数据库 ==========
-# 真实项目中这部分应替换为数据库查询或第三方 API 调用
+# 真实项目中这部分应替换为数据库查询或第三方 API 调用。
+# 覆盖 16 个城市（三亚/北京/上海/杭州/成都/重庆/西安/广州/深圳/南京/武汉/长沙/
+# 厦门/青岛/天津/苏州），每个城市 2~4 家，价格与星级拉开档位，
+# 用于无 Key 的降级运行与规则引擎回归测试。
 HOTEL_DB: List[Hotel] = [
     Hotel(
         hotel_id="H001", name="三亚海景大酒店", city="三亚",
@@ -93,6 +96,193 @@ HOTEL_DB: List[Hotel] = [
         facilities=["WiFi"],
         room_types=["标准间"],
         rating=3.8, review_count=945
+    ),
+    # ---------- 成都 ----------
+    Hotel(
+        hotel_id="H011", name="成都春熙路亚朵酒店", city="成都",
+        address="春熙路商圈 红星路三段", star=4, price_per_night=468,
+        facilities=["WiFi", "早餐", "健身房", "停车场"],
+        room_types=["高级大床房", "高级双床房", "亲子房"],
+        rating=4.6, review_count=2890
+    ),
+    Hotel(
+        hotel_id="H012", name="成都天府广场希尔顿酒店", city="成都",
+        address="人民南路一段", star=5, price_per_night=1288,
+        facilities=["WiFi", "早餐", "健身房", "行政酒廊", "泳池"],
+        room_types=["标准间", "行政房", "套房"],
+        rating=4.8, review_count=3612
+    ),
+    Hotel(
+        hotel_id="H013", name="成都宽窄巷子青旅", city="成都",
+        address="下同仁路 宽窄巷子旁", star=2, price_per_night=168,
+        facilities=["WiFi"],
+        room_types=["标准间", "大床房"],
+        rating=4.1, review_count=742
+    ),
+    # ---------- 重庆 ----------
+    Hotel(
+        hotel_id="H014", name="重庆解放碑洪崖洞江景酒店", city="重庆",
+        address="沧白路 洪崖洞景区旁", star=4, price_per_night=528,
+        facilities=["江景", "WiFi", "早餐"],
+        room_types=["江景大床房", "标准间"],
+        rating=4.7, review_count=2103
+    ),
+    Hotel(
+        hotel_id="H015", name="重庆江北机场如家快捷酒店", city="重庆",
+        address="江北国际机场 T3 航站楼", star=2, price_per_night=218,
+        facilities=["WiFi", "停车场"],
+        room_types=["标准间", "大床房"],
+        rating=3.9, review_count=660
+    ),
+    # ---------- 西安 ----------
+    Hotel(
+        hotel_id="H016", name="西安钟楼美居酒店", city="西安",
+        address="南大街 钟楼旁", star=4, price_per_night=498,
+        facilities=["WiFi", "早餐", "健身房"],
+        room_types=["大床房", "双床房"],
+        rating=4.6, review_count=1876
+    ),
+    Hotel(
+        hotel_id="H017", name="西安临潼兵马俑驿站客栈", city="西安",
+        address="临潼区 秦陵北路", star=2, price_per_night=158,
+        facilities=["WiFi", "停车场"],
+        room_types=["标准间"],
+        rating=4.0, review_count=512
+    ),
+    # ---------- 广州 ----------
+    Hotel(
+        hotel_id="H018", name="广州珠江新城江景大酒店", city="广州",
+        address="珠江新城 花城大道", star=5, price_per_night=1388,
+        facilities=["江景", "WiFi", "早餐", "健身房", "SPA"],
+        room_types=["江景房", "行政房", "套房"],
+        rating=4.8, review_count=2984
+    ),
+    Hotel(
+        hotel_id="H019", name="广州北京路步行街快捷酒店", city="广州",
+        address="北京路步行街", star=2, price_per_night=238,
+        facilities=["WiFi"],
+        room_types=["标准间", "大床房"],
+        rating=4.0, review_count=1203
+    ),
+    # ---------- 深圳 ----------
+    Hotel(
+        hotel_id="H020", name="深圳福田会展中心大酒店", city="深圳",
+        address="福田区 福华三路 会展中心", star=5, price_per_night=1188,
+        facilities=["WiFi", "早餐", "健身房", "泳池"],
+        room_types=["标准间", "行政房", "套房"],
+        rating=4.7, review_count=2456
+    ),
+    Hotel(
+        hotel_id="H021", name="深圳华强北全季酒店", city="深圳",
+        address="福田区 华强北路", star=3, price_per_night=358,
+        facilities=["WiFi", "早餐"],
+        room_types=["大床房", "双床房"],
+        rating=4.4, review_count=1780
+    ),
+    # ---------- 南京 ----------
+    Hotel(
+        hotel_id="H022", name="南京夫子庙秦淮河景酒店", city="南京",
+        address="秦淮区 夫子庙贡院街", star=4, price_per_night=588,
+        facilities=["河景", "WiFi", "早餐"],
+        room_types=["河景大床房", "标准间"],
+        rating=4.6, review_count=1543
+    ),
+    Hotel(
+        hotel_id="H023", name="南京新街口如家精选酒店", city="南京",
+        address="新街口 中山南路", star=2, price_per_night=268,
+        facilities=["WiFi"],
+        room_types=["标准间", "大床房"],
+        rating=4.1, review_count=987
+    ),
+    # ---------- 武汉 ----------
+    Hotel(
+        hotel_id="H024", name="武汉黄鹤楼江景酒店", city="武汉",
+        address="武昌区 临江大道 黄鹤楼旁", star=4, price_per_night=468,
+        facilities=["江景", "WiFi", "早餐"],
+        room_types=["江景房", "标准间"],
+        rating=4.5, review_count=1320
+    ),
+    Hotel(
+        hotel_id="H025", name="武汉光谷广场汉庭酒店", city="武汉",
+        address="洪山区 光谷广场", star=2, price_per_night=208,
+        facilities=["WiFi"],
+        room_types=["标准间"],
+        rating=3.9, review_count=845
+    ),
+    # ---------- 长沙 ----------
+    Hotel(
+        hotel_id="H026", name="长沙五一广场橘子洲酒店", city="长沙",
+        address="芙蓉区 五一大道", star=4, price_per_night=438,
+        facilities=["WiFi", "早餐", "健身房"],
+        room_types=["大床房", "双床房"],
+        rating=4.5, review_count=1678
+    ),
+    Hotel(
+        hotel_id="H027", name="长沙坡子街青年旅舍", city="长沙",
+        address="天心区 坡子街", star=2, price_per_night=138,
+        facilities=["WiFi"],
+        room_types=["标准间"],
+        rating=4.0, review_count=604
+    ),
+    # ---------- 厦门 ----------
+    Hotel(
+        hotel_id="H028", name="厦门鼓浪屿海景别墅酒店", city="厦门",
+        address="鼓浪屿 龙头路", star=5, price_per_night=1088,
+        facilities=["海景", "泳池", "WiFi", "早餐"],
+        room_types=["海景房", "别墅"],
+        rating=4.8, review_count=2233
+    ),
+    Hotel(
+        hotel_id="H029", name="厦门中山路步行街客栈", city="厦门",
+        address="思明区 中山路步行街", star=2, price_per_night=228,
+        facilities=["WiFi"],
+        room_types=["标准间", "大床房"],
+        rating=4.2, review_count=1105
+    ),
+    # ---------- 青岛 ----------
+    Hotel(
+        hotel_id="H030", name="青岛栈桥海景假日酒店", city="青岛",
+        address="市南区 太平路 栈桥旁", star=4, price_per_night=598,
+        facilities=["海景", "WiFi", "早餐", "停车场"],
+        room_types=["海景大床房", "标准间"],
+        rating=4.6, review_count=1965
+    ),
+    Hotel(
+        hotel_id="H031", name="青岛市南五四广场快捷酒店", city="青岛",
+        address="市南区 香港中路 五四广场", star=2, price_per_night=248,
+        facilities=["WiFi"],
+        room_types=["标准间", "大床房"],
+        rating=4.0, review_count=872
+    ),
+    # ---------- 天津 ----------
+    Hotel(
+        hotel_id="H032", name="天津意式风情区精品酒店", city="天津",
+        address="河北区 意式风情区 胜利路", star=4, price_per_night=468,
+        facilities=["WiFi", "早餐"],
+        room_types=["大床房", "双床房"],
+        rating=4.4, review_count=1188
+    ),
+    Hotel(
+        hotel_id="H033", name="天津站前如家快捷酒店", city="天津",
+        address="河东区 海河东路 天津站", star=2, price_per_night=198,
+        facilities=["WiFi"],
+        room_types=["标准间"],
+        rating=3.8, review_count=634
+    ),
+    # ---------- 苏州 ----------
+    Hotel(
+        hotel_id="H034", name="苏州平江路园林酒店", city="苏州",
+        address="姑苏区 平江路历史街区", star=5, price_per_night=988,
+        facilities=["园林", "WiFi", "早餐", "茶室"],
+        room_types=["园景房", "套房"],
+        rating=4.7, review_count=1742
+    ),
+    Hotel(
+        hotel_id="H035", name="苏州观前街快捷酒店", city="苏州",
+        address="姑苏区 观前街", star=2, price_per_night=218,
+        facilities=["WiFi"],
+        room_types=["标准间", "大床房"],
+        rating=4.1, review_count=1063
     ),
 ]
 
@@ -377,14 +567,15 @@ def sync_real_order_status(order: Order) -> None:
 
 def cancel_order(order_id: str) -> str:
     """
-    工具6：取消订单（售后场景）
-    返回："ok" 已取消 / "remote_unsupported" 道旅真实订单无取消接口 / "not_found"
+    工具6：取消本地模拟订单。
+    真实订单请走 pre_cancel_real_order() / confirm_cancel_real_order()。
+    返回："ok" 已取消 / "remote_unsupported" 真实单不可本地取消 / "not_found"
     """
     order = storage.get_order(order_id)
     if order is None or order.status == "cancelled":
         return "not_found"
-    # 道旅没有开放订单取消接口（MCP 工具与 REST 路径均已实测确认），
-    # 绝不能只在本地标记取消——那会让用户以为订单已取消，实际仍在网页待支付
+    # 真实订单必须走 pre_cancel_real_order / confirm_cancel_real_order
+    # （远端成功后才能改本地状态）；这里只处理本地模拟单，避免误标已取消。
     if order.source == "rollinggo":
         return "remote_unsupported"
     storage.update_status(order_id, "cancelled")
@@ -393,18 +584,158 @@ def cancel_order(order_id: str) -> str:
 
 
 def real_order_cancel_guide(order_id: str) -> str:
-    """道旅真实订单的取消指引（agent / multi_agent 共用）。"""
+    """取消接口不可用时的兜底指引（agent / multi_agent 共用）。"""
     return (
-        f"订单 {order_id} 是道旅真实订单，道旅暂未开放取消接口，"
-        f"助手无法代为取消（也不会在本地把它标记为已取消，"
-        f"以免和道旅网页状态不一致）。\n"
-        f"请手动取消：\n"
-        f"  1. 打开订单详情页："
-        f"https://rollinggo.cn/pc/#/hotel/detail?subOrderNo={order_id}\n"
-        f"  2. 点击页面右侧【取消订单】按钮\n"
-        f"  3. 是否免费取消以页面【取消政策】的截止时间为准；"
-        f"订单尚未支付的话，不支付就不会扣款"
+        f"订单 {order_id} 暂时无法通过助手在线取消。\n"
+        f"请打开道旅订单详情页手动取消：\n"
+        f"  https://rollinggo.cn/pc/#/hotel/detail?subOrderNo={order_id}\n"
+        f"是否免费取消以页面【取消政策】的截止时间为准；"
+        f"订单尚未支付的话，不支付就不会扣款。"
     )
+
+
+def find_order(order_id: str) -> Optional[Order]:
+    """
+    按订单号查本地订单；本地没有时回退查道旅订单详情。
+
+    Web 订单页的订单来自远端列表，并不一定写入本地 SQLite；
+    取消/查详情不能只查 storage，否则远端订单会一直被判定“未找到”。
+    """
+    order = storage.get_order(order_id)
+    if order is not None:
+        return order
+
+    if not order_id:
+        return None
+    try:
+        import rollinggo_book as rlg
+        if not rlg.is_logged_in():
+            return None
+        rows = rlg.parse_orders(rlg.get_order_detail(str(order_id)))
+        if not rows:
+            return None
+        row = rows[0]
+        bucket = _order_status_bucket(row)
+        return Order(
+            order_id=row.get("order_no") or str(order_id),
+            hotel_id="",
+            hotel_name=row.get("hotel_name") or "道旅订单",
+            check_in=row.get("check_in") or "",
+            check_out=row.get("check_out") or "",
+            room_type=row.get("room_name") or "",
+            guest_name="",
+            total_price=float(row.get("total_price") or 0),
+            status={"CANCELLED": "cancelled",
+                    "PENDING": "pending"}.get(bucket, "paid"),
+            source="rollinggo",
+            payment_url=row.get("payment_url") or "",
+        )
+    except Exception:
+        return None
+
+
+def pre_cancel_real_order(order_id: str) -> dict:
+    """
+    真实订单取消询价：返回罚金、凭证和客服提示，不修改订单。
+    结果中的 ok=True 才表示“可以进入确认取消”；confirm_id 10 分钟有效。
+    """
+    local = storage.get_order(order_id)
+    if local is not None and local.source != "rollinggo":
+        return {"ok": False, "reason": "not_real",
+                "message": "该订单是本地模拟订单，可直接在对话里回复【取消订单】取消。"}
+
+    try:
+        import rollinggo_book as rlg
+        if not rlg.is_logged_in():
+            return {"ok": False, "reason": "not_logged_in",
+                    "order_id": order_id,
+                    "message": "道旅账号未登录，请先在项目目录运行：python rollinggo_book.py login"}
+    except Exception:
+        pass
+
+    order = local or find_order(order_id)
+    if order is None:
+        return {"ok": False, "reason": "not_found",
+                "message": f"未找到订单 {order_id}，请确认订单号是否正确。"}
+    if order.source != "rollinggo":
+        return {"ok": False, "reason": "not_real",
+                "message": "该订单是本地模拟订单，可直接在对话里回复【取消订单】取消。"}
+
+    sync_real_order_status(order)
+    if order.status == "cancelled":
+        return {"ok": False, "reason": "already_cancelled",
+                "order_id": order.order_id,
+                "message": f"订单 {order.order_id} 已经是取消状态了。"}
+
+    try:
+        import rollinggo_book as rlg
+        if not rlg.is_logged_in():
+            return {"ok": False, "reason": "not_logged_in",
+                    "order_id": order.order_id,
+                    "message": "道旅账号未登录，请先在项目目录运行：python rollinggo_book.py login"}
+        quote = rlg.pre_cancel(order.order_id)
+    except Exception as e:
+        return {"ok": False, "reason": "api_error",
+                "order_id": order.order_id,
+                "message": f"取消询价失败：{e}"}
+
+    penalty = quote.get("penalty")
+    result = {
+        "ok": bool(quote.get("can_cancel")),
+        "reason": "quoted" if quote.get("can_cancel") else "not_cancellable",
+        "order_id": order.order_id,
+        "hotel_name": order.hotel_name,
+        "check_in": order.check_in,
+        "check_out": order.check_out,
+        "total_price": float(order.total_price or 0),
+        "can_cancel": bool(quote.get("can_cancel")),
+        "penalty": penalty,
+        "confirm_id": quote.get("confirm_id") or "",
+        "booking_id": quote.get("booking_id") or "",
+        "message": quote.get("message") or "",
+        "expires_at": time.time() + 600,
+    }
+    if not result["ok"]:
+        result["message"] = result["message"] or \
+            "该订单按规则无法在线取消，请联系道旅客服处理。"
+    return result
+
+
+def confirm_cancel_real_order(order_id: str, booking_id: str,
+                              confirm_id: str, description: str = "") -> dict:
+    """
+    确认取消真实订单（不可逆）。只有远端返回成功后才更新本地状态，
+    绝不在失败时把本地订单标成 cancelled。
+    """
+    if not order_id or not booking_id or not confirm_id:
+        return {"ok": False, "reason": "invalid_request",
+                "message": "取消凭证不完整，请重新发起取消并在 10 分钟内确认。"}
+
+    try:
+        import rollinggo_book as rlg
+        if not rlg.is_logged_in():
+            return {"ok": False, "reason": "not_logged_in",
+                    "message": "道旅账号未登录，请先运行：python rollinggo_book.py login"}
+        result = rlg.confirm_cancel(order_id, booking_id, confirm_id,
+                                    description or None)
+    except Exception as e:
+        return {"ok": False, "reason": "api_error",
+                "order_id": order_id,
+                "message": f"取消失败：{e}"}
+
+    if not result.get("success"):
+        return {"ok": False, "reason": "failed",
+                "order_id": order_id,
+                "message": result.get("message") or "道旅未确认取消，请稍后重试或联系客服。"}
+
+    storage.update_status(order_id, "cancelled")
+    _invalidate_history_cache()
+    order = storage.get_order(order_id)
+    if order is not None:
+        order.status = "cancelled"
+    return {"ok": True, "reason": "cancelled",
+            "order_id": order_id,
+            "message": result.get("message") or "订单已成功取消。"}
 
 
 def get_order_status(order_id: str) -> Optional[Order]:
@@ -438,6 +769,7 @@ def _local_order_to_row(order: Order) -> dict:
         "status": order.status,
         "status_text": _LOCAL_STATUS_TEXT.get(order.status, order.status),
         "payment_url": order.payment_url or "",
+        "payment_deadline": "",
         "create_time": "",
         "source": order.source,                       # mock / rollinggo
         "session_local": True,                        # 来自本次进程内存
@@ -454,7 +786,17 @@ def _order_status_bucket(row: dict) -> str:
     if "待支付" in text or "未支付" in text \
             or "PAY" in raw or "UNPAID" in raw or raw == "PENDING":
         return "PENDING"
+    # 道旅未支付订单常见 orderStatus=Booked（展示为“已确认”）+ paymentUrl。
+    # 不能只看订单状态，否则这类订单会被误归到 FINISHED，PENDING 过滤为空。
+    if row.get("payment_url") and not any(
+            k in text for k in ("已支付", "已完成", "已取消")):
+        return "PENDING"
     return "FINISHED"
+
+
+def order_status_bucket(row: dict) -> str:
+    """公开的状态桶（PENDING / CANCELLED / FINISHED），Web 层据此渲染操作按钮。"""
+    return _order_status_bucket(row)
 
 
 def list_history_orders(status_filter: str = "ALL") -> dict:

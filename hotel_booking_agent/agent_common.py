@@ -310,6 +310,7 @@ def reset_booking_state(state) -> None:
     state.search_results = []
     state.selected_hotel = None
     state.current_order = None
+    state.pending_cancel = {}
     state.booking_context = {}
     state.pending_booking = {}
     state.pending_location_fix = {}

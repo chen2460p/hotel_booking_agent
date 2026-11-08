@@ -13,7 +13,8 @@
   - GET  /orders        订单列表页面
   - GET  /api/orders    订单列表 JSON
   - POST /api/orders/{id}/pay     模拟支付
-  - POST /api/orders/{id}/cancel  取消订单（道旅真实订单给出手动指引）
+  - POST /api/orders/{id}/pre-cancel  真实订单取消询价（罚金 + confirmId）
+  - POST /api/orders/{id}/cancel      取消订单（真实订单需带询价凭证并确认）
 
 存储：订单走 storage 层（SQLite 自动回退内存，配 MySQL 可选），评分/酒店缓存与 CLI 版共用同一套磁盘文件。
 会话：session agent 池——前端携带 session_id，同一会话复用同一 Agent 实例（多轮对话状态保持），
@@ -22,6 +23,7 @@
 
 import os, sys, time, uuid, json, queue, asyncio, threading
 from pathlib import Path
+from typing import Optional
 
 PROJ = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJ))
@@ -92,6 +94,14 @@ class HotelMoreRequest(BaseModel):
     session_id: str
     offset: int = 0               # 从第 offset 家（0 基）开始补
     limit: int = 5                # 本次补全/展示家数
+
+
+class CancelRequest(BaseModel):
+    """真实订单确认取消：凭证来自 /pre-cancel，必须显式 confirm=true。"""
+    confirm: bool = False
+    confirm_id: str = ""
+    booking_id: str = ""
+    description: str = ""
 
 
 def _hotel_counts(agent: HotelBookingAgent, reply: str) -> tuple:
@@ -264,8 +274,11 @@ async def api_orders(filter: str = "ALL"):
             "check_out": r.get("check_out"),
             "total_price": r.get("total_price"),
             "currency": r.get("currency"),
+            "status": r.get("status", ""),
             "status_text": r.get("status_text"),
+            "status_bucket": tools.order_status_bucket(r),
             "payment_url": r.get("payment_url", ""),
+            "payment_deadline": r.get("payment_deadline", ""),
             "source": r.get("source", "mock"),
         })
     return {"rows": trimmed, "logged_in": result["logged_in"],
@@ -281,17 +294,46 @@ async def api_pay(order_id: str):
     return {"ok": True, "order_id": order_id}
 
 
+@app.post("/api/orders/{order_id}/pre-cancel")
+async def api_pre_cancel(order_id: str):
+    """真实订单取消询价：返回罚金、confirmId/bookingId（10 分钟有效）。"""
+    result = tools.pre_cancel_real_order(order_id)
+    if result.get("reason") == "not_found":
+        raise HTTPException(status_code=404, detail=result.get("message"))
+    return result
+
+
 @app.post("/api/orders/{order_id}/cancel")
-async def api_cancel(order_id: str):
+async def api_cancel(order_id: str, req: Optional[CancelRequest] = None):
+    """
+    取消订单：
+    - 本地模拟单：直接取消（兼容旧前端）
+    - 道旅真实单：必须带 pre-cancel 返回的 confirm_id + booking_id 且 confirm=true
+    """
+    order = tools.find_order(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail=f"订单 {order_id} 不存在")
+
+    if order.source == "rollinggo":
+        if not req or not req.confirm or not req.confirm_id or not req.booking_id:
+            return {
+                "ok": False,
+                "order_id": order_id,
+                "reason": "confirmation_required",
+                "message": "真实订单取消需先询价，并在确认罚金后提交取消凭证。",
+            }
+        result = tools.confirm_cancel_real_order(
+            order_id, req.booking_id, req.confirm_id, req.description)
+        return result
+
     result = tools.cancel_order(order_id)
     if result == "not_found":
         raise HTTPException(status_code=404, detail=f"订单 {order_id} 不存在")
     if result == "remote_unsupported":
-        # 道旅真实订单无取消接口，返回手动指引
         return {"ok": False, "order_id": order_id,
                 "reason": "remote_unsupported",
-                "guide": tools.real_order_cancel_guide(order_id)}
-    return {"ok": True, "order_id": order_id}
+                "message": tools.real_order_cancel_guide(order_id)}
+    return {"ok": True, "order_id": order_id, "message": "订单已取消。"}
 
 
 @app.get("/api/health")

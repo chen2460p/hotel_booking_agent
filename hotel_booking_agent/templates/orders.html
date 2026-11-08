@@ -60,13 +60,20 @@ async function loadOrders() {
   let html = `<table>
     <tr><th>订单号</th><th>酒店</th><th>房型</th><th>入住</th><th>总价</th><th>状态</th><th>来源</th><th>操作</th></tr>`;
   for (const o of rows) {
-    const status = o.status_text || o.status;
-    const cls = o.status === "pending" ? "status-pending" :
-                o.status === "cancelled" ? "status-cancel" : "status-paid";
+    const bucket = o.status_bucket ||
+      (o.status === "pending" ? "PENDING" :
+       o.status === "cancelled" ? "CANCELLED" : "FINISHED");
+    const status = (bucket === "PENDING" && o.source === "rollinggo")
+      ? "待支付" : (o.status_text || o.status);
+    const cls = bucket === "PENDING" ? "status-pending" :
+                bucket === "CANCELLED" ? "status-cancel" : "status-paid";
     let action = "";
-    if (o.status === "pending") {
-      if (o.source === "rollinggo" && o.payment_url) {
-        action += `<a class="pay-link" target="_blank" href="${o.payment_url}">去支付</a>`;
+    if (bucket === "PENDING") {
+      if (o.source === "rollinggo") {
+        if (o.payment_url) {
+          action += `<a class="pay-link" target="_blank" href="${o.payment_url}">去支付</a>`;
+        }
+        action += `<button class="btn danger" onclick="cancelReal('${o.order_no}')">取消订单</button>`;
       } else if (o.source === "mock") {
         action += `<button class="btn" onclick="pay('${o.order_no}')">标记支付</button>`;
         action += `<button class="btn danger" onclick="cancel('${o.order_no}')">取消</button>`;
@@ -98,8 +105,45 @@ async function cancel(id) {
   const r = await fetch(`/api/orders/${id}/cancel`, {method: "POST"});
   const d = await r.json();
   if (d.ok) { alert("已取消"); loadOrders(); }
-  else if (d.reason === "remote_unsupported") { alert(d.guide || "道旅真实订单请手动在网页取消"); }
-  else { alert("操作失败"); }
+  else if (d.reason === "remote_unsupported") { alert(d.message || "道旅真实订单请手动在网页取消"); }
+  else { alert(d.message || "操作失败"); }
+}
+
+async function cancelReal(id) {
+  // 第一步：询价，拿到罚金和 10 分钟有效的取消凭证
+  const r = await fetch(`/api/orders/${id}/pre-cancel`, {method: "POST"});
+  const q = await r.json();
+  if (!r.ok || !q.ok) {
+    alert(q.message || "该订单暂时无法在线取消，请联系道旅客服。");
+    return;
+  }
+  const penalty = q.penalty == null ? null : Number(q.penalty);
+  const total = Number(q.total_price || 0);
+  const refund = penalty == null ? null : Math.max(total - penalty, 0);
+  const lines = [
+    `确认取消订单 ${id}？`,
+    `酒店：${q.hotel_name || "-"}`,
+    `订单总价：¥${total}`,
+    `取消罚金：${penalty == null ? "以道旅页面为准" : "¥" + penalty}`,
+  ];
+  if (refund != null) lines.push(`预计退款：¥${refund}`);
+  if (q.message) lines.push("", q.message);
+  lines.push("", "取消不可撤销，确认继续？");
+  if (!confirm(lines.join("\n"))) return;
+
+  // 第二步：带凭证提交确认取消
+  const r2 = await fetch(`/api/orders/${id}/cancel`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      confirm: true,
+      confirm_id: q.confirm_id,
+      booking_id: q.booking_id,
+    }),
+  });
+  const d = await r2.json();
+  alert(d.message || (d.ok ? "已取消" : "取消失败"));
+  loadOrders();
 }
 
 loadOrders();
