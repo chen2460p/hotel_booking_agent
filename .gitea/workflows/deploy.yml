@@ -1,0 +1,85 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一分支只保留最新一次发布，避免并发部署互相覆盖容器
+concurrency:
+  group: deploy-hotel-main
+  cancel-in-progress: true
+
+env:
+  IMAGE: hotel-booking-agent
+  CONTAINER: hotel-booking-agent
+  HOST_PORT: "9122"
+  # 容器内 uvicorn 监听端口（见 Dockerfile CMD）
+  APP_PORT: "8000"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 生成运行时配置
+        run: |
+          # 密钥一律走仓库 Secrets（Settings → Actions → Secrets），不进镜像、不进仓库。
+          # 单引号防止 secret 里的 $ 被 shell 展开；这些 Key 都是纯字母数字。
+          # 未配置时为空值，应用会自动降级：意图识别走规则引擎、搜索走内置模拟酒店库。
+          {
+            echo 'DASHSCOPE_API_KEY=${{ secrets.DASHSCOPE_API_KEY }}'
+            echo 'DASHSCOPE_MODEL=${{ secrets.DASHSCOPE_MODEL }}'
+            echo 'AMAP_API_KEY=${{ secrets.AMAP_API_KEY }}'
+            echo 'ROLLINGGO_API_KEY=${{ secrets.ROLLINGGO_API_KEY }}'
+          } > hotel_booking_agent/.env
+          chmod 600 hotel_booking_agent/.env
+          echo "已写入 .env：$(grep -c '=.\+' hotel_booking_agent/.env) 个非空配置项"
+
+      - name: 构建镜像
+        run: |
+          docker build \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            -t "$IMAGE:latest" \
+            -t "$IMAGE:${{ github.sha }}" \
+            .
+
+      - name: 重启容器
+        run: |
+          docker rm -f "$CONTAINER" 2>/dev/null || true
+          docker run -d \
+            --name "$CONTAINER" \
+            --restart unless-stopped \
+            -p "127.0.0.1:${HOST_PORT}:${APP_PORT}" \
+            --env-file "$PWD/hotel_booking_agent/.env" \
+            -e TZ=Asia/Shanghai \
+            -e DATABASE_URL=sqlite:////data/orders.db \
+            -e ROLLINGGO_TOKEN_FILE=/home/app/.hotel-cli/token.json \
+            -v hotel-data:/data \
+            -v hotel-cache:/app/cache \
+            -v hotel-token:/home/app/.hotel-cli \
+            "$IMAGE:latest"
+
+      - name: 健康检查
+        run: |
+          # 作业跑在独立 job 容器里，127.0.0.1 不是宿主机，所以进应用容器内部自检
+          for i in $(seq 1 30); do
+            if docker exec "$CONTAINER" python -c \
+              "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:${APP_PORT}/api/health', timeout=3).status == 200 else 1)"; then
+              echo "服务已就绪（第 ${i} 次探测）"
+              docker exec "$CONTAINER" python -c \
+                "import urllib.request,json; print(urllib.request.urlopen('http://127.0.0.1:${APP_PORT}/api/health').read().decode())"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "健康检查失败，最近日志："
+          docker logs --tail 80 "$CONTAINER" || true
+          exit 1
+
+      - name: 清理旧镜像
+        run: |
+          # 保留 latest 与当前提交的镜像，其余悬空/历史镜像清掉
+          docker image prune -f || true
