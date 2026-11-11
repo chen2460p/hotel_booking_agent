@@ -107,6 +107,12 @@ class Order:
     source: str = "mock"            # mock=本地模拟 / rollinggo=道旅真实订单
     payment_url: str = ""           # 道旅通用收银台链接（创建订单后返回，需用户自行支付）
     contact_email: str = ""         # 联系人邮箱
+    # 时间字段统一 "YYYY-MM-DD HH:MM:SS"（本地时区）：
+    # created_at 恒为下单时间（不可被支付时间覆盖）；paid_at 仅支付成功时写入；
+    # updated_at 记录最后一次状态变更，用于“最近动态”（均由 storage 维护）
+    created_at: str = ""
+    paid_at: str = ""
+    updated_at: str = ""
 
 
 @dataclass
@@ -125,4 +131,10 @@ class AgentState:
     pending_booking: dict = field(default_factory=dict)
     # 地名疑似笔误时暂存纠正建议，等用户确认后再搜索
     pending_location_fix: dict = field(default_factory=dict)
+    # 搜索结果版本号：每次重新搜索（列表被替换）时更新；前端结构化选店必须带它，
+    # 版本不一致直接拒绝，避免用户点到旧列表里的酒店
+    search_revision: str = ""
+    # 本次回复对应的酒店列表视图：{kind, revision, intro, outro}。
+    # Web 端据此用结构化 items 渲染卡片；非酒店列表回复时为空
+    last_view: dict = field(default_factory=dict)
     stage: str = "intent"  # 当前阶段：intent意图理解 / clarify参数澄清 / search搜索 / recommend推荐 / booking预订 / booking_confirm验价待确认 /售后

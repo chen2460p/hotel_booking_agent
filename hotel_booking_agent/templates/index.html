@@ -40,6 +40,21 @@
   /* “展开全部”：逐段补真实评分后追加展示 */
   #chatbox .bot .expand-hotels { display: block; margin: 8px 0 0; padding: 4px 12px; font-size: 12px; color: #2980b9; background: #fff; border: 1px dashed #2980b9; border-radius: 12px; cursor: pointer; }
   #chatbox .bot .expand-hotels:disabled { color: #95a5a6; border-color: #ccc; cursor: default; }
+  /* 结构化酒店卡片：数据来自后端 JSON（hotel_view.items），不解析回复文本 */
+  #chatbox .bot .hotel-view { white-space: normal; max-width: 85%; margin-top: 6px; }
+  #chatbox .bot .hotel-card { display: flex; gap: 10px; border: 1px solid #e3e7ea; border-radius: 10px; padding: 8px; margin: 8px 0; background: #fff; }
+  #chatbox .bot .hotel-card .hc-thumb { width: 92px; height: 92px; flex: 0 0 auto; border-radius: 8px; object-fit: cover; background: #eef1f3; cursor: zoom-in; border: 1px solid #e0e0e0; }
+  #chatbox .bot .hotel-card .hc-main { flex: 1 1 auto; min-width: 0; }
+  #chatbox .bot .hotel-card .hc-name { font-weight: 600; font-size: 14px; margin-bottom: 2px; }
+  #chatbox .bot .hotel-card .hc-meta { color: #555; font-size: 12px; line-height: 1.65; word-break: break-all; white-space: pre-line; }
+  #chatbox .bot .hotel-card .hc-price { color: #c0392b; font-weight: 600; }
+  #chatbox .bot .hotel-card .hc-actions { margin-top: 6px; display: flex; gap: 8px; align-items: center; }
+  #chatbox .bot .hotel-card .hc-actions button { padding: 3px 14px; font-size: 12px; color: #fff; background: #2980b9; border: none; border-radius: 12px; cursor: pointer; }
+  #chatbox .bot .hotel-card .hc-actions button:disabled { background: #bdc3c7; cursor: default; }
+  #chatbox .bot .hotel-card .hc-rev { color: #aaa; font-size: 11px; }
+  #chatbox .bot .hotel-card.stale { opacity: .55; }
+  #chatbox .bot .hotel-card.stale .hc-actions button { background: #bdc3c7; }
+  #chatbox .bot .hv-outro { white-space: pre-wrap; color: #555; font-size: 13px; margin-top: 8px; }
   #inputrow { display: flex; gap: 8px; }
   #inputrow textarea { flex: 1; height: 64px; padding: 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; resize: none; }
   #inputrow button { padding: 0 20px; background: #2980b9; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
@@ -223,6 +238,165 @@ function saveCurrentScroll() {
   persist();
 }
 
+// ---------- 结构化酒店卡片 ----------
+// 列表数据来自后端 hotel_view（服务端 search_results 的快照），
+// 选店只提交 {hotel_id, revision}：不经过模型，也不按序号猜。
+// 卡片按钮在后端校验失败（409/404）时统一置灰，避免拿旧列表选出别家。
+function sysNotice(text) {
+  const rec = remember("sys", text);
+  append("sys", rec.text, false, rec);
+  chatbox.scrollTop = chatbox.scrollHeight;
+  return rec;
+}
+
+function _hcMetaLines(item) {
+  const star = item.star ? `${item.star}星` : "星级未知";
+  const price = item.price_per_night
+    ? `¥${item.price_per_night}/晚` : "价格以实际预订为准";
+  let rating = "暂无评分";
+  if (item.rating) {
+    rating = `评分 ${item.rating}`;
+    if (item.review_count) rating += `（${item.review_count}条）`;
+    if (item.rating_source) rating += ` · ${item.rating_source}`;
+  }
+  const dist = (item.distance_m && item.distance_to)
+    ? ` · 距${item.distance_to}约${Math.round(item.distance_m / 10) * 10}米` : "";
+  const lines = [`${star} · ${price}`, `${rating}${dist}`,
+                 `地址：${item.address || "待补充"}`];
+  if (item.facilities && item.facilities.length) {
+    lines.push(`设施：${item.facilities.join("、")}`);
+  }
+  if (item.room_types && item.room_types.length) {
+    lines.push(`房型：${item.room_types.join("、")}`);
+  }
+  return lines.join("\n");
+}
+
+function appendHotelCard(box, item, pos, hv) {
+  const card = document.createElement("div");
+  card.className = "hotel-card";
+  card.dataset.hotelId = item.hotel_id || "";
+
+  if (item.image_url) {
+    const img = document.createElement("img");
+    img.className = "hc-thumb";
+    img.alt = item.name || "酒店实拍图";
+    img.referrerPolicy = "no-referrer";
+    img.onclick = () => window.open(item.image_url, "_blank", "noopener,noreferrer");
+    card.appendChild(img);
+    _enqueueImg(img, item.image_url);   // 串行队列加载，失败退化链接
+  }
+
+  const main = document.createElement("div");
+  main.className = "hc-main";
+
+  const name = document.createElement("div");
+  name.className = "hc-name";
+  name.textContent = `${pos}. ${item.name || "酒店"}`;
+  main.appendChild(name);
+
+  const meta = document.createElement("div");
+  meta.className = "hc-meta";
+  meta.textContent = _hcMetaLines(item);
+  main.appendChild(meta);
+
+  const actions = document.createElement("div");
+  actions.className = "hc-actions";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = "选这家";
+  btn.onclick = () => selectHotel(item, hv, card, btn);
+  actions.appendChild(btn);
+  main.appendChild(actions);
+
+  card.appendChild(main);
+  box.appendChild(card);
+  return card;
+}
+
+function renderHotelViewInto(div, hv, rec) {
+  const span = div.querySelector("span");
+  span.textContent = "";
+  if (hv.intro) renderRich(span, hv.intro);
+  const box = document.createElement("div");
+  box.className = "hotel-view";
+  div.appendChild(box);
+  div.dataset.revision = hv.revision || "";
+  const items = hv.items || [];
+  items.forEach((it, i) => appendHotelCard(box, it, i + 1, hv));
+  if (hv.outro) {
+    const outro = document.createElement("div");
+    outro.className = "hv-outro";
+    outro.textContent = hv.outro.replace(/^\s+/, "");
+    box.appendChild(outro);
+  }
+  if (rec) { rec.hotelView = hv; rec.next = items.length; }
+  return box;
+}
+
+function markStaleCards(keepRevision) {
+  chatbox.querySelectorAll(".hotel-view").forEach(view => {
+    const div = view.closest(".bot");
+    const rev = div ? (div.dataset.revision || "") : "";
+    if (keepRevision && rev === keepRevision) return;
+    view.querySelectorAll(".hotel-card").forEach(c => c.classList.add("stale"));
+    view.querySelectorAll(".hotel-card button").forEach(b => {
+      b.disabled = true;
+      b.textContent = "列表已更新";
+    });
+  });
+}
+
+let _selecting = false;
+async function selectHotel(item, hv, card, btn) {
+  if (_selecting || !item || !item.hotel_id) return;
+  _selecting = true;
+  btn.disabled = true;
+  btn.textContent = "选择中…";
+  // 请求期间禁止切会话：回复必须落到当前这段对话里
+  sessionSelect.disabled = true;
+  newSessionBtn.disabled = true;
+  try {
+    const r = await fetch(`/api/session/${encodeURIComponent(sessionId)}/select`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({hotel_id: item.hotel_id, revision: (hv && hv.revision) || ""}),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.status === 409) {          // 旧列表：后端拒绝按位置猜
+      markStaleCards();
+      sysNotice("⚠️ 酒店列表已更新，请按最新列表重新选择。");
+      return;
+    }
+    if (r.status === 404) {          // 会话过期 / 酒店不在当前列表
+      markStaleCards();
+      sysNotice(d.detail || "⚠️ 会话已过期或该酒店不在当前列表，请重新搜索。");
+      return;
+    }
+    if (!r.ok) throw new Error(d.detail || ("HTTP " + r.status));
+
+    const urec = remember("sys", `👉 已选择：${item.name || item.hotel_id}`);
+    append("sys", urec.text, false, urec);
+    const rec = remember("bot", d.reply, {rich: true, hotelTotal: 0, hotelShown: 0, next: 0});
+    append("bot", d.reply, true, rec);
+    if (d.current_order) {
+      const orec = remember("sys", "📌 " + d.current_order);
+      append("sys", orec.text, false, orec);
+    }
+    markStaleCards();                 // 已进入选房阶段，旧酒店卡片不再可点
+    saveCurrentScroll();
+  } catch (e) {
+    sysNotice("❌ 选择失败：" + e.message);
+    btn.disabled = false;
+    btn.textContent = "选这家";
+  } finally {
+    _selecting = false;
+    sessionSelect.disabled = false;
+    newSessionBtn.disabled = false;
+    input.focus();
+  }
+}
+
+
 function showWelcome() {
   const div = document.createElement("div");
   div.className = "sys";
@@ -239,7 +413,14 @@ function renderHistory() {
   if (!s.messages.length) showWelcome();
   for (const rec of s.messages) {
     const rich = rec.role === "bot" && rec.rich !== false;
-    const div = append(rec.role, rec.text, rich, rec);
+    let div;
+    if (rec.role === "bot" && rec.hotelView) {
+      // 结构化卡片按落盘快照重建；是否仍可点由后端 revision 校验兜底
+      div = append("bot", "", rich, rec);
+      renderHotelViewInto(div, rec.hotelView, rec);
+    } else {
+      div = append(rec.role, rec.text, rich, rec);
+    }
     if (rec.role === "bot" && !rec.stale && rec.hotelTotal > (rec.next || 0)) {
       addHotelExpander(div, div.querySelector("span"), rec.hotelTotal, rec.next || 0);
     }
@@ -312,6 +493,11 @@ async function checkServerSession() {
       div.textContent = "⚠️ 服务端会话上下文已过期（30 分钟无活动或服务重启）。历史记录已保留，继续发送会从新上下文开始。";
       chatbox.appendChild(div);
       chatbox.scrollTop = chatbox.scrollHeight;
+      markStaleCards();          // 会话没了：旧列表不能再点，避免选出别家
+    } else {
+      // 服务端有列表：版本一致的卡片保持可点，旧版本全部置灰
+      // （服务端无列表时传 null，把历史卡片一并置灰）
+      markStaleCards(d.search_revision || null);
     }
   } catch (e) {
     // 网络异常不打扰正常聊天
@@ -455,9 +641,12 @@ function append(cls, text, rich, rec) {
 // ---------- 展开全部：按需补全剩余酒店的真实评分 ----------
 // 后端每段补 5 家（受百度/高德 QPS 限制，约 2-3 秒），逐段追加而不是一次等完。
 // 评分全部来自真实接口/7 天缓存；查不到仍是“暂无评分”，不做任何伪造。
+// 结构化视图下追加的是 items（卡片），旧版纯文本视图仍兼容 text。
 async function expandHotels(div, span, btn) {
   btn.disabled = true;
   const total = +btn.dataset.total;
+  const rev = div.dataset.revision || "";
+  const view = div.querySelector(".hotel-view");
   let offset = +btn.dataset.next;
   try {
     while (offset < total) {
@@ -465,11 +654,30 @@ async function expandHotels(div, span, btn) {
       btn.textContent = `⏳ 正在补全评分…（已展示 ${offset}/${total} 家）`;
       const r = await fetch("/api/hotels/more", {
         method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({session_id: sessionId, offset, limit: 5}),
+        body: JSON.stringify({session_id: sessionId, offset, limit: 5, revision: rev}),
       });
+      if (r.status === 409 || r.status === 404) {
+        // 列表已更新 / 会话过期：停止追加并置灰旧卡片
+        markStaleCards();
+        btn.remove();
+        sysNotice(r.status === 409
+          ? "⚠️ 酒店列表已更新，请按最新列表重新选择。"
+          : "⚠️ 会话已过期，请重新搜索。");
+        return;
+      }
       if (!r.ok) throw new Error("HTTP " + r.status);
       const d = await r.json();
-      if (d.text) {
+      if (d.items && d.items.length && view) {
+        const outroEl = view.querySelector(".hv-outro");
+        d.items.forEach((it, i) => {
+          const card = appendHotelCard(view, it, offset + i + 1, {revision: rev});
+          if (outroEl) view.insertBefore(card, outroEl);   // 新卡片始终排在引导语之前
+        });
+        if (div._rec && div._rec.hotelView) {
+          div._rec.hotelView.items.push(...d.items);   // 刷新/返回后卡片不丢
+        }
+      } else if (d.text) {
+        // 兼容旧版后端（只返回文本）
         renderRich(span, "\n" + d.text, true);
         // 回写持久化记录：刷新/从订单页返回后，已展开的酒店不丢
         if (div._rec) div._rec.text += "\n" + d.text;
@@ -542,7 +750,7 @@ async function sendMsg() {
     const reader = r.body.getReader();
     const dec = new TextDecoder();
     let buf = "", reply = null, currentOrder = "", errMsg = null;
-    let hotelTotal = 0, hotelShown = 0;
+    let hotelTotal = 0, hotelShown = 0, hotelView = null;
     while (true) {
       const {done, value} = await reader.read();
       if (done) break;
@@ -565,6 +773,7 @@ async function sendMsg() {
           currentOrder = d.current_order;
           hotelTotal = d.hotel_total || 0;
           hotelShown = d.hotel_shown || 0;
+          hotelView = d.hotel_view || null;
           if (d.session_id && d.session_id !== sessionId) {
             adoptServerSession(d.session_id);
           }
@@ -578,12 +787,29 @@ async function sendMsg() {
       const rec = remember("bot", "❌ " + errMsg, {rich: false});
       append("bot", rec.text, false, rec);
     } else if (reply !== null) {
-      const rec = remember("bot", reply, {
-        rich: true, hotelTotal, hotelShown, next: hotelShown,
-      });
-      const botDiv = append("bot", reply, true, rec);
-      if (hotelTotal > hotelShown) {
-        addHotelExpander(botDiv, botDiv.querySelector("span"), hotelTotal, hotelShown);
+      let botDiv;
+      if (hotelView) {
+        // 结构化列表：intro 文案 + 卡片（hotel_id 定位）+ 操作引导，不再渲染回复正文里的列表
+        const hv = hotelView;
+        const rec = remember("bot", reply, {
+          rich: true, hotelTotal, hotelShown,
+          next: (hv.items || []).length, hotelView: hv,
+        });
+        botDiv = append("bot", "", true, rec);
+        renderHotelViewInto(botDiv, hv, rec);
+        markStaleCards(hv.revision);   // 旧版本卡片置灰，只有本次列表可点
+        if (hv.total > (hv.items || []).length) {
+          addHotelExpander(botDiv, botDiv.querySelector("span"),
+                           hv.total, (hv.items || []).length);
+        }
+      } else {
+        const rec = remember("bot", reply, {
+          rich: true, hotelTotal, hotelShown, next: hotelShown,
+        });
+        botDiv = append("bot", reply, true, rec);
+        if (hotelTotal > hotelShown) {
+          addHotelExpander(botDiv, botDiv.querySelector("span"), hotelTotal, hotelShown);
+        }
       }
       if (currentOrder) {
         const orec = remember("sys", "📌 " + currentOrder);

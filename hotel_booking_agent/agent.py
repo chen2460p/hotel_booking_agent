@@ -9,6 +9,7 @@
 
 import re
 import time
+import uuid
 from typing import Optional
 from models import AgentState, BookingParams, Hotel
 from tools import (
@@ -28,7 +29,8 @@ from agent_common import (
     booking_exit_action, quit_booking_message, is_selection_attempt,
     extract_order_id, load_hotel_selection_detail,
     location_fix_action, city_fix_action,
-    render_hotel_results, render_hotel_selection, chat_reply,
+    render_hotel_results_parts,
+    render_hotel_selection, chat_reply,
     reset_booking_state,
 )
 import rollinggo_book as rlg
@@ -38,6 +40,15 @@ LOGIN_HINT = (
     "请先在项目目录运行：python rollinggo_book.py login\n"
     "完成浏览器授权后，重新选择房型即可走真实下单链路（验价 → 确认 → 支付链接）。"
 )
+
+
+class SelectionError(Exception):
+    """结构化选店失败：code 供 Web 层映射 HTTP 状态码。"""
+
+    def __init__(self, code: str, message: str):
+        self.code = code          # no_results / stale / not_found
+        self.message = message
+        super().__init__(message)
 
 
 class HotelBookingAgent:
@@ -75,6 +86,9 @@ class HotelBookingAgent:
         """
         # 记录对话历史（短期记忆）
         self.state.conversation_history.append(f"用户：{user_input}")
+        # 每轮先清空“本次回复的酒店列表视图”：只有真正渲染列表的回复才重新登记，
+        # 避免上一轮的列表被当成这一轮的 payload 重复下发给前端
+        self.state.last_view = {}
         self._emit_stage("thinking", "正在理解你的需求…")
 
         # 真实订单的支付只能由用户打开支付链接完成，任何时候都不能本地标记已支付
@@ -182,6 +196,8 @@ class HotelBookingAgent:
         self._emit_stage("searching", "正在搜索酒店、获取真实评分…")
         results = search_hotels(params)
         self.state.search_results = results
+        # 列表被替换 → 新版本号：前端拿着旧版本选店会被后端拒绝
+        self.state.search_revision = uuid.uuid4().hex[:12]
 
         # ===== 阶段3：推荐（Agent 解释能力）=====
         self.state.stage = "recommend"
@@ -192,7 +208,7 @@ class HotelBookingAgent:
                 f"需要我帮你调整条件重新搜索吗？"
             )
         else:
-            response = render_hotel_results(params, results)
+            response = self._render_search_view()
 
         self.state.conversation_history.append(f"助手：{response}")
         return response
@@ -499,12 +515,51 @@ class HotelBookingAgent:
         self.state.conversation_history.append(f"助手：{response}")
         return response
 
+    def _render_search_view(self) -> str:
+        """渲染当前搜索结果，并登记“本次回复的酒店列表视图”。
+
+        Web 端据此下发结构化 items（卡片渲染 + 按 hotel_id 选店），
+        文本 body 仅用于 CLI、历史回放与降级展示。
+        """
+        intro, body, outro = render_hotel_results_parts(
+            self.state.params, self.state.search_results or [])
+        self.state.last_view = {
+            "kind": "hotels",
+            "revision": self.state.search_revision,
+            "intro": intro,
+            "outro": outro,
+        }
+        return intro + body + outro
+
+    def select_hotel_by_id(self, hotel_id: str,
+                           revision: str = "") -> str:
+        """结构化选店：只认稳定 hotel_id，序号仅用于展示。
+
+        - 列表为空：no_results
+        - revision 与当前搜索结果不一致：stale（旧列表，拒绝按位置猜）
+        - hotel_id 不在当前列表：not_found
+        """
+        results = self.state.search_results or []
+        if not results:
+            raise SelectionError("no_results", "当前没有可选的酒店，请先搜索。")
+        if revision and self.state.search_revision \
+                and revision != self.state.search_revision:
+            raise SelectionError(
+                "stale", "酒店列表已更新，请按最新列表重新选择（旧列表已失效）。")
+        hotel = next((h for h in results if h.hotel_id == hotel_id), None)
+        if hotel is None:
+            raise SelectionError(
+                "not_found", "这家酒店已不在当前搜索结果中，请重新搜索。")
+        return self._handle_hotel_selection(hotel)
+
     def _handle_hotel_selection(self, hotel: Hotel) -> str:
         """
         处理用户选中酒店后的流程——进入预订 Workflow
         这是从 Agent 推荐阶段切换到 Workflow 下单阶段的关键节点。
         道旅酒店会实时拉取房型报价与退改政策（失败则回退搜索缓存）。
         """
+        # 这一轮回复是房型列表，不是酒店列表：清掉上一条视图，避免前端重复渲染卡片
+        self.state.last_view = {}
         self.state.selected_hotel = hotel
         self.state.stage = "booking"
         # 新选了酒店，上一家酒店的选房暂存不再适用
@@ -527,8 +582,8 @@ class HotelBookingAgent:
         """
         action = booking_exit_action(self.state, text)
         if action == "back":
-            return render_hotel_results(
-                self.state.params, self.state.search_results or [])
+            # 同一个列表、同一个 revision：只是重新展示，不算新搜索
+            return self._render_search_view()
         if action == "research":
             # stage 交给 _handle_booking_flow 重新置位；沿用原参数重搜
             return self._handle_booking_flow(text)
@@ -880,6 +935,8 @@ class HotelBookingAgent:
         # 重置检索上下文，但保留 current_order 便于继续展示支付链接
         self.state.params = BookingParams()
         self.state.search_results = []
+        self.state.search_revision = ""
+        self.state.last_view = {}
         self.state.selected_hotel = None
         self.state.booking_context = {}
         self.state.stage = "intent"

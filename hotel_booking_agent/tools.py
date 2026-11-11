@@ -770,10 +770,19 @@ def _local_order_to_row(order: Order) -> dict:
         "status_text": _LOCAL_STATUS_TEXT.get(order.status, order.status),
         "payment_url": order.payment_url or "",
         "payment_deadline": "",
-        "create_time": "",
+        # 下单时间恒为创建时间；支付时间只来自真实支付动作，不覆盖创建时间
+        "create_time": order.created_at or "",
+        "paid_time": order.paid_at or "",
+        "updated_at": order.updated_at or "",
         "source": order.source,                       # mock / rollinggo
         "session_local": True,                        # 来自本次进程内存
     }
+
+
+def _row_time_key(row: dict) -> tuple:
+    """列表排序键：下单时间倒序；缺时间时用入住日期兜底（沉到后面）。"""
+    return (str(row.get("create_time") or ""),
+            str(row.get("check_in") or ""))
 
 
 def _order_status_bucket(row: dict) -> str:
@@ -849,6 +858,9 @@ def list_history_orders(status_filter: str = "ALL") -> dict:
         rows = [_local_order_to_row(o) for o in storage.list_all_orders()]
         source = "local" if rows else "none"
 
+    # 统一按“下单时间”倒序，时间缺失的沉底；道旅返回顺序不作依赖
+    rows.sort(key=_row_time_key, reverse=True)
+
     if flt != "ALL":
         rows = [r for r in rows if _order_status_bucket(r) == flt]
 
@@ -888,6 +900,10 @@ def format_order_rows(rows: List[dict], max_show: int = 10) -> str:
             head += f" · {r['room_name']}"
         if r.get("check_in") or r.get("check_out"):
             head += f"\n   入住：{r.get('check_in') or '?'} → {r.get('check_out') or '?'}"
+        if r.get("create_time"):
+            head += f"\n   下单时间：{r['create_time']}"
+        if r.get("paid_time"):
+            head += f" · 支付时间：{r['paid_time']}"
         head += f"\n   总价：{total_text} · 状态：{r.get('status_text') or '未知'}"
         lines.append(head)
         # 待支付订单附上支付链接（真实订单由用户自行付款）

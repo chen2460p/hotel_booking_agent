@@ -36,6 +36,8 @@
 - **真实验价 + 下单**：道旅 OAuth REST 接口 `/hotelpriceconfirm`（锁价拿 `referenceNo`）→ `/hotelbook`（创建订单拿 `orderNo` + `paymentUrl`）→ `/hotelorders`（查单）
 - **历史订单查询**：对话里说「查我的历史订单 / 查待支付的订单 / 查已取消的订单」即可拉取道旅账号全部真实订单（跨会话保留），支持按状态筛选；未登录时降级展示本次会话的本地订单并引导登录
 - **Web 多会话与聊天记录保留**：聊天记录按会话缓存在浏览器 `localStorage`，从「查看历史订单」返回或刷新页面后自动恢复（含已展开的酒店、滚动位置）；顶栏可切换历史会话或「＋ 新建会话」。服务端上下文 30 分钟无活动会过期，前端会提示「历史仍在、上下文已重置」
+- **酒店列表结构化下发（防幻觉、防错位）**：酒店信息只保留在服务端会话（`search_results` + `search_revision`），Web 端通过 `GET /api/session/{id}/hotels` 取结构化 items 渲染卡片；选店走 `POST /api/session/{id}/select`（`hotel_id` + `revision`），不经过 LLM、也不按序号猜。旧列表/会话过期由后端拒绝（409/404）并把卡片置灰，避免用户点到上一轮的第 N 家
+- **订单时间可追溯**：下单时间（道旅 `orderDate` / 本地 `created_at`）与支付时间（`paid_at`）分开存储、互不覆盖；列表按下单时间倒序，已支付订单在明细行单独展示支付时间。道旅接口没有支付时间字段时显示 `-`，不拿创建时间冒充
 - **真实订单取消**：说「取消订单 订单号」先走 pre-cancel 查询罚金/退款并拿 10 分钟凭证，用户明确回复「确认取消」后才提交 confirm-cancel；不可在线取消时原样展示道旅客服指引。Web 订单页同样支持两步取消
 - **资金安全设计**：验价与下单两步分离、强制二次确认、常用入住人须用户确认后才使用、**程序只拿到支付链接，绝不在程序内完成支付**
 - **三级数据源回退**：道旅（有价格）→ 高德 POI（仅名称地址）→ 内置模拟酒店库，任何 Key 缺失都不阻断运行
@@ -84,7 +86,7 @@
     ├── .env.example           # 配置模板（复制为 .env 后填 Key）
     ├── main.py                # 入口①：ReAct + Workflow 混合版（真实下单链路在这）
     ├── main_multi.py          # 入口②：Supervisor-Worker 多 Agent 协作版
-    ├── web.py                 # 入口③：FastAPI + Web 聊天界面（图片内嵌、多轮会话池）
+    ├── web.py                 # 入口③：FastAPI + Web 聊天界面（图片内嵌、多轮会话池、结构化酒店卡片）
     ├── templates/index.html   # Web 前端（referrer=no-referrer 防道旅 CDN 403）
     ├── agent.py               # 主版对话 Agent：状态机、选店选房、验价确认编排
     ├── multi_agent.py         # 多 Agent：Supervisor/Search/Booking/Service/Review
@@ -267,14 +269,16 @@ orderNo + paymentUrl（通用收银台，用户自行打开支付）
 | 文件 | 关键内容 |
 |---|---|
 | `models.py` | 全部 dataclass；`Hotel` 含 `distance_m`（距 POI 直线距离米）与 `distance_to`（参照地标名）；`BookingParams.is_complete()/missing_fields()` 驱动参数追问；`Order.source` 区分 mock/rollinggo |
-| `llm.py` | `LLMClient.extract_intent_and_params()`：意图 book/search/order_query/cancel/chat + 结构化参数；默认模型 qwen3.8-flash（OpenAI 兼容接口，`DASHSCOPE_MODEL` 可覆盖）；含口语日期换算（今天/明天/后天/住三天）+ 错误日志直接打印 status/code/message |
-| `tools.py` | `search_hotels()` 三级回退；`get_hotel_detail(live=True)` 实时富化；`create_order()` 模拟单；`create_real_order()` 道旅真单；`find_order()` 本地/远端订单查找；`pre_cancel_real_order() / confirm_cancel_real_order()` 真实单两步取消；`list_history_orders()` 历史订单（远程+本地合并、状态筛选）；运行时酒店缓存；`format_hotel_list()` 在有 POI 距离时输出距离行 |
+| `llm.py` | `LLMClient.extract_intent_and_params()`：意图 book/search/order_query/cancel/chat + 结构化参数；默认模型 qwen3.8-flash（OpenAI 兼容接口，`DASHSCOPE_MODEL` 可覆盖）；含口语日期换算（今天/明天/后天/住三天）与裸数字日期对（回「12 15」= 12 号入住、15 号离店）；含错误日志直接打印 status/code/message |
+| `tools.py` | `search_hotels()` 三级回退；`get_hotel_detail(live=True)` 实时富化；`create_order()` 模拟单；`create_real_order()` 道旅真单；`find_order()` 本地/远端订单查找；`pre_cancel_real_order() / confirm_cancel_real_order()` 真实单两步取消；`list_history_orders()` 历史订单（远程+本地合并、状态筛选、按下单时间倒序）；运行时酒店缓存；`format_hotel_list()` 在有 POI 距离时输出距离行 |
+| `storage.py` | 订单存储抽象：SQLite/MySQL/内存自动回退；orders 表含 `created_at/paid_at/updated_at`，首次启动自动补列并把旧 `created_at` 从 UTC 转本地时区；状态变更只刷新 `updated_at`，首次支付写 `paid_at`，永不覆盖 `created_at` |
 | `rollinggo_mcp.py` | `RollingGoMCPClient`：MCP 握手、JSON/SSE 双解析；搜索参数构造（`hotelTags.maxPricePerNight` 等）；报价按「房型 + 餐食 + 退改 + 申请确认 + 床型 + 入住人数」分桶，每房型保留最多 4 档代表性报价；POI 距离透传（`distanceInMeters`）；地标识别扩展到 街/路/大道；排序策略：有 POI 距离时按"近→远"、未知沉底，否则地标词命中优先 |
 | `rollinggo_book.py` | OAuth PKCE 登录与本地回调服务；token 存取（与官方 CLI 共享 `~/.hotel-cli/token.json`）；`price_confirm() / create_booking() / list_orders() / get_order_detail() / parse_orders()`；`pre_cancel() / confirm_cancel()` 两步取消；CLI 支持 `login/status/logout/orders` |
 | `amap_poi.py` | 高德文本搜索 v3（`restapi.amap.com/v3/place/text`），住宿大类 100000，星级词映射 |
 | `agent.py` | 主状态机：选店、验价确认卡编排、下单与取消（选择/解析/渲染细节走 `agent_common`） |
 | `multi_agent.py` | `AgentMessage` 消息队列 + `AgentState` 共享黑板；Supervisor 分发 Search/Booking/Service/Review 四个 Worker |
-| `agent_common.py` | 两套架构共用的纯逻辑：`merge_params / parse_hotel_selection / match_room_choice / extract_guest_name / detect_order_filter / render_hotel_selection / chat_reply` 等，含同房型多档报价的分组、差价展示与 `1-2` 选择解析 |
+| `agent_common.py` | 两套架构共用的纯逻辑：`merge_params / parse_hotel_selection / match_room_choice / extract_guest_name / detect_order_filter / render_hotel_results_parts / render_hotel_selection / chat_reply` 等，含同房型多档报价的分组、差价展示与 `1-2` 选择解析 |
+| `web.py` | FastAPI 入口：会话池（30 分钟 TTL）、SSE 阶段推送、结构化酒店列表 `GET /api/session/{id}/hotels` 与按 `hotel_id + revision` 选店 `POST /api/session/{id}/select`（旧列表 409）；`hotel_view` 只由服务端搜索结果生成 |
 | `cli_common.py` | 终端入口共用：`display_width()` 与 `print_banner(rows)`（按显示宽度生成 ASCII 横幅） |
 | `rag.py` | 模拟评价语料切块、Embedding 双模式、召回+重排+生成 |
 | `main.py` / `main_multi.py` | 两个终端入口，仅做输入输出循环 |

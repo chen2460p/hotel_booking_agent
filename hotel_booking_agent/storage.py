@@ -15,6 +15,7 @@ CLI 零配置可跑，Web 版有 DB 则持久化。
 import os
 import re
 import threading
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from models import Order
@@ -30,6 +31,9 @@ _conn_lock = threading.Lock()
 _backend = "memory"          # memory / sqlite / mysql
 _initialized = False
 _init_lock = threading.Lock()  # 保护 _init_once 的线程安全（Double-checked locking）
+# 表里是否有 paid_at / updated_at（老库/只读库迁移失败时为 False）：
+# 没有就退回旧 SQL，避免整个存储层降级到内存、丢掉已有本地订单
+_HAS_TIME_COLS = True
 
 
 def _init_once() -> None:
@@ -120,10 +124,54 @@ def _ensure_schema_sqlite(conn) -> None:
             source        TEXT NOT NULL DEFAULT 'mock',
             payment_url   TEXT NOT NULL DEFAULT '',
             contact_email TEXT NOT NULL DEFAULT '',
-            created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+            created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+            paid_at       DATETIME,
+            updated_at    DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    _migrate_sqlite_columns(conn)
     conn.commit()
+
+
+def _check_time_cols_sqlite(conn) -> None:
+    global _HAS_TIME_COLS
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(orders)").fetchall()}
+    _HAS_TIME_COLS = {"paid_at", "updated_at"} <= cols
+
+
+def _migrate_sqlite_columns(conn) -> None:
+    """老库补列：created_at 建表就有，paid_at/updated_at 是后加的。
+
+    SQLite 的 ALTER TABLE ADD COLUMN 不允许 CURRENT_TIMESTAMP 默认值，
+    所以新列先加空列，再用 created_at 回填 updated_at。
+
+    迁移失败（如数据库只读）不能把整个存储层拖回内存：只记警告，
+    置 _HAS_TIME_COLS=False，读写退回旧表结构，已有订单仍可查。
+    """
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(orders)").fetchall()}
+        first_migration = "updated_at" not in cols
+        if first_migration:
+            # 旧表 created_at 用的是 CURRENT_TIMESTAMP（UTC），展示前转成本地时间。
+            # 只在首次迁移做一次，避免重复 +8 小时。
+            try:
+                conn.execute(
+                    "UPDATE orders SET created_at = datetime(created_at, 'localtime') "
+                    "WHERE created_at IS NOT NULL")
+            except Exception as e:
+                print(f"[storage] created_at 本地化失败（保持原值）：{e}")
+        if "paid_at" not in cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN paid_at DATETIME")
+        if "updated_at" not in cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN updated_at DATETIME")
+        conn.execute(
+            "UPDATE orders SET updated_at = created_at WHERE updated_at IS NULL")
+        conn.execute(
+            "UPDATE orders SET created_at = updated_at "
+            "WHERE created_at IS NULL AND updated_at IS NOT NULL")
+    except Exception as e:
+        print(f"[storage] orders 时间字段迁移失败（按旧表结构只读运行）：{e}")
+    _check_time_cols_sqlite(conn)
 
 
 # ---------- MySQL ----------
@@ -164,12 +212,58 @@ def _ensure_schema_mysql(conn) -> None:
             source        VARCHAR(16) NOT NULL DEFAULT 'mock',
             payment_url   TEXT NOT NULL,
             contact_email VARCHAR(120) NOT NULL DEFAULT '',
-            created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+            created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+            paid_at       DATETIME NULL,
+            updated_at    DATETIME NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """)
+    _migrate_mysql_columns(conn)
+
+
+def _migrate_mysql_columns(conn) -> None:
+    """老库补列：paid_at / updated_at（created_at 建表就有）。"""
+    def _has(col: str) -> bool:
+        with conn.cursor() as cur:
+            cur.execute(f"SHOW COLUMNS FROM orders LIKE '{col}'")
+            return bool(cur.fetchall())
+
+    try:
+        if not _has("paid_at"):
+            conn.execute("ALTER TABLE orders ADD COLUMN paid_at DATETIME NULL")
+        if not _has("updated_at"):
+            conn.execute("ALTER TABLE orders ADD COLUMN updated_at DATETIME NULL")
+        conn.execute(
+            "UPDATE orders SET updated_at = created_at WHERE updated_at IS NULL")
+        conn.execute(
+            "UPDATE orders SET created_at = updated_at "
+            "WHERE created_at IS NULL AND updated_at IS NOT NULL")
+    except Exception as e:
+        print(f"[storage] orders 时间字段迁移失败（按旧表结构运行）：{e}")
+    global _HAS_TIME_COLS
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SHOW COLUMNS FROM orders")
+            cols = {r.get("Field") for r in cur.fetchall()}
+        _HAS_TIME_COLS = {"paid_at", "updated_at"} <= cols
+    except Exception:
+        _HAS_TIME_COLS = False
 
 
 # ---------- 统一数据访问接口 ----------
+def _now() -> str:
+    """本地时区当前时间，统一 DB / 内存 / API 的时间字符串格式。"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _fmt_dt(value) -> str:
+    """DB 驱动可能返回 datetime 或字符串，统一成 YYYY-MM-DD HH:MM:SS。"""
+    if value is None or value == "":
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)[:19]
+
+
 def _row_to_order(row) -> Order:
     if isinstance(row, dict):
         return Order(
@@ -181,6 +275,9 @@ def _row_to_order(row) -> Order:
             status=row["status"], source=row["source"],
             payment_url=row.get("payment_url", "") or "",
             contact_email=row.get("contact_email", "") or "",
+            created_at=_fmt_dt(row.get("created_at")),
+            paid_at=_fmt_dt(row.get("paid_at")),
+            updated_at=_fmt_dt(row.get("updated_at")),
         )
     # sqlite3.Row 带 keys()
     d = dict(row)
@@ -189,22 +286,41 @@ def _row_to_order(row) -> Order:
 
 def insert_order(order: Order) -> None:
     _init_once()
+    # 下单时间只在这里落一次，后续状态变更绝不覆盖
+    order.created_at = order.created_at or _now()
+    order.updated_at = order.updated_at or order.created_at
     if _backend == "memory":
         _mem_db[order.order_id] = order
         return
     try:
         with _conn_lock:
-            _conn.execute(
-                """INSERT OR REPLACE INTO orders
-                   (order_id, hotel_id, hotel_name, check_in, check_out,
-                    room_type, guest_name, total_price, status, source,
-                    payment_url, contact_email)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (order.order_id, order.hotel_id, order.hotel_name,
-                 order.check_in, order.check_out, order.room_type,
-                 order.guest_name, order.total_price, order.status,
-                 order.source, order.payment_url, order.contact_email),
-            )
+            if _HAS_TIME_COLS:
+                _conn.execute(
+                    """INSERT OR REPLACE INTO orders
+                       (order_id, hotel_id, hotel_name, check_in, check_out,
+                        room_type, guest_name, total_price, status, source,
+                        payment_url, contact_email, created_at, paid_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (order.order_id, order.hotel_id, order.hotel_name,
+                     order.check_in, order.check_out, order.room_type,
+                     order.guest_name, order.total_price, order.status,
+                     order.source, order.payment_url, order.contact_email,
+                     order.created_at, order.paid_at or None,
+                     order.updated_at),
+                )
+            else:
+                # 老库/只读库：保持旧字段，created_at 用表默认值
+                _conn.execute(
+                    """INSERT OR REPLACE INTO orders
+                       (order_id, hotel_id, hotel_name, check_in, check_out,
+                        room_type, guest_name, total_price, status, source,
+                        payment_url, contact_email)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (order.order_id, order.hotel_id, order.hotel_name,
+                     order.check_in, order.check_out, order.room_type,
+                     order.guest_name, order.total_price, order.status,
+                     order.source, order.payment_url, order.contact_email),
+                )
     except Exception as e:
         print(f"[storage] insert_order 失败（回退内存）：{e}")
         _mem_db[order.order_id] = order
@@ -226,29 +342,62 @@ def get_order(order_id: str) -> Optional[Order]:
 
 
 def update_status(order_id: str, status: str) -> bool:
-    """更新订单状态，返回是否更新成功。"""
+    """更新订单状态，返回是否更新成功。
+
+    - 每次状态变更都刷新 updated_at（“最近动态”时间）
+    - 首次进入 paid 时写 paid_at；之后重复置 paid 不覆盖首次支付时间
+    - created_at 永远不动
+    """
     _init_once()
+    now = _now()
+    paid_now = status == "paid"
     if _backend == "memory":
-        if order_id not in _mem_db:
+        order = _mem_db.get(order_id)
+        if order is None:
             return False
-        _mem_db[order_id].status = status
+        order.status = status
+        order.updated_at = now
+        if paid_now and not order.paid_at:
+            order.paid_at = now
         return True
     try:
         with _conn_lock:
-            cur = _conn.execute(
-                "UPDATE orders SET status = ? WHERE order_id = ?",
-                (status, order_id),
-            )
+            if not _HAS_TIME_COLS:
+                # 老库/只读库：没有时间列，只更新状态
+                cur = _conn.execute(
+                    "UPDATE orders SET status = ? WHERE order_id = ?",
+                    (status, order_id),
+                )
+            elif paid_now:
+                cur = _conn.execute(
+                    "UPDATE orders SET status = ?, updated_at = ?, "
+                    "paid_at = COALESCE(paid_at, ?) WHERE order_id = ?",
+                    (status, now, now, order_id),
+                )
+            else:
+                cur = _conn.execute(
+                    "UPDATE orders SET status = ?, updated_at = ? "
+                    "WHERE order_id = ?",
+                    (status, now, order_id),
+                )
             # sqlite3 / pymysql 游标都有 rowcount
             affected = cur.rowcount
         # 更新内存副本，供同进程后续 get_order 立刻读到
-        if order_id in _mem_db:
-            _mem_db[order_id].status = status
+        order = _mem_db.get(order_id)
+        if order is not None:
+            order.status = status
+            order.updated_at = now
+            if paid_now and not order.paid_at:
+                order.paid_at = now
         return affected > 0
     except Exception as e:
         print(f"[storage] update_status 失败：{e}")
-        if order_id in _mem_db:
-            _mem_db[order_id].status = status
+        order = _mem_db.get(order_id)
+        if order is not None:
+            order.status = status
+            order.updated_at = now
+            if paid_now and not order.paid_at:
+                order.paid_at = now
             return True
         return False
 
@@ -257,7 +406,8 @@ def list_all_orders() -> List[Order]:
     """返回全部订单（不限状态，按创建时间倒序）。"""
     _init_once()
     if _backend == "memory":
-        return list(_mem_db.values())
+        return sorted(_mem_db.values(),
+                      key=lambda o: o.created_at or "", reverse=True)
     try:
         with _conn_lock:
             cur = _conn.execute(

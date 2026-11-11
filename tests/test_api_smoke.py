@@ -122,9 +122,24 @@ def test_openapi_contract():
     expected = {"/api/health", "/api/chat", "/api/chat/stream", "/api/orders",
                 "/api/orders/{order_id}/cancel",
                 "/api/orders/{order_id}/pre-cancel", "/orders", "/",
-                "/api/session/{session_id}"}
+                "/api/session/{session_id}",
+                "/api/session/{session_id}/hotels",
+                "/api/session/{session_id}/select",
+                "/api/hotels/more"}
     missing = expected - paths
     assert not missing, f"OpenAPI 缺少路由: {missing}"
+
+
+def test_hotels_endpoint_unknown_session():
+    """结构化列表是只读接口：不存在的会话返回 404，且不能被创建出来。"""
+    r = http("/api/session/smoke-session-does-not-exist/hotels")
+    assert r.status == 404, f"期望 404，实际 {r.status}: {r.text[:200]}"
+
+
+def test_select_unknown_session():
+    r = http("/api/session/smoke-session-does-not-exist/select",
+             payload={"hotel_id": "H001", "revision": "x"})
+    assert r.status == 404, f"期望 404，实际 {r.status}: {r.text[:200]}"
 
 
 def test_session_info_unknown():
@@ -154,6 +169,9 @@ def test_orders_default_filter_returns_schema():
     for key in ("rows", "logged_in", "filter", "source"):
         assert key in d, f"/api/orders 缺少字段 {key}: {list(d)}"
     assert isinstance(d["rows"], list)
+    for row in d["rows"]:
+        for key in ("create_time", "paid_time", "updated_at", "status_bucket"):
+            assert key in row, f"订单行缺少字段 {key}: {row}"
 
 
 # --------------------------------------------------------------------------

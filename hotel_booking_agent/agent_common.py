@@ -308,6 +308,8 @@ def reset_booking_state(state) -> None:
     """重置预订状态，准备下一次预订。"""
     state.params = BookingParams()
     state.search_results = []
+    state.search_revision = ""
+    state.last_view = {}
     state.selected_hotel = None
     state.current_order = None
     state.pending_cancel = {}
@@ -737,10 +739,18 @@ def quit_booking_message() -> str:
 
 # ========== 展示 ==========
 
-def render_hotel_results(params, results: List[Hotel]) -> str:
-    """渲染酒店搜索结果列表（搜索完成与“返回酒店列表”共用）。"""
+def render_hotel_results_parts(params, results: List[Hotel]):
+    """把搜索结果渲染拆成 (intro, body, outro)。
+
+    - intro：标题 + 距离提示
+    - body：编号酒店列表（纯文本，CLI/历史回放用）
+    - outro：操作引导
+
+    Web 端用 intro/outro + 结构化 items 渲染卡片，不解析 body 文本；
+    空结果返回 (提示语, "", "")。
+    """
     if not results:
-        return "没有找到符合条件的酒店，建议放宽筛选条件。"
+        return "没有找到符合条件的酒店，建议放宽筛选条件。", "", ""
     nights = calc_nights(params.check_in, params.check_out)
     location = (params.location or "").strip()
     city_core = (params.city or "").rstrip("市")
@@ -758,14 +768,23 @@ def render_hotel_results(params, results: List[Hotel]) -> str:
             f"按距{location.replace('附近', '')}由近到远排列，"
             f"最近的是 {nearest.name}（约{dist}米）。\n"
         )
-    return (
+    intro = (
         f"为你找到 {len(results)} 家符合条件的酒店"
         f"（{area_text}{params.check_in} 入住，{params.check_out} 离店，共{nights}晚）：\n\n"
         f"{nearest_hint}"
-        f"{format_hotel_list(results)}\n\n"
-        f"回复序号或酒店名选一家；想按价格、星级或距离再筛，"
-        f"直接告诉我就行。"
     )
+    body = format_hotel_list(results)
+    outro = (
+        "\n\n回复序号或酒店名选一家；想按价格、星级或距离再筛，"
+        "直接告诉我就行。"
+    )
+    return intro, body, outro
+
+
+def render_hotel_results(params, results: List[Hotel]) -> str:
+    """渲染酒店搜索结果列表（搜索完成与“返回酒店列表”共用）。"""
+    intro, body, outro = render_hotel_results_parts(params, results)
+    return intro + body + outro
 
 
 def load_hotel_selection_detail(hotel: Hotel, params) -> Hotel:

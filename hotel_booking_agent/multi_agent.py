@@ -10,6 +10,7 @@
 # 协调模式：Supervisor-Worker（工头制，生产环境最常用模式）
 
 import time
+import uuid
 from typing import Optional, List
 from dataclasses import dataclass, field
 from models import AgentState
@@ -28,7 +29,7 @@ from agent_common import (
     format_order_detail, extract_guest_name, parse_hotel_selection,
     match_room_choice, booking_exit_action, quit_booking_message,
     load_hotel_selection_detail, location_fix_action, city_fix_action,
-    render_hotel_results, render_hotel_selection, chat_reply,
+    render_hotel_results_parts, render_hotel_selection, chat_reply,
     reset_booking_state, is_selection_attempt,
 )
 from rag import get_rag
@@ -87,6 +88,8 @@ class SearchAgent(BaseAgent):
             params = shared_state.params
             results = search_hotels(params)
             shared_state.search_results = results
+            # 新列表 → 新版本号：前端结构化选店必须带它
+            shared_state.search_revision = uuid.uuid4().hex[:12]
 
             if not results:
                 return AgentMessage(
@@ -97,7 +100,14 @@ class SearchAgent(BaseAgent):
                 )
 
             # 格式化搜索结果（与单 Agent / 返回列表共用）
-            result_text = render_hotel_results(params, results)
+            intro, body, outro = render_hotel_results_parts(params, results)
+            shared_state.last_view = {
+                "kind": "hotels",
+                "revision": shared_state.search_revision,
+                "intro": intro,
+                "outro": outro,
+            }
+            result_text = intro + body + outro
 
             return AgentMessage(
                 sender=self.name, receiver="Supervisor",
@@ -531,8 +541,16 @@ class SupervisorAgent:
         """选房/入住人收集阶段的逃生口；命中时 shared_state 已更新。"""
         action = booking_exit_action(self.shared_state, user_input.strip())
         if action == "back":
-            return render_hotel_results(
+            # 同一个列表、同一个 revision：只是重新展示，不算新搜索
+            intro, body, outro = render_hotel_results_parts(
                 self.shared_state.params, self.shared_state.search_results or [])
+            self.shared_state.last_view = {
+                "kind": "hotels",
+                "revision": self.shared_state.search_revision,
+                "intro": intro,
+                "outro": outro,
+            }
+            return intro + body + outro
         if action == "research":
             return self._handle_booking_intent(user_input)
         if action == "quit":

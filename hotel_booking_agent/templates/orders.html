@@ -4,14 +4,17 @@
 <meta charset="UTF-8">
 <title>历史订单 · 酒店预订 Agent</title>
 <style>
-  body { font-family: "Microsoft YaHei", system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 16px; }
+  body { font-family: "Microsoft YaHei", system-ui, sans-serif; max-width: 1280px; margin: 0 auto; padding: 16px; }
   h1 { color: #2c3e50; }
   .topbar { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; font-size: 13px; color: #666; }
   .topbar a { color: #2980b9; text-decoration: none; }
   .tag { background: #ecf0f1; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
   table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
   th, td { border-bottom: 1px solid #eee; padding: 8px 10px; text-align: left; }
-  th { background: #f8f9fa; color: #555; }
+  th { background: #f8f9fa; color: #555; white-space: nowrap; }
+  /* 订单号/价格/状态/来源/操作不折行；酒店与房型列允许换行 */
+  td:nth-child(1), td:nth-child(6), td:nth-child(7), td:nth-child(8), td:nth-child(9),
+  th:nth-child(6), th:nth-child(7), th:nth-child(8), th:nth-child(9) { white-space: nowrap; }
   tr:hover td { background: #fafbfc; }
   .status-pending { color: #e67e22; }
   .status-paid    { color: #27ae60; }
@@ -21,6 +24,15 @@
   .btn.danger { background: #c0392b; }
   .btn.danger:hover { background: #a93226; }
   .pay-link { color: #e67e22; }
+  .time { white-space: nowrap; font-variant-numeric: tabular-nums; color: #34495e; }
+  .detail-row td { background: #fbfdff; padding: 0 10px 10px; border-bottom: 1px solid #eee; }
+  .detail-box {
+    display: flex; flex-wrap: wrap; gap: 22px; align-items: center;
+    margin-left: 10px; padding: 8px 12px; border-left: 3px solid #b7d7ee;
+    background: #f5faff; border-radius: 0 6px 6px 0; font-size: 13px; color: #52616b;
+  }
+  .detail-box b { color: #2c3e50; font-weight: 600; }
+  .pay-badge { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 8px; background: #eaf7ef; color: #27ae60; font-size: 11px; }
   .empty { text-align: center; padding: 40px; color: #999; }
   .filter { margin-top: 12px; }
   .filter a { display: inline-block; padding: 4px 12px; margin-right: 6px; border: 1px solid #ddd; border-radius: 14px; text-decoration: none; color: #555; font-size: 13px; }
@@ -44,6 +56,22 @@
 <div id="table_container"></div>
 
 <script>
+// 时间格式统一为 "YYYY-MM-DD HH:MM"；接口给的是 "YYYY-MM-DD HH:MM:SS"
+function fmtTime(v) {
+  if (!v) return "-";
+  const s = String(v).replace("T", " ");
+  return s.length >= 16 ? s.slice(0, 16) : s;
+}
+// 最近动态：优先支付时间，其次状态变更时间，最后创建时间
+function lastEvent(o) {
+  if (o.paid_time) return `${fmtTime(o.paid_time)} 支付成功`;
+  if (o.updated_at && o.updated_at !== o.create_time) {
+    return `${fmtTime(o.updated_at)} ${o.status_text || o.status || "状态更新"}`;
+  }
+  if (o.create_time) return `${fmtTime(o.create_time)} 创建订单`;
+  return "-";
+}
+
 async function loadOrders() {
   const urlParams = new URLSearchParams(window.location.search);
   const current_filter = urlParams.get("filter") || "ALL";
@@ -58,7 +86,7 @@ async function loadOrders() {
   }
 
   let html = `<table>
-    <tr><th>订单号</th><th>酒店</th><th>房型</th><th>入住</th><th>总价</th><th>状态</th><th>来源</th><th>操作</th></tr>`;
+    <tr><th>订单号</th><th>酒店</th><th>房型</th><th>入住</th><th>下单时间</th><th>总价</th><th>状态</th><th>来源</th><th>操作</th></tr>`;
   for (const o of rows) {
     const bucket = o.status_bucket ||
       (o.status === "pending" ? "PENDING" :
@@ -79,16 +107,28 @@ async function loadOrders() {
         action += `<button class="btn danger" onclick="cancel('${o.order_no}')">取消</button>`;
       }
     }
+    const paidMark = o.paid_time ? `<span class="pay-badge">已支付</span>` : "";
     html += `<tr>
       <td>${o.order_no}</td>
       <td>${o.hotel_name}</td>
       <td>${o.room_name || '-'}</td>
-      <td>${o.check_in || '?'} → ${o.check_out || '?'}</td>
+      <td class="time">${o.check_in || '?'} → ${o.check_out || '?'}</td>
+      <td class="time">${fmtTime(o.create_time)}</td>
       <td>${o.total_price} ${o.currency || 'CNY'}</td>
-      <td class="${cls}">${status}</td>
+      <td class="${cls}">${status}${paidMark}</td>
       <td>${o.source === "rollinggo" ? '【道旅】' : '本地'}</td>
       <td>${action || '-'}</td>
     </tr>`;
+    // 有支付时间的订单多展示一行明细：创建/支付/最近动态分开，互不覆盖
+    if (o.paid_time) {
+      html += `<tr class="detail-row"><td colspan="9">
+        <div class="detail-box">
+          <span>下单时间：<b>${fmtTime(o.create_time)}</b></span>
+          <span>支付时间：<b>${fmtTime(o.paid_time)}</b></span>
+          <span>最近动态：<b>${lastEvent(o)}</b></span>
+        </div>
+      </td></tr>`;
+    }
   }
   html += `</table>`;
   container.innerHTML = html;

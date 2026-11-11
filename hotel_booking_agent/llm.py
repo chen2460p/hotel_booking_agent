@@ -132,6 +132,9 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
   如果提供了"住N晚""住N天"（N可能是中文数字，如"三天"），用入住日期推算离店日期。
 - city 是城市中文名，例如"沈阳"→"沈阳"。
 - max_price 是数字（元/晚）。
+- 用户只回两个数字（如"12 15""12、15""12-15"，中间可有"号/日"）时，按"前一个入住日、
+  后一个离店日"理解；月份取不早于今天的最近月份（如今天是 11 月，"12 15"→11 月 12 日入住、
+  11 月 15 日离店）。只回一个数字（"15号"）时只当作入住日，离店日留空。
 - 无法确定的字段不要填，不要编造。
 
 示例返回：{{"intent":"book","city":"沈阳","check_in":"{tomorrow:%Y-%m-%d}","check_out":"{day_after:%Y-%m-%d}","max_price":1000}}"""
@@ -156,6 +159,17 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
                                 params[k] = v
                                 continue
                         params.setdefault(k, v)
+                    # 规则能从原文解析出"成对日期"（裸数字 12 15、区间 12-15 等）时以规则为准：
+                    # LLM 容易把"12 15"猜成单个 12 月 15 日，导致离店日期丢失/倒挂
+                    if rule_params.get("check_in") and rule_params.get("check_out"):
+                        params["check_in"] = rule_params["check_in"]
+                        params["check_out"] = rule_params["check_out"]
+                    # 日期倒挂保护：仍出现 check_out <= check_in 时，
+                    # 保留入住日、丢弃不可信的离店日（下一轮再追问），
+                    # 绝不带着倒挂日期去搜索
+                    if (params.get("check_in") and params.get("check_out")
+                            and str(params["check_out"]) <= str(params["check_in"])):
+                        params.pop("check_out", None)
                     return intent, params
             except Exception as e:
                 print(f"[LLM 返回解析失败，回退规则引擎] {e}")
@@ -310,6 +324,29 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
                 d2 = _future_day_only(int(range_match.group(2)))
                 if d1 and d2:
                     if d2 <= d1:
+                        try:
+                            d2 = d2.replace(
+                                month=d2.month % 12 + 1,
+                                year=d2.year + (1 if d2.month == 12 else 0))
+                        except ValueError:
+                            pass
+                    if d2 > d1:
+                        params["check_in"] = d1.strftime("%Y-%m-%d")
+                        params["check_out"] = d2.strftime("%Y-%m-%d")
+
+        # 3b. 两个裸数字：12 15 / 12、15 / 12-15 / 12号15号
+        #     被追问"入住和离店日期"时最常见的简写：前一个入住、后一个离店。
+        #     必须带分隔符或"号/日"，避免把"1215"这类数字串误判成日期。
+        if "check_in" not in params and "check_out" not in params:
+            pair_match = re.fullmatch(
+                r'\s*(\d{1,2})\s*(?:[号日]\s*(?:[-—~到至、,，/]\s*)?'
+                r'|[-—~到至、,，/]\s*|\s+)\s*'
+                r'(\d{1,2})\s*[号日]?\s*', text)
+            if pair_match:
+                d1 = _future_day_only(int(pair_match.group(1)))
+                d2 = _future_day_only(int(pair_match.group(2)))
+                if d1 and d2:
+                    if d2 <= d1:          # 跨月（如"28 3"）= 28 号到下月 3 号
                         try:
                             d2 = d2.replace(
                                 month=d2.month % 12 + 1,

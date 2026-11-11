@@ -575,7 +575,7 @@ def parse_orders(raw: Any) -> List[Dict[str, Any]]:
     把道旅订单列表/详情响应归一化为统一行结构：
     order_no / hotel_name / room_name / check_in / check_out /
     total_price / currency / status(原始) / status_text(中文) /
-    payment_url / create_time
+    payment_url / create_time / paid_time
     """
     rows: List[Dict[str, Any]] = []
     for it in _extract_order_rows(raw):
@@ -600,8 +600,14 @@ def parse_orders(raw: Any) -> List[Dict[str, Any]]:
                 it, ["paymentUrl", "payUrl", "cashierUrl", "payURL"], "")) or "",
             "payment_deadline": str(_find_key(
                 it, ["paymentDeadline", "payDeadline", "expireTime", "expireDate"], "")) or "",
+            # 道旅列表/详情实测用 orderDate 表示下单时间（2026-11-11 09:46:09）；
+            # 其余键名是不同渠道/版本的兼容兜底
             "create_time": str(_find_key(
-                it, ["createTime", "createdAt", "orderTime", "bookingTime"], "")) or "",
+                it, ["orderDate", "createTime", "createdAt", "orderTime",
+                     "bookingTime"], "")) or "",
+            # 道旅接口目前不返回支付时间；保留候选键，将来提供时自动接上
+            "paid_time": str(_find_key(
+                it, ["paymentTime", "payTime", "paidAt", "payDate"], "")) or "",
             "source": "rollinggo",
         })
     return rows

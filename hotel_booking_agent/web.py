@@ -11,6 +11,8 @@
   - POST /api/chat      对话接口（JSON 入 user_input，出 reply）
   - POST /api/chat/stream  对话接口 SSE 版（先推阶段事件，最后推完整回复）
   - GET  /api/session/{session_id}  查询会话在服务端是否仍存活（前端恢复本地历史用）
+  - GET  /api/session/{session_id}/hotels  结构化酒店列表（卡片渲染用，带 revision）
+  - POST /api/session/{session_id}/select  按 hotel_id + revision 选店（不经过 LLM/序号）
   - GET  /orders        订单列表页面
   - GET  /api/orders    订单列表 JSON
   - POST /api/orders/{id}/pay     模拟支付
@@ -35,7 +37,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from agent import HotelBookingAgent
+from agent import HotelBookingAgent, SelectionError
 import tools
 import storage
 import hotel_rating
@@ -75,6 +77,26 @@ def session_count() -> int:
     return len(_agents)
 
 
+def _peek_agent(session_id: str):
+    """只读获取已存在的会话（不创建）；顺手回收过期会话并续期。
+
+    返回 {"agent": ..., "ts": ...} 或 None。结构化列表/选店接口用它，
+    避免前端一个 GET 就把不存在的会话创建出来。
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return None
+    now = time.time()
+    with _agents_lock:
+        entry = _agents.get(sid)
+        if entry is not None and now - entry["ts"] > _SESSION_TTL:
+            del _agents[sid]
+            entry = None
+        elif entry is not None:
+            entry["ts"] = now
+        return entry
+
+
 # ---------- 请求/响应模型 ----------
 class ChatRequest(BaseModel):
     user_input: str
@@ -89,12 +111,23 @@ class ChatResponse(BaseModel):
     storage_enabled: bool          # True = 真实持久化
     hotel_total: int = 0          # 本次搜索命中的酒店总数（>5 时前端显示“展开全部”）
     hotel_shown: int = 0          # 首屏已展示家数
+    stage: str = ""               # 当前阶段（intent/recommend/booking/...）
+    # 酒店列表视图（本次回复是列表时才有）：结构化 items + revision + 文案，
+    # 前端据此渲染卡片并按 hotel_id 选店，不再解析回复文本
+    hotel_view: Optional[dict] = None
 
 
 class HotelMoreRequest(BaseModel):
     session_id: str
     offset: int = 0               # 从第 offset 家（0 基）开始补
     limit: int = 5                # 本次补全/展示家数
+    revision: str = ""            # 搜索结果版本号；带上则校验，避免展开到旧列表
+
+
+class SelectHotelRequest(BaseModel):
+    """结构化选店：只认稳定 hotel_id + 列表版本，序号仅用于展示。"""
+    hotel_id: str
+    revision: str = ""
 
 
 class CancelRequest(BaseModel):
@@ -105,18 +138,55 @@ class CancelRequest(BaseModel):
     description: str = ""
 
 
-def _hotel_counts(agent: HotelBookingAgent, reply: str) -> tuple:
-    """返回 (命中总数, 首屏已展示数)；仅对本次“推荐酒店”回复生效。
+def _hotel_item(h) -> dict:
+    """单家酒店的结构化视图：前端卡片只渲染这些字段，不再解析文本。"""
+    return {
+        "hotel_id": h.hotel_id,
+        "name": h.name,
+        "star": h.star,
+        "price_per_night": h.price_per_night,
+        "rating": h.rating,
+        "review_count": h.review_count,
+        "rating_source": h.rating_source,
+        "address": h.address,
+        "distance_m": h.distance_m,
+        "distance_to": h.distance_to,
+        "facilities": list(h.facilities[:4]),
+        "room_types": list(h.room_types),
+        "image_url": h.image_url,
+    }
 
-    不能只看 stage：推荐阶段里用户追问订单等，stage 可能仍是 recommend，
-    但回复并不是酒店列表，此时不应给前端“展开全部”按钮。
+
+def _hotel_view(agent: HotelBookingAgent) -> Optional[dict]:
+    """本次回复若为酒店列表，返回结构化视图；否则 None。
+
+    以 agent 登记的 last_view 为准（而不是靠匹配回复文案），
+    这样推荐阶段用户追问订单等非列表回复不会误挂“展开全部”。
     """
-    state = agent.state
-    # 用结果标题判断是否本次酒店列表，避免依赖具体引导语（引导语会随模板调整）
-    if state.stage != "recommend" or "符合条件的酒店" not in reply:
+    view = getattr(agent.state, "last_view", None) or {}
+    if view.get("kind") != "hotels":
+        return None
+    results = getattr(agent.state, "search_results", None) or []
+    total = len(results)
+    if not total:
+        return None
+    shown = min(tools.HOTEL_PREVIEW, total)
+    return {
+        "revision": view.get("revision") or getattr(agent.state, "search_revision", ""),
+        "total": total,
+        "shown": shown,
+        "intro": view.get("intro", ""),
+        "outro": view.get("outro", ""),
+        "items": [_hotel_item(h) for h in results[:shown]],
+    }
+
+
+def _hotel_counts(agent: HotelBookingAgent) -> tuple:
+    """返回 (命中总数, 首屏已展示数)；仅对本次“酒店列表”回复生效。"""
+    view = _hotel_view(agent)
+    if view is None:
         return 0, 0
-    total = len(getattr(state, "search_results", None) or [])
-    return total, min(tools.HOTEL_PREVIEW, total)
+    return view["total"], view["shown"]
 
 
 def _current_order_text(agent: HotelBookingAgent) -> str:
@@ -131,7 +201,7 @@ def _current_order_text(agent: HotelBookingAgent) -> str:
 def _chat_payload(agent: HotelBookingAgent, reply: str,
                   session_id: str) -> dict:
     """普通接口与 SSE 接口共用的结果构造。"""
-    total, shown = _hotel_counts(agent, reply)
+    total, shown = _hotel_counts(agent)
     return {
         "reply": reply,
         "current_order": _current_order_text(agent),
@@ -140,6 +210,8 @@ def _chat_payload(agent: HotelBookingAgent, reply: str,
         "storage_enabled": storage.storage_available(),
         "hotel_total": total,
         "hotel_shown": shown,
+        "stage": getattr(agent.state, "stage", ""),
+        "hotel_view": _hotel_view(agent),
     }
 
 
@@ -238,15 +310,7 @@ async def api_session_info(session_id: str):
     sid = (session_id or "").strip()
     if not sid:
         raise HTTPException(status_code=400, detail="session_id 不能为空")
-    now = time.time()
-    with _agents_lock:
-        entry = _agents.get(sid)
-        # 与 _get_or_create_agent 使用同一套 TTL：过期条目尚未被清理时也不能报 exists
-        if entry is not None and now - entry["ts"] > _SESSION_TTL:
-            del _agents[sid]
-            entry = None
-        elif entry is not None:
-            entry["ts"] = now      # 用户正在查看/恢复该会话，重置不活跃计时
+    entry = _peek_agent(sid)
     if entry is None:
         return {"exists": False, "session_id": sid}
     agent = entry["agent"]
@@ -257,29 +321,94 @@ async def api_session_info(session_id: str):
         "stage": state.stage,
         "current_order": _current_order_text(agent),
         "hotel_total": len(getattr(state, "search_results", None) or []),
+        "search_revision": getattr(state, "search_revision", ""),
         "last_active": entry["ts"],
     }
+
+
+@app.get("/api/session/{session_id}/hotels")
+def api_session_hotels(session_id: str, offset: int = 0, limit: int = 5,
+                       revision: str = ""):
+    """结构化酒店列表（卡片渲染 / 展开全部 / 恢复历史共用）。
+
+    - 只读，不创建会话；返回 items（字段与首屏一致）
+    - 带 revision 时做版本校验：不一致返回 409，前端提示列表已更新
+    - 展示前按需补真实评分（只补没有评分的，7 天缓存）
+    """
+    entry = _peek_agent(session_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期，请重新搜索")
+    state = entry["agent"].state
+    results = getattr(state, "search_results", None) or []
+    current_rev = getattr(state, "search_revision", "")
+    if revision and current_rev and revision != current_rev:
+        raise HTTPException(status_code=409,
+                            detail="酒店列表已更新，请按最新列表重新选择")
+    total = len(results)
+    start = max(0, offset)
+    if start >= total:
+        return {"revision": current_rev, "total": total, "offset": start,
+                "items": [], "done": True}
+    limit = max(1, min(limit, 20))
+    end = min(total, start + limit)
+    chunk = results[start:end]
+    try:
+        # 只补尚无评分的酒店；缓存命中不产生请求
+        hotel_rating.enrich_hotels_rating(chunk, limit=len(chunk))
+    except Exception as e:
+        print(f"[展开补评分失败，按暂无评分展示] {type(e).__name__}: {e}")
+    return {
+        "revision": current_rev,
+        "total": total,
+        "offset": start,
+        "items": [_hotel_item(h) for h in chunk],
+        "done": end >= total,
+    }
+
+
+@app.post("/api/session/{session_id}/select", response_model=ChatResponse)
+def api_select_hotel(session_id: str, req: SelectHotelRequest):
+    """按 hotel_id + revision 选店：不经过 LLM，也不按序号猜。
+
+    版本不一致（旧列表）→ 409；酒店已不在列表 → 404；
+    成功返回房型报价回复与最新会话状态。
+    """
+    entry = _peek_agent(session_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期，请重新搜索")
+    agent = entry["agent"]
+    try:
+        reply = agent.select_hotel_by_id(req.hotel_id, req.revision)
+    except SelectionError as e:
+        # stale=旧列表（可重取最新列表）；其余=酒店不存在/无列表
+        status = 409 if e.code == "stale" else 404
+        raise HTTPException(status_code=status, detail=e.message)
+    return ChatResponse(**_chat_payload(agent, reply, session_id))
 
 
 @app.post("/api/hotels/more")
 def api_hotels_more(req: HotelMoreRequest):
     """
-    “展开全部”按需补全评分：为 search_results[offset:offset+limit] 补真实评分，
-    再按首屏同一套规则格式化返回。
+    “展开全部”按需补全评分并返回结构化 items（兼容旧前端的 text 字段）。
 
     - 评分只取真实数据（百度/高德 + 7 天磁盘缓存）；查不到仍显示“暂无评分”
     - 用同步 def，FastAPI 自动放线程池执行，不阻塞事件循环
-    - 编号从 offset+1 延续，前端可直接追加到当前消息末尾
+    - 带 revision 时做版本校验：列表已更新则 409
     """
-    with _agents_lock:
-        entry = _agents.get(req.session_id)
+    entry = _peek_agent(req.session_id)
     if entry is None:
         raise HTTPException(status_code=404, detail="会话不存在或已过期，请重新搜索")
-    results = getattr(entry["agent"].state, "search_results", None) or []
+    state = entry["agent"].state
+    results = getattr(state, "search_results", None) or []
+    current_rev = getattr(state, "search_revision", "")
+    if req.revision and current_rev and req.revision != current_rev:
+        raise HTTPException(status_code=409,
+                            detail="酒店列表已更新，请按最新列表重新选择")
     total = len(results)
     start = max(0, req.offset)
     if start >= total:
-        return {"text": "", "next": start, "total": total, "done": True}
+        return {"revision": current_rev, "text": "", "items": [],
+                "next": start, "total": total, "done": True}
     limit = max(1, min(req.limit, 20))
     end = min(total, start + limit)
     chunk = results[start:end]
@@ -289,6 +418,8 @@ def api_hotels_more(req: HotelMoreRequest):
     except Exception as e:
         print(f"[展开补评分失败，按暂无评分展示] {type(e).__name__}: {e}")
     return {
+        "revision": current_rev,
+        "items": [_hotel_item(h) for h in chunk],
         "text": tools.format_hotel_slice(results, start, end - start),
         "next": end, "total": total, "done": end >= total,
     }
@@ -315,6 +446,9 @@ async def api_orders(filter: str = "ALL"):
             "status_bucket": tools.order_status_bucket(r),
             "payment_url": r.get("payment_url", ""),
             "payment_deadline": r.get("payment_deadline", ""),
+            "create_time": r.get("create_time", ""),
+            "paid_time": r.get("paid_time", ""),
+            "updated_at": r.get("updated_at", ""),
             "source": r.get("source", "mock"),
         })
     return {"rows": trimmed, "logged_in": result["logged_in"],
