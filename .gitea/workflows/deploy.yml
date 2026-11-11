@@ -83,3 +83,11 @@ jobs:
         run: |
           # 保留 latest 与当前提交的镜像，其余悬空/历史镜像清掉
           docker image prune -f || true
+
+      - name: 失败时通知 Hermes 自动修复
+        if: failure()
+        run: |
+          curl -sS -m 10 -X POST "http://172.17.0.1:9300/hook" \
+            -H "Content-Type: application/json" \
+            -d "{\"repo\":\"${{ github.repository }}\",\"branch\":\"${{ github.ref_name }}\",\"sha\":\"${{ github.sha }}\"}" \
+            || echo "调用 Hermes hook 失败（忽略）"
