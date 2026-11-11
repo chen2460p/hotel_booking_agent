@@ -102,6 +102,10 @@ def test_index_page_renders():
     body = r.text
     assert "酒店" in body, "首页内容缺少中文文案，模板可能没加载"
     assert len(body) > 3000, f"首页只有 {len(body)} 字节，疑似模板渲染异常"
+    # 多会话/本地历史：从订单页返回后要能恢复聊天记录，且能新建会话
+    assert 'id="session-select"' in body, "首页缺少会话切换下拉框"
+    assert 'id="new-session"' in body, "首页缺少“新建会话”按钮"
+    assert "hb_sessions_v1" in body, "首页缺少聊天记录本地持久化逻辑"
 
 
 def test_orders_page_renders():
@@ -117,9 +121,19 @@ def test_openapi_contract():
     paths = set(r.json().get("paths", {}))
     expected = {"/api/health", "/api/chat", "/api/chat/stream", "/api/orders",
                 "/api/orders/{order_id}/cancel",
-                "/api/orders/{order_id}/pre-cancel", "/orders", "/"}
+                "/api/orders/{order_id}/pre-cancel", "/orders", "/",
+                "/api/session/{session_id}"}
     missing = expected - paths
     assert not missing, f"OpenAPI 缺少路由: {missing}"
+
+
+def test_session_info_unknown():
+    """只读会话查询：不存在的会话返回 exists=False，且不应创建 Agent。"""
+    r = http("/api/session/smoke-session-does-not-exist")
+    assert r.status == 200, f"期望 200，实际 {r.status}: {r.text[:200]}"
+    d = r.json()
+    assert d.get("exists") is False, d
+    assert d.get("session_id") == "smoke-session-does-not-exist", d
 
 
 def test_chat_rejects_empty_input():

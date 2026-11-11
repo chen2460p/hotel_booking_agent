@@ -9,9 +9,14 @@
 <style>
   body { font-family: "Microsoft YaHei", system-ui, sans-serif; max-width: 780px; margin: 0 auto; padding: 16px; }
   h1 { color: #2c3e50; }
-  .topbar { display: flex; gap: 12px; margin-bottom: 12px; font-size: 13px; color: #666; }
+  .topbar { display: flex; gap: 12px; margin-bottom: 12px; font-size: 13px; color: #666; flex-wrap: wrap; align-items: center; }
+  .topbar .spacer { flex: 1 1 auto; }
   .topbar a { color: #2980b9; text-decoration: none; }
   .topbar a:hover { text-decoration: underline; }
+  .topbar select { max-width: 230px; padding: 3px 6px; border: 1px solid #ccc; border-radius: 6px; font-size: 12px; color: #333; background: #fff; }
+  .topbar .mini { padding: 3px 10px; border: 1px solid #2980b9; background: #fff; color: #2980b9; border-radius: 6px; cursor: pointer; font-size: 12px; white-space: nowrap; }
+  .topbar .mini:hover { background: #eaf4fb; }
+  .topbar .mini:disabled, .topbar select:disabled { opacity: .55; cursor: not-allowed; }
   .tag { background: #ecf0f1; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
   .tag.mem { background: #ffeaa7; color: #b8860b; }
   .tag.sql { background: #dff0d8; color: #2d6a4f; }
@@ -22,6 +27,7 @@
   #chatbox .bot { margin: 6px 0; }
   #chatbox .bot span { background: #fff; border: 1px solid #e0e0e0; padding: 6px 10px; border-radius: 8px; display: inline-block; max-width: 85%; }
   #chatbox .sys { text-align: center; color: #aaa; font-size: 12px; margin: 8px 0; }
+  #chatbox .sys.notice { color: #9a6a00; background: #fffbea; border: 1px dashed #e6c35c; border-radius: 6px; padding: 4px 8px; }
   #chatbox .bot.status span { background: #f8f9fa; color: #7f8c8d; font-style: italic; border-style: dashed; }
   #chatbox .bot a { color: #2980b9; word-break: break-all; }
   #chatbox .bot .chat-img { display: block; max-width: 280px; max-height: 190px; border-radius: 8px; margin: 6px 0; cursor: zoom-in; border: 1px solid #e0e0e0; min-height: 56px; background: #f5f6f7; }
@@ -48,6 +54,10 @@
     存储：{{ storage_backend }}（{{ '真实持久化' if storage_enabled else '内存回退' }}）
   </span>
   <a href="/orders">📋 查看历史订单</a>
+  <span class="spacer"></span>
+  <label for="session-select">会话</label>
+  <select id="session-select" title="切换历史会话"></select>
+  <button id="new-session" class="mini" type="button" title="开始一段新的对话">＋ 新建会话</button>
 </div>
 
 <div id="chatbox">
@@ -59,21 +69,260 @@
   <button id="send">发送</button>
 </div>
 <div class="example">
-  提示：多轮对话已支持（同一浏览器会话保持搜索/选房状态）；重启 Web 进程会话重置。图片与链接可直接点击，等待期间可看到实时进度（理解需求 → 搜索酒店 → 获取报价）。
+  提示：聊天记录按会话保存在本浏览器，点击「查看历史订单」再返回不会丢失；顶栏可切换历史会话或新建会话。服务端上下文 30 分钟无活动会过期（历史记录仍保留）。图片与链接可直接点击，等待期间可看到实时进度（理解需求 → 搜索酒店 → 获取报价）。
 </div>
 
 <script>
 const chatbox = document.getElementById("chatbox");
 const input   = document.getElementById("input");
 const send    = document.getElementById("send");
+const sessionSelect = document.getElementById("session-select");
+const newSessionBtn = document.getElementById("new-session");
 
-// ---------- 会话标识：localStorage 持久化，同一浏览器刷新/重开不丢会话 ----------
-let sessionId = localStorage.getItem("hb_session_id");
-if (!sessionId) {
-  sessionId = (crypto.randomUUID ? crypto.randomUUID()
-                                  : "s-" + Date.now() + "-" + Math.random().toString(36).slice(2));
-  localStorage.setItem("hb_session_id", sessionId);
+// ---------- 多会话 + 聊天记录本地持久化 ----------
+// 从 /orders 返回会重新加载页面：聊天记录存 localStorage，启动时按 sessionId 恢复。
+// 存储结构：{active, sessions:[{id, createdAt, updatedAt, scroll, messages:[...]}]}
+// 服务端 Agent 池仍由 sessionId 复用（见 web.py），这里只负责“看得见的历史”。
+// 复用原有 append/renderRich/expandHotels，尽量不碰聊天主流程。
+const STORE_KEY = "hb_sessions_v1";
+const SID_KEY   = "hb_session_id";
+const MAX_SESSIONS = 20;    // 本浏览器最多保留 20 段会话
+const MAX_MESSAGES = 200;   // 单段会话最多保留 200 条消息
+
+function _uid() {
+  return crypto.randomUUID ? crypto.randomUUID()
+    : "s-" + Date.now() + "-" + Math.random().toString(36).slice(2);
 }
+function _safeGet(key) {
+  try { return localStorage.getItem(key); } catch (e) { return null; }
+}
+function _safeSet(key, val) {
+  try { localStorage.setItem(key, val); return true; } catch (e) { return false; }
+}
+
+function loadStore() {
+  try {
+    const raw = _safeGet(STORE_KEY);
+    if (raw) {
+      const data = JSON.parse(raw);
+      if (data && Array.isArray(data.sessions)) {
+        data.sessions = data.sessions.filter(s => s && typeof s.id === "string" && s.id);
+        for (const s of data.sessions) {
+          if (!Array.isArray(s.messages)) s.messages = [];
+          s.messages = s.messages.filter(m => m && typeof m.text === "string");
+        }
+        if (!data.active || !data.sessions.some(s => s.id === data.active)) {
+          // 兼容旧版只存了 hb_session_id 的浏览器
+          const legacy = _safeGet(SID_KEY) || "";
+          data.active = data.sessions.some(s => s.id === legacy)
+            ? legacy : (data.sessions[0] ? data.sessions[0].id : "");
+        }
+        return data;
+      }
+    }
+  } catch (e) {
+    console.warn("会话历史解析失败，已重建：", e);
+  }
+  return {active: "", sessions: []};
+}
+
+let store = loadStore();
+let sessionId = "";
+let _sessionCheck = 0;      // 会话存活检查序号：发送新消息后旧检查结果作废
+
+function currentSession() {
+  return store.sessions.find(s => s.id === store.active) || null;
+}
+
+function persist() {
+  if (!_safeSet(STORE_KEY, JSON.stringify(store))) {
+    // 浏览器配额满：先丢最旧的非当前会话，再压缩当前会话，尽量保住正在用的对话
+    while (store.sessions.length > 1) {
+      let victim = -1;
+      for (let i = store.sessions.length - 1; i >= 0; i--) {
+        if (store.sessions[i].id !== store.active) { victim = i; break; }
+      }
+      if (victim < 0) break;
+      store.sessions.splice(victim, 1);
+      if (_safeSet(STORE_KEY, JSON.stringify(store))) return;
+    }
+    const cur = currentSession();
+    if (cur && cur.messages.length > 50) {
+      cur.messages = cur.messages.slice(-50);
+      if (_safeSet(STORE_KEY, JSON.stringify(store))) return;
+    }
+    console.warn("聊天记录保存失败：浏览器本地存储空间不足");
+  }
+}
+
+function ensureSession() {
+  let s = currentSession();
+  if (s) { sessionId = s.id; return s; }
+  s = {
+    id: _safeGet(SID_KEY) || _uid(),
+    createdAt: Date.now(), updatedAt: Date.now(), scroll: 0, messages: [],
+  };
+  store.sessions.unshift(s);
+  store.active = s.id;
+  sessionId = s.id;
+  _safeSet(SID_KEY, s.id);
+  persist();
+  return s;
+}
+
+function trimSessions() {
+  while (store.sessions.length > MAX_SESSIONS) {
+    let victim = -1;
+    for (let i = store.sessions.length - 1; i >= 0; i--) {
+      if (store.sessions[i].id !== store.active) { victim = i; break; }
+    }
+    if (victim < 0) break;
+    store.sessions.splice(victim, 1);
+  }
+}
+
+function sessionLabel(s) {
+  const first = (s.messages || []).find(m => m.role === "user");
+  if (!first) return "新会话";
+  const text = first.text.replace(/\s+/g, " ").trim();
+  return text.length > 14 ? text.slice(0, 14) + "…" : text;
+}
+
+function updateSessionSelect() {
+  const list = [...store.sessions].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  sessionSelect.innerHTML = "";
+  for (const s of list) {
+    const opt = document.createElement("option");
+    opt.value = s.id;
+    const d = new Date(s.updatedAt || s.createdAt || Date.now());
+    const stamp = `${d.getMonth() + 1}/${d.getDate()} `
+      + `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    opt.textContent = `${sessionLabel(s)} · ${stamp}`;
+    sessionSelect.appendChild(opt);
+  }
+  sessionSelect.value = store.active;
+}
+
+function remember(role, text, extra) {
+  const s = ensureSession();
+  const rec = Object.assign({role, text, ts: Date.now()}, extra || {});
+  s.messages.push(rec);
+  if (s.messages.length > MAX_MESSAGES) {
+    s.messages.splice(0, s.messages.length - MAX_MESSAGES);
+  }
+  s.updatedAt = Date.now();
+  persist();
+  updateSessionSelect();
+  return rec;
+}
+
+function saveCurrentScroll() {
+  const s = currentSession();
+  if (!s) return;
+  s.scroll = chatbox.scrollTop;
+  persist();
+}
+
+function showWelcome() {
+  const div = document.createElement("div");
+  div.className = "sys";
+  div.textContent = '👋 你好！告诉我想订哪的酒店就行，例如"帮我订下周末三亚海景房，预算 1000 以内"。';
+  chatbox.appendChild(div);
+}
+
+function renderHistory() {
+  const s = ensureSession();
+  sessionId = s.id;
+  // 切会话/恢复历史会清空 DOM：断开旧观察器，避免已移除的图片节点一直挂在 observer 上
+  if (_imgObserver) { _imgObserver.disconnect(); _imgObserver = null; }
+  chatbox.innerHTML = "";
+  if (!s.messages.length) showWelcome();
+  for (const rec of s.messages) {
+    const rich = rec.role === "bot" && rec.rich !== false;
+    const div = append(rec.role, rec.text, rich, rec);
+    if (rec.role === "bot" && !rec.stale && rec.hotelTotal > (rec.next || 0)) {
+      addHotelExpander(div, div.querySelector("span"), rec.hotelTotal, rec.next || 0);
+    }
+  }
+  updateSessionSelect();
+  chatbox.scrollTop = s.scroll || chatbox.scrollHeight;
+}
+
+function activateSession(id) {
+  if (id === store.active) return;
+  const s = store.sessions.find(x => x.id === id);
+  if (!s) return;
+  saveCurrentScroll();
+  store.active = id;
+  sessionId = id;
+  _safeSet(SID_KEY, id);
+  persist();
+  renderHistory();
+  checkServerSession();
+}
+
+function createSession() {
+  const cur = currentSession();
+  if (cur && !cur.messages.length) {   // 已经是空白会话，不必再叠一个
+    const tip = document.createElement("div");
+    tip.className = "sys notice";
+    tip.textContent = "当前已经是新会话，直接输入需求即可。";
+    chatbox.appendChild(tip);
+    chatbox.scrollTop = chatbox.scrollHeight;
+    setTimeout(() => tip.remove(), 2500);
+    input.focus();
+    return;
+  }
+  saveCurrentScroll();
+  const s = {id: _uid(), createdAt: Date.now(), updatedAt: Date.now(), scroll: 0, messages: []};
+  store.sessions.unshift(s);
+  store.active = s.id;
+  sessionId = s.id;
+  _safeSet(SID_KEY, s.id);
+  trimSessions();
+  persist();
+  renderHistory();
+  input.focus();
+}
+
+function adoptServerSession(newId) {
+  const s = currentSession();
+  if (!s || !newId || newId === s.id) return;
+  s.id = newId;
+  store.active = newId;
+  sessionId = newId;
+  _safeSet(SID_KEY, newId);
+  persist();
+  updateSessionSelect();
+}
+
+async function checkServerSession() {
+  const s = currentSession();
+  if (!s || !s.messages.length) return;
+  const id = s.id;
+  const check = ++_sessionCheck;
+  try {
+    const r = await fetch("/api/session/" + encodeURIComponent(id), {cache: "no-store"});
+    if (!r.ok) return;
+    const d = await r.json();
+    if (check !== _sessionCheck || store.active !== id) return;  // 等待期间已发送/切走
+    if (!d.exists) {
+      const div = document.createElement("div");
+      div.className = "sys notice";
+      div.textContent = "⚠️ 服务端会话上下文已过期（30 分钟无活动或服务重启）。历史记录已保留，继续发送会从新上下文开始。";
+      chatbox.appendChild(div);
+      chatbox.scrollTop = chatbox.scrollHeight;
+    }
+  } catch (e) {
+    // 网络异常不打扰正常聊天
+  }
+}
+
+sessionSelect.addEventListener("change", () => {
+  if (sessionSelect.value !== store.active) activateSession(sessionSelect.value);
+});
+newSessionBtn.onclick = createSession;
+window.addEventListener("pagehide", saveCurrentScroll);
 
 // ---------- 富文本渲染：URL → 内嵌图片 / 可点链接（DOM API 拼装，无 XSS 风险）----------
 const URL_RE   = /https?:\/\/[^\s，。；、！？（）)】"'<>]+/g;
@@ -190,13 +439,14 @@ function groupGalleries(span) {
   }
 }
 
-function append(cls, text, rich) {
+function append(cls, text, rich, rec) {
   const div = document.createElement("div");
   div.className = cls;
   const span = document.createElement("span");
   if (rich) { renderRich(span, text); }
   else      { span.textContent = text; }
   div.appendChild(span);
+  if (rec) div._rec = rec;      // 关联持久化记录：展开全部时回写正文/进度
   chatbox.appendChild(div);
   chatbox.scrollTop = chatbox.scrollHeight;
   return div;
@@ -219,10 +469,15 @@ async function expandHotels(div, span, btn) {
       });
       if (!r.ok) throw new Error("HTTP " + r.status);
       const d = await r.json();
-      if (d.text) renderRich(span, "\n" + d.text, true);
+      if (d.text) {
+        renderRich(span, "\n" + d.text, true);
+        // 回写持久化记录：刷新/从订单页返回后，已展开的酒店不丢
+        if (div._rec) div._rec.text += "\n" + d.text;
+      }
       if (!d.next || d.next <= offset) break;     // 防御：后端未推进则退出
       offset = d.next;
       btn.dataset.next = offset;
+      if (div._rec) { div._rec.next = offset; persist(); }
       chatbox.scrollTop = chatbox.scrollHeight;
     }
     btn.remove();
@@ -236,24 +491,45 @@ async function expandHotels(div, span, btn) {
 function addHotelExpander(div, span, total, shown) {
   const btn = document.createElement("button");
   btn.className = "expand-hotels";
-  btn.textContent = `展开全部（共 ${total} 家）`;
+  const rec = div._rec;
+  btn.textContent = (rec && shown > (rec.hotelShown || 0))
+    ? `继续展开（已展示 ${shown}/${total} 家）`
+    : `展开全部（共 ${total} 家）`;
   btn.dataset.next = shown;
   btn.dataset.total = total;
   btn.onclick = () => expandHotels(div, span, btn);
   div.appendChild(btn);
 }
 
-async function sendMsg() {
-  const text = input.value.trim();
-  if (!text) return;
-  append("user", text);
-  // 新一轮搜索会替换会话里的 search_results，旧消息的“展开全部”已失效
+// 新一轮搜索会替换会话里的 search_results，旧消息的“展开全部”已失效
+function markOldExpandersStale() {
+  const s = currentSession();
+  if (s) {
+    let changed = false;
+    for (const m of s.messages) {
+      if (m.hotelTotal && !m.stale) { m.stale = true; changed = true; }
+    }
+    if (changed) persist();
+  }
   chatbox.querySelectorAll(".expand-hotels").forEach(b => {
     b.dataset.stale = "1";
     b.remove();
   });
+}
+
+async function sendMsg() {
+  if (send.disabled) return;              // 上一条还在请求中，Enter 不重复发送
+  const text = input.value.trim();
+  if (!text) return;
+  _sessionCheck++;                        // 有新消息：忽略启动时还没返回的“上下文过期”检查
+  markOldExpandersStale();
+  const userRec = remember("user", text);
+  append("user", text, false, userRec);
   input.value = "";
   send.disabled = true;
+  // 请求期间禁止切会话，避免回复落到另一段对话里
+  sessionSelect.disabled = true;
+  newSessionBtn.disabled = true;
   // 状态条：SSE stage 事件实时更新文案（理解需求 → 搜索酒店 → 获取报价）
   const status = append("bot", "正在连接助手…");
   status.classList.add("status");
@@ -290,8 +566,7 @@ async function sendMsg() {
           hotelTotal = d.hotel_total || 0;
           hotelShown = d.hotel_shown || 0;
           if (d.session_id && d.session_id !== sessionId) {
-            sessionId = d.session_id;
-            localStorage.setItem("hb_session_id", sessionId);
+            adoptServerSession(d.session_id);
           }
         } else if (ev === "error") {
           errMsg = d.message;
@@ -299,21 +574,48 @@ async function sendMsg() {
       }
     }
     status.remove();
-    if (errMsg) append("bot", "❌ " + errMsg);
-    else if (reply !== null) {
-      const botDiv = append("bot", reply, true);
+    if (errMsg) {
+      const rec = remember("bot", "❌ " + errMsg, {rich: false});
+      append("bot", rec.text, false, rec);
+    } else if (reply !== null) {
+      const rec = remember("bot", reply, {
+        rich: true, hotelTotal, hotelShown, next: hotelShown,
+      });
+      const botDiv = append("bot", reply, true, rec);
       if (hotelTotal > hotelShown) {
         addHotelExpander(botDiv, botDiv.querySelector("span"), hotelTotal, hotelShown);
       }
-      if (currentOrder) append("sys", "📌 " + currentOrder);
-    } else append("bot", "(连接中断，未收到完整回复)");
+      if (currentOrder) {
+        const orec = remember("sys", "📌 " + currentOrder);
+        append("sys", orec.text, false, orec);
+      }
+    } else {
+      const rec = remember("bot", "(连接中断，未收到完整回复)", {rich: false});
+      append("bot", rec.text, false, rec);
+    }
   } catch (e) {
     status.remove();
-    append("bot", "❌ 请求失败：" + e.message);
+    const rec = remember("bot", "❌ 请求失败：" + e.message, {rich: false});
+    append("bot", rec.text, false, rec);
   } finally {
     send.disabled = false;
+    sessionSelect.disabled = false;
+    newSessionBtn.disabled = false;
     input.focus();
+    saveCurrentScroll();
   }
+}
+
+// 启动：恢复当前会话（含聊天记录/展开进度/滚动位置）
+// 本地数据可能被用户/插件改坏：恢复失败也要保证输入框和按钮可用
+try {
+  renderHistory();
+  checkServerSession();
+} catch (e) {
+  console.warn("恢复会话历史失败，已从空白会话开始：", e);
+  chatbox.innerHTML = "";
+  showWelcome();
+  updateSessionSelect();
 }
 
 send.onclick = sendMsg;

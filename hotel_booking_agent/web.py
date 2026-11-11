@@ -10,6 +10,7 @@
   - GET  /              聊天页面（Jinja2 模板）
   - POST /api/chat      对话接口（JSON 入 user_input，出 reply）
   - POST /api/chat/stream  对话接口 SSE 版（先推阶段事件，最后推完整回复）
+  - GET  /api/session/{session_id}  查询会话在服务端是否仍存活（前端恢复本地历史用）
   - GET  /orders        订单列表页面
   - GET  /api/orders    订单列表 JSON
   - POST /api/orders/{id}/pay     模拟支付
@@ -223,6 +224,41 @@ async def api_chat_stream(req: ChatRequest):
     return StreamingResponse(
         event_gen(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/session/{session_id}")
+async def api_session_info(session_id: str):
+    """
+    查询会话在服务端是否还存活（不创建 Agent；命中时顺手续期活跃时间）。
+
+    前端把聊天记录缓存在浏览器 localStorage：从订单页返回/刷新后先恢复气泡，
+    但服务端 Agent 只在 30 分钟内有状态；前端用这个接口判断是否需要提示
+    “历史记录还在，但继续对话会从新上下文开始”。
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="session_id 不能为空")
+    now = time.time()
+    with _agents_lock:
+        entry = _agents.get(sid)
+        # 与 _get_or_create_agent 使用同一套 TTL：过期条目尚未被清理时也不能报 exists
+        if entry is not None and now - entry["ts"] > _SESSION_TTL:
+            del _agents[sid]
+            entry = None
+        elif entry is not None:
+            entry["ts"] = now      # 用户正在查看/恢复该会话，重置不活跃计时
+    if entry is None:
+        return {"exists": False, "session_id": sid}
+    agent = entry["agent"]
+    state = agent.state
+    return {
+        "exists": True,
+        "session_id": sid,
+        "stage": state.stage,
+        "current_order": _current_order_text(agent),
+        "hotel_total": len(getattr(state, "search_results", None) or []),
+        "last_active": entry["ts"],
+    }
 
 
 @app.post("/api/hotels/more")
