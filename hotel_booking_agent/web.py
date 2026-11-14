@@ -73,8 +73,17 @@ def _get_or_create_agent(session_id: str) -> HotelBookingAgent:
 
 
 def session_count() -> int:
-    """当前活跃会话数（/api/health 用）。"""
-    return len(_agents)
+    """当前活跃会话数（/api/health 用）。
+
+    先清掉超过 TTL 的条目再计数：过期会话只在“新建会话/读取会话”时才会被
+    回收，长时间没人聊天时旧对象会一直留在池子里，直接 len() 会虚高。
+    """
+    now = time.time()
+    with _agents_lock:
+        for sid in [sid for sid, v in _agents.items()
+                    if now - v["ts"] > _SESSION_TTL]:
+            del _agents[sid]
+        return len(_agents)
 
 
 def _peek_agent(session_id: str):
