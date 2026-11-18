@@ -29,6 +29,8 @@ from agent_common import (
     booking_exit_action, quit_booking_message, is_selection_attempt,
     extract_order_id, load_hotel_selection_detail,
     location_fix_action, city_fix_action,
+    plan_groups, rooms_view as build_rooms_view,
+    drop_rate_plan,
     render_hotel_results_parts,
     render_hotel_selection, chat_reply,
     reset_booking_state,
@@ -134,6 +136,13 @@ class HotelBookingAgent:
 
         # 将提取到的参数合并到当前状态（支持多轮累积补充）
         merge_params(self.state, extracted, user_input)
+
+        # 改口/否定（"不是成都，是重庆""不要海景房"）即使被模型判成闲聊或取消，
+        # 也要回到预订流程按新条件重新搜索；但真正要取消订单的句子不拦。
+        if (extracted.get("_corrected")
+                and self.state.stage in ("recommend", "clarify", "search")
+                and not any(w in user_input for w in ("取消", "退订", "退款", "订单"))):
+            intent = "book"
 
         # 地名疑似笔误：先确认，确认后再搜索，避免按错地名查出一堆无关酒店
         fix_action, fix_reply = location_fix_action(self.state, user_input)
@@ -552,6 +561,85 @@ class HotelBookingAgent:
                 "not_found", "这家酒店已不在当前搜索结果中，请重新搜索。")
         return self._handle_hotel_selection(hotel)
 
+    def rooms_view(self) -> Optional[dict]:
+        """当前是否应下发结构化房型列表。
+
+        只在「已选酒店、还没定房型」这一窗口返回数据：一旦用户已选好房型
+        （pending_booking 里有 room_type / rate_plan_id）或已进入验价确认
+        （booking_context 有值），返回 None，避免前端把房型卡片反复渲染出来。
+        只暂存了入住人姓名时仍下发：此时用户还没选房，列表就是他要操作的对象。
+        """
+        state = self.state
+        if state.stage != "booking" or state.selected_hotel is None:
+            return None
+        pending = state.pending_booking or {}
+        if (state.booking_context or pending.get("room_type")
+                or pending.get("rate_plan_id")):
+            return None
+        return build_rooms_view(state.selected_hotel, state.params,
+                                getattr(state, "rooms_revision", ""))
+
+    def select_room_by_numbers(self, room_no: int, plan_no: int = 1,
+                               guest_name: str = "",
+                               email: str = "") -> str:
+        """结构化选房：按「房型序号 + 报价序号」直接定位 ratePlanId。
+
+        与文本入口（回复「2-1」）走同一套 plan_groups 编号，但不再解析文本：
+        - 房型/报价序号越界 → room_not_found
+        - 已进入验价确认阶段 → busy（必须先放弃本次验价）
+        - 带入住人姓名 → 直接进入验价（已登录且为道旅酒店）或模拟下单
+        - 只带房型 → 暂存 pending_booking，等下一轮补入住人（与文本链路一致）
+        """
+        state = self.state
+        hotel = state.selected_hotel
+        if hotel is None:
+            raise SelectionError("no_hotel", "还没有选择酒店，请先搜索并选择酒店。")
+        if state.stage == "booking_confirm":
+            raise SelectionError(
+                "busy", "当前已进入验价确认阶段，请先回复【取消】放弃本次验价，再重新选房。")
+        if state.stage != "booking":
+            raise SelectionError("no_hotel", "当前不在选房阶段，请重新选择酒店。")
+
+        groups = dict(plan_groups(hotel.rate_plans))
+        try:
+            plans = groups.get(int(room_no))
+            idx = int(plan_no or 1) - 1
+        except (TypeError, ValueError):
+            raise SelectionError("room_not_found", "房型序号格式不对，请重新选择。")
+        if not plans:
+            raise SelectionError("room_not_found", "该房型已不在当前列表中，请重新选择。")
+        if idx < 0 or idx >= len(plans):
+            raise SelectionError("room_not_found", "该报价档已不在当前列表中，请重新选择。")
+        rate_plan = plans[idx]
+
+        pending = state.pending_booking or {}
+        guest_name = (guest_name or "").strip() or pending.get("guest_name", "")
+        email = (email or "").strip() or pending.get("email_override", "")
+
+        real_capable = bool(rate_plan.rate_plan_id
+                            and str(hotel.hotel_id).startswith("RLG_"))
+        if guest_name:
+            state.pending_booking = {}
+            if real_capable and rlg.is_logged_in():
+                return self._do_real_price_confirm({
+                    "rate_plan_obj": rate_plan,
+                    "room_type": rate_plan.room_name,
+                    "guest_name": guest_name,
+                    "email_override": email,
+                })
+            # 模拟链路（未登录的真实酒店同样先落模拟单，并给出登录提示）
+            response = self.confirm_booking(rate_plan.room_name, guest_name, rate_plan)
+            if real_capable and not rlg.is_logged_in():
+                response += "\n\n" + LOGIN_HINT
+            return response
+
+        state.pending_booking = {
+            "room_type": rate_plan.room_name,
+            "rate_plan_id": rate_plan.rate_plan_id or "",
+            "email_override": email,
+        }
+        return f"{rate_plan.room_name}已记下～入住人写谁？（告诉我姓名就可以下单了）"
+
     def _handle_hotel_selection(self, hotel: Hotel) -> str:
         """
         处理用户选中酒店后的流程——进入预订 Workflow
@@ -570,6 +658,8 @@ class HotelBookingAgent:
         self._emit_stage("pricing", "正在获取实时房型报价…")
         hotel = load_hotel_selection_detail(hotel, p)
         self.state.selected_hotel = hotel
+        # 房型列表换了一份（新酒店/新报价）→ 新版本号：结构化选房带旧版本会被拒绝
+        self.state.rooms_revision = uuid.uuid4().hex[:12]
 
         response = render_hotel_selection(hotel, p, show_login_hint=True)
         self.state.conversation_history.append(f"助手：{response}")
@@ -643,6 +733,72 @@ class HotelBookingAgent:
 
     # ---------- 道旅真实下单链路 ----------
 
+    def _recover_unavailable_rate(self, error, rate_plan_id: str = "",
+                                  guest_name: str = "",
+                                  email: str = "",
+                                  action: str = "验价") -> str:
+        """验价/下单遇到「房型报价已变动或售罄」时的恢复路径。
+
+        不再让用户对着同一档失效报价反复重试（那只会一直撞 6201），而是：
+        重新拉一次实时房型 → 摘掉刚失败的报价 → 回到选房阶段；
+        已填的入住人姓名/邮箱记进 pending_booking，选新房型时不用再填一遍。
+        整家酒店都没有可订房型时，直接退回酒店列表让用户换一家。
+        """
+        hotel = self.state.selected_hotel
+        p = self.state.params
+        self.state.booking_context = {}
+        self.state.stage = "booking"
+        # 这一轮回复是房型列表（或退回后的酒店列表），先清掉上一轮的视图
+        self.state.last_view = {}
+
+        # 详情接口失败时会保留旧列表，所以刷新后还要本地摘掉刚失败的那一档
+        refreshed = load_hotel_selection_detail(hotel, p) if hotel else None
+        refreshed = drop_rate_plan(refreshed, rate_plan_id)
+        self.state.selected_hotel = refreshed
+        # 房型列表换了一份 → 新版本号：旧序号/旧卡片一律作废
+        self.state.rooms_revision = uuid.uuid4().hex[:12]
+
+        guest_name = (guest_name or "").strip()
+        email = (email or "").strip()
+        remembered = {}
+        if guest_name:
+            remembered["guest_name"] = guest_name
+        if email:
+            remembered["email_override"] = email
+        self.state.pending_booking = remembered
+
+        notice = (
+            f"⚠️ {action}未通过：{error}\n"
+            f"该房型报价已变动或售罄（不是你填错了），"
+            f"我已重新核对了这家酒店的实时房型。"
+        )
+        if guest_name:
+            notice += (f"\n入住人「{guest_name}」已记下，"
+                       f"选好房型回复序号就能重新{action}。")
+
+        if refreshed is None or not refreshed.rate_plans:
+            self.state.pending_booking = {}
+            blocks = [notice, "这家酒店目前没有可预订的房型了（大概率已售罄）。"]
+            if self.state.search_results:
+                self.state.selected_hotel = None
+                self.state.stage = "recommend"
+                blocks.append("已帮你回到酒店列表，可以换一家看看：\n")
+                blocks.append(self._render_search_view())
+            else:
+                self.state.selected_hotel = None
+                self.state.stage = "intent"
+                blocks.append("回复【重新查询】可以按原条件再搜一次，"
+                              "或告诉我新的城市/日期。")
+            response = "\n".join(blocks)
+            self.state.conversation_history.append(f"助手：{response}")
+            return response
+
+        response = notice + "\n\n" + render_hotel_selection(
+            refreshed, p, show_login_hint=False,
+            guest_name=guest_name, heading="刷新后的可订房型：")
+        self.state.conversation_history.append(f"助手：{response}")
+        return response
+
     def _do_real_price_confirm(self, draft: dict) -> str:
         """
         真实下单第 1 步：调用道旅验价接口锁定实时价格，拿到 referenceNo。
@@ -674,19 +830,29 @@ class HotelBookingAgent:
         except rlg.RollingGoAuthError as e:
             return f"验价失败：{e}"
         except rlg.RollingGoApiError as e:
+            # 6201（房型不可售）：刷新房型、回退选房，而不是让用户原样再试
+            if rlg.is_rate_unavailable_error(e):
+                return self._recover_unavailable_rate(
+                    e, rate_plan_id=rate_plan.rate_plan_id,
+                    guest_name=guest_name,
+                    email=draft.get("email_override") or "")
             self.state.booking_context = {}
             return (
                 f"验价失败：{e}\n"
-                f"该房型报价可能已变动或售罄，请重新回复房型序号 + 入住人姓名再试。"
+                f"这不是房型售罄，而是接口/参数层面的报错，可以稍后重试；"
+                f"回复【返回上一级】可回到酒店列表换一家。"
             )
 
         if not price_info.get("reference_no"):
-            print(f"[验价响应缺少 referenceNo] {price_info.get('raw')}")
-            self.state.booking_context = {}
-            return (
-                "验价接口未返回预订参考号（referenceNo），暂时无法下单。"
-                "请稍后重试，或换一个房型再试。"
-            )
+            # 只打印字段名，不打印 raw：验价响应含 recentGuests（姓名/手机/邮箱）
+            raw = price_info.get("raw")
+            keys = sorted(raw) if isinstance(raw, dict) else type(raw).__name__
+            print(f"[验价响应缺少 referenceNo] keys={keys}")
+            return self._recover_unavailable_rate(
+                "验价接口未返回预订参考号（referenceNo），这档报价可能已失效",
+                rate_plan_id=rate_plan.rate_plan_id,
+                guest_name=guest_name,
+                email=draft.get("email_override") or "")
 
         names = rlg.split_cn_name(guest_name)
         email_override = draft.get("email_override")
@@ -908,14 +1074,24 @@ class HotelBookingAgent:
             return f"下单失败：{e}\n登录恢复后请重新选择房型并验价。"
         except rlg.RollingGoApiError as e:
             # 常见原因：验价超时 referenceNo 失效、房型售罄
+            if rlg.is_rate_unavailable_error(e):
+                chosen = ctx.get("chosen_recent") or {}
+                return self._recover_unavailable_rate(
+                    e, rate_plan_id=ctx["rate_plan_obj"].rate_plan_id,
+                    guest_name=chosen.get("name") or ctx.get("guest_name", ""),
+                    email=email, action="下单")
             self.state.booking_context = {}
             self.state.stage = "booking"
             return (
                 f"下单失败：{e}\n"
-                f"多为验价价格已超时或房型被抢完，请重新选择房型（我会重新验价）。"
+                f"这不是房型售罄，而是接口/参数层面的报错；"
+                f"回复【返回上一级】可回到酒店列表换一家。"
             )
 
-        print(f"[道旅下单响应] {result.get('raw')}")
+        # 只打印状态与字段名，不打印 raw：下单响应可能带联系人/入住人信息
+        raw = result.get("raw")
+        keys = sorted(raw) if isinstance(raw, dict) else type(raw).__name__
+        print(f"[道旅下单响应] status={result.get('status')} keys={keys}")
         if not result.get("order_no"):
             self.state.booking_context = {}
             self.state.stage = "booking"

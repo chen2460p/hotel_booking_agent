@@ -134,6 +134,9 @@ class AgentState:
     # 搜索结果版本号：每次重新搜索（列表被替换）时更新；前端结构化选店必须带它，
     # 版本不一致直接拒绝，避免用户点到旧列表里的酒店
     search_revision: str = ""
+    # 房型列表版本号：每次选中酒店、重新拉取实时报价时更新；结构化选房必须带它，
+    # 不一致直接拒绝，避免按旧房型列表选到错档报价
+    rooms_revision: str = ""
     # 本次回复对应的酒店列表视图：{kind, revision, intro, outro}。
     # Web 端据此用结构化 items 渲染卡片；非酒店列表回复时为空
     last_view: dict = field(default_factory=dict)

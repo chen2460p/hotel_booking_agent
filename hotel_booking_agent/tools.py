@@ -528,10 +528,17 @@ def create_real_order(hotel: Hotel, params: BookingParams, room_type: str,
 
 def pay_order(order_id: str) -> bool:
     """
-    工具5：支付订单
-    高危操作——真实场景需要接入支付网关 + 短信验证
-    这里模拟支付成功
+    工具5：支付【模拟】订单
+    高危操作——真实场景需要接入支付网关 + 短信验证，这里只模拟本地状态。
+
+    真实道旅订单**不允许**本地标记已支付：那会写入 paid_at，破坏订单审计，
+    且钱并没有付。真实单只能由用户打开收银台链接自行支付。
     """
+    order = storage.get_order(order_id)
+    if order is None:
+        return False
+    if order.source == "rollinggo":
+        return False
     ok = storage.update_status(order_id, "paid")
     if ok:
         _invalidate_history_cache()

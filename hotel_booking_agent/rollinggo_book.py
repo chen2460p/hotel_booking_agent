@@ -117,7 +117,8 @@ def token_status() -> str:
     if expires_in and saved_at:
         left = int(saved_at) + int(expires_in) - int(time.time())
         tail = f"，约 {max(left, 0) // 60} 分钟后过期" if left > 0 else "（已过期，请重新登录）"
-    return f"已登录（token: {access[:16]}...）{tail}"
+    # 不回显 token 片段：日志/截图外泄时不留凭证材料
+    return f"已登录（token 已保存）{tail}"
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +267,30 @@ def _raise_if_business_error(data: Any) -> None:
     msg = (data.get("message") or data.get("msg")
            or data.get("errorMsg") or str(data)[:300])
     raise RollingGoApiError(f"道旅业务错误 code={code}：{msg}")
+
+
+# 房型报价已变动/售罄这类「可恢复」业务错误：换一档报价或刷新实时房型
+# 就能继续，不该让用户拿着同一档失效报价反复重试（6201 = Price confirm failed）
+_RATE_UNAVAILABLE_HINTS = (
+    "no room available", "room not available", "rooms not available",
+    "no availability", "sold out", "price confirm failed",
+    "库存不足", "售罄", "无房", "房型已售",
+)
+
+
+def is_rate_unavailable_error(error: Any) -> bool:
+    """判断错误是否为「房型报价已变动或售罄」（可换房型继续，而非原样重试）。
+
+    道旅验价/下单失败时只在 message 里给 "code=6201：Price confirm failed:
+    No room available"，所以按 code 与文案双重识别，避免把登录失效、
+    参数错误这类问题误判成售罄。
+    """
+    text = str(error or "").lower()
+    if not text:
+        return False
+    if re.search(r"code\s*[=:：]\s*['\"]?6201(?!\d)", text):
+        return True
+    return any(h in text for h in _RATE_UNAVAILABLE_HINTS)
 
 
 def _is_success(data: Any) -> bool:

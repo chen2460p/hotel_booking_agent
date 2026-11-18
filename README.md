@@ -7,6 +7,8 @@
 - LLM 支持通义千问 DashScope（无 Key 时自动降级为内置规则引擎，零配置也能跑）
 - 同一套工具层同时服务 **ReAct + Workflow 混合版**与 **Supervisor-Worker 多 Agent 版**两个入口
 
+> 用 AI 编码工具（Claude Code / Cursor / Trae / DSH 等）改这个仓库前，先读根目录 [AGENTS.md](AGENTS.md)：运行目录、测试红线、真实交易接口禁令、分层约定都在那里。
+
 ---
 
 ## 目录
@@ -22,6 +24,7 @@
 - [数据降级矩阵](#数据降级矩阵)
 - [模块说明](#模块说明)
 - [核心数据模型](#核心数据模型)
+- [测试与评测](#测试与评测)
 - [常见问题](#常见问题)
 - [免责声明](#免责声明)
 
@@ -32,11 +35,12 @@
 - **自然语言预订**：「帮我订下周六成都的酒店，预算 300 以内，住两晚」→ LLM 自动提取城市/日期/预算/星级（含口语日期换算：明天、后天、这周末、下周末、"住三天"晚数推断）；多轮对话里先答入住再补离店不会互相覆盖
 - **真实酒店搜索**：道旅 `searchHotels` 返回全国城市实时可订酒店、展示价、星级、设施标签；支持按星级、每晚预算服务端筛选；**带 POI（故宫/中街/春熙路/高铁站/大学/中小学/医院）搜索时每条酒店附带直线距离，并按"近→远"排序**；POI 搜索有距离结果时不再补城市搜索，避免市中心/下辖县酒店混入
 - **地名笔误确认**：如「南宁是第二中学」这种「市/是」笔误，或「大年市西安路」这种城市名笔误（→大连市），先提示「我猜你想说的是『大连市西安路』附近，对吗？」，用户确认后才搜索，避免按错地名查出一堆无关酒店
-- **实时房型报价**：道旅 `getHotelDetail` 返回同房型下含早/退改等上百条报价，程序按房型聚合、每房型保留最多 4 档代表性报价（最低价 / 含早 / 可取消 / 申请确认），**同房型多档对比**并标出差价；每个房型配**多张实拍图**（道旅 `roomInfo.images` 单图 + 携程官方相册按房型名模糊匹配补齐，每房型最多 8 张）
+- **实时房型报价**：道旅 `getHotelDetail` 返回同房型下含早/退改等上百条报价，程序按房型聚合、每房型保留最多 4 档代表性报价（最低价 / 含早 / 可取消 / 申请确认），**同房型多档对比**并标出差价；每个房型配**多张实拍图**（道旅 `roomInfo.images` 单图 + 携程官方相册按房型名模糊匹配补齐，每房型最多 8 张；携程抓取仅限本地演示，勿用于生产/商用）
 - **真实验价 + 下单**：道旅 OAuth REST 接口 `/hotelpriceconfirm`（锁价拿 `referenceNo`）→ `/hotelbook`（创建订单拿 `orderNo` + `paymentUrl`）→ `/hotelorders`（查单）
 - **历史订单查询**：对话里说「查我的历史订单 / 查待支付的订单 / 查已取消的订单」即可拉取道旅账号全部真实订单（跨会话保留），支持按状态筛选；未登录时降级展示本次会话的本地订单并引导登录
 - **Web 多会话与聊天记录保留**：聊天记录按会话缓存在浏览器 `localStorage`，从「查看历史订单」返回或刷新页面后自动恢复（含已展开的酒店、滚动位置）；顶栏可切换历史会话或「＋ 新建会话」。服务端上下文 30 分钟无活动会过期，前端会提示「历史仍在、上下文已重置」
 - **酒店列表结构化下发（防幻觉、防错位）**：酒店信息只保留在服务端会话（`search_results` + `search_revision`），Web 端通过 `GET /api/session/{id}/hotels` 取结构化 items 渲染卡片；选店走 `POST /api/session/{id}/select`（`hotel_id` + `revision`），不经过 LLM、也不按序号猜。旧列表/会话过期由后端拒绝（409/404）并把卡片置灰，避免用户点到上一轮的第 N 家
+- **房型列表结构化下发**：选中酒店后，`ChatResponse.rooms_view` 直接给出房型 × 报价档（`room_no` / `plan_no` / `plan_key`（即 `rate_plan_id`）/ 每晚价 / 总价 / 餐食 / 退改 / 图片），编号与文本渲染同源（都走 `plan_groups`）；选房走 `POST /api/session/{id}/room`（`room_no` + `plan_no` + `rooms_revision`），**不再解析回复文本里的「2-1」**，旧房型列表返回 409
 - **订单时间可追溯**：下单时间（道旅 `orderDate` / 本地 `created_at`）与支付时间（`paid_at`）分开存储、互不覆盖；列表按下单时间倒序，已支付订单在明细行单独展示支付时间。道旅接口没有支付时间字段时显示 `-`，不拿创建时间冒充
 - **真实订单取消**：说「取消订单 订单号」先走 pre-cancel 查询罚金/退款并拿 10 分钟凭证，用户明确回复「确认取消」后才提交 confirm-cancel；不可在线取消时原样展示道旅客服指引。Web 订单页同样支持两步取消
 - **资金安全设计**：验价与下单两步分离、强制二次确认、常用入住人须用户确认后才使用、**程序只拿到支付链接，绝不在程序内完成支付**
@@ -80,28 +84,53 @@
 
 ```
 .
-├── README.md                  # 本文档
-├── .gitignore                 # 忽略 .env / __pycache__
-└── hotel_booking_agent/       # 全部源码与配置（运行时请进入此目录）
-    ├── .env.example           # 配置模板（复制为 .env 后填 Key）
-    ├── main.py                # 入口①：ReAct + Workflow 混合版（真实下单链路在这）
-    ├── main_multi.py          # 入口②：Supervisor-Worker 多 Agent 协作版
-    ├── web.py                 # 入口③：FastAPI + Web 聊天界面（图片内嵌、多轮会话池、结构化酒店卡片）
-    ├── templates/index.html   # Web 前端（referrer=no-referrer 防道旅 CDN 403）
-    ├── agent.py               # 主版对话 Agent：状态机、选店选房、验价确认编排
-    ├── multi_agent.py         # 多 Agent：Supervisor/Search/Booking/Service/Review
-    ├── agent_common.py        # 单/多 Agent 共用：参数合并、选店选房、姓名/订单解析、渲染
-    ├── cli_common.py          # 两个终端入口共用：显示宽度计算与欢迎横幅
-    ├── text_rules.py          # 姓名/订单状态规则（llm 与 agent_common 共用）
-    ├── text_utils.py          # 名称归一/相似度（携程、高德、评分匹配共用）
-    ├── llm.py                 # LLM 封装：DashScope 真实模式 + 规则引擎模拟模式
-    ├── models.py              # dataclass：Hotel / RoomRatePlan / BookingParams / Order / AgentState
-    ├── tools.py               # 工具层：三级回退搜索、详情、计价、下单/取消、订单存储
-    ├── rollinggo_mcp.py       # 道旅 MCP（Streamable HTTP）客户端：搜索 + 房型报价
-    ├── rollinggo_book.py      # 道旅 OAuth REST：登录/验价/下单/查单/取消（也支持命令行）
-    ├── amap_poi.py            # 高德 Web 服务 POI 文本搜索适配器
-    └── rag.py                 # 酒店评价 RAG（Embedding 召回 + 重排）
+├── AGENTS.md                     # 给 AI 编码助手的项目约定（动手前先读）
+├── README.md                     # 本文档
+├── .gitignore                    # 忽略 .env / *.db / __pycache__ / 测试临时目录
+├── .dockerignore                 # Docker 构建上下文排除
+├── Dockerfile                    # 镜像构建；单 worker，勿加 --workers
+├── docker-compose.yml            # 单机部署编排（显式 name: hotel-booking）
+├── DOCKER.md                     # 部署与运维说明
+├── .gitea/workflows/deploy.yml   # push main 自动部署；宿主端口 9122
+├── scripts/                      # 评测与部署自检（从仓库根执行）
+│   ├── eval_nlu.py               # 120 条 NLU 评测（3 模型 × raw/pipeline）
+│   ├── eval_nlu_cases.json       # 评测用例集
+│   ├── eval_nlu_report.md        # 最新评测报告（资产，随代码提交）
+│   ├── eval_nlu_baseline.md      # 修复前基线
+│   ├── eval_nlu_results.json     # 逐条明细
+│   └── preflight.py              # 部署前 30 秒自检
+├── tests/                        # 全部测试（从仓库根执行）
+│   ├── run_all.py                # 离线单测总入口，自动发现 test_*_unit.py
+│   ├── test_api_smoke.py         # 接口冒烟，需先起服务
+│   └── test_*_unit.py            # 离线单测（NLU/选店/房型/取消/订单时间/支付守卫…）
+└── hotel_booking_agent/          # 业务源码与配置（运行时进入此目录）
+    ├── .env.example              # 配置模板（复制为 .env 后填 Key）
+    ├── requirements-web.txt      # Web 依赖 + 通用依赖
+    ├── 启动前端.bat              # Windows 一键起 Web（chcp 65001 + python web.py）
+    ├── main.py                   # 入口①：ReAct + Workflow 混合版（真实下单链路在这）
+    ├── main_multi.py             # 入口②：Supervisor-Worker 多 Agent 协作版
+    ├── web.py                    # 入口③：FastAPI + Web 聊天界面
+    ├── templates/index.html      # Web 前端（referrer=no-referrer 防道旅 CDN 403）
+    ├── agent.py                  # 主版状态机：选店选房、验价确认编排
+    ├── multi_agent.py            # 多 Agent：Supervisor/Search/Booking/Service/Review
+    ├── agent_common.py           # 单/多 Agent 共用纯逻辑：合并参数、选店选房、渲染
+    ├── cli_common.py             # 终端入口共用：显示宽度计算与欢迎横幅
+    ├── text_rules.py             # 姓名/订单状态规则
+    ├── text_utils.py             # 名称归一/相似度（携程、高德、评分匹配共用）
+    ├── llm.py                    # LLM 封装：DashScope 真实模式 + 规则引擎降级
+    ├── nlu_corrections.py        # NLU 后处理：改口 / 否定约束 / 跨月与倒挂日期
+    ├── geo_data.py               # 地级市中心坐标表，校正 POI 编码偏差
+    ├── models.py                 # dataclass：Hotel / RoomRatePlan / BookingParams / Order / AgentState
+    ├── tools.py                  # 工具层：三级回退搜索、详情、计价、下单/取消
+    ├── storage.py                # 订单存储抽象：SQLite / MySQL / 内存自动回退
+    ├── rag.py                    # 酒店评价 RAG（Embedding 召回 + 重排）
+    ├── rollinggo_mcp.py          # 道旅 MCP 客户端：搜索 + 房型报价
+    ├── rollinggo_book.py         # 道旅 OAuth REST：登录/验价/下单/查单/取消
+    ├── amap_poi.py               # 高德 Web 服务 POI 文本搜索适配器
+    ├── ctrip_crawler.py          # 携程图集/评分抓取（仅教学演示，禁止商用）
+    └── hotel_rating.py           # 真实住客评分富化：携程→百度→高德，7 天缓存
 ```
+
 
 ## 环境准备
 
@@ -125,9 +154,11 @@ Copy-Item .env.example .env   # PowerShell
 
 | 配置项 | 必填 | 使用模块 | 作用 |
 |---|---|---|---|
-| `DASHSCOPE_API_KEY` | 否 | llm.py / rag.py | 通义千问 Key；留空 → 意图识别用规则引擎、Embedding 用 TF-IDF。**默认模型 qwen3.8-flash**（走 DashScope OpenAI 兼容接口，可通过 `DASHSCOPE_MODEL` 覆盖） |
-| `DASHSCOPE_MODEL` | 可选 | llm.py | 覆盖默认 LLM 模型名（如 `qwen3.8-flash` / `qwen3.8-max` / `qwen-plus`） |
+| `DASHSCOPE_API_KEY` | 否 | llm.py / rag.py | 通义千问 Key；留空 → 意图识别用规则引擎、Embedding 用 TF-IDF。**默认模型 deepseek-v4.1-flash**（走 DashScope OpenAI 兼容接口，可通过 `DASHSCOPE_MODEL` 覆盖） |
+| `DASHSCOPE_MODEL` | 可选 | llm.py | 覆盖默认 LLM 模型名（如 `deepseek-v4.1-flash` / `qwen-flash` / `qwen3.8-flash`；120 条 NLU 评测见 `scripts/eval_nlu_report.md`） |
+| `DASHSCOPE_TIMEOUT` | 可选 | llm.py | 单次对话读取超时（秒），默认 30；超时自动回退规则引擎，避免思考模型长尾卡住一条消息 |
 | `AMAP_API_KEY` | 选填 | amap_poi.py | 高德「**Web 服务**」类型 Key；道旅不可用时的 POI 回退（无价格） |
+| `BAIDU_MAP_AK` | 选填 | hotel_rating.py | 百度地图「**服务端**」AK；评分富化的次选源（携程 → 百度 → 高德），留空则跳过。线上需在仓库 Secrets 配置同名变量才生效 |
 | `ROLLINGGO_API_KEY` | 真实搜索必填 | rollinggo_mcp.py | 道旅开发者 Key（`mcp_` 开头），用于酒店搜索与实时房价 |
 | `ROLLINGGO_MCP_URL` | 可选 | 两个 rollinggo 模块 | 默认 `https://mcp.rollinggo.cn/mcp`；国际站改 `https://mcp.rollinggo.ai/mcp` |
 | `ROLLINGGO_OAUTH_SERVER` | 可选 | rollinggo_book.py | OAuth 中转，默认 `https://rollinggo.store` |
@@ -136,11 +167,14 @@ Copy-Item .env.example .env   # PowerShell
 | `ROLLINGGO_ACCESS_TOKEN` | 可选 | rollinggo_book.py | 直接注入 access token，优先于本地 token 文件 |
 | `ROLLINGGO_TOKEN_FILE` | 可选 | rollinggo_book.py | token 存储路径，默认 `~/.hotel-cli/token.json` |
 
+评分富化的 QPS 节流可用 `BAIDU_QPS_LIMIT` / `AMAP_QPS_LIMIT` / `CTRIP_QPS_LIMIT` 调整（默认 2 / 5 / 2），一般无需修改。
+
 Key 申请地址：
 
 - 道旅：`https://travelportal-partner-center.dida.com/register?lang=zh`（注册后拿 `mcp_` 开头 Key；下单权限通过 OAuth 登录授权，见下节）
 - DashScope：`https://dashscope.console.aliyun.com/`
 - 高德：`https://lbs.amap.com/`（注意必须创建 **Web 服务** 类型 Key）
+- 百度地图：`https://lbsyun.baidu.com/`（创建 **服务端** AK，用于评分次选源）
 
 `.env` 已被 `.gitignore` 忽略，不会提交；仓库里只提供 `.env.example`。
 
@@ -152,8 +186,8 @@ $env:PYTHONUTF8 = "1"
 cd hotel_booking_agent
 
 # 首次使用真实下单：浏览器授权一次（token 存到 ~/.hotel-cli/token.json，约 14 天有效）
-python rollinggo_book.py login
-python rollinggo_book.py          # 不带参数 = 查看登录状态
+python rollinggo_book.py login     # 浏览器授权一次
+python rollinggo_book.py status    # 查看登录状态（有效期以 status 输出为准）
 
 # 启动主版（支持真实下单全链路）
 python main.py
@@ -188,6 +222,10 @@ python main_multi.py
 
 你 > 取消          # 验价后任何时候都可放弃，referenceNo 随即作废
 ```
+
+验价若提示「该房型报价可能已变动或售罄」（道旅 `code=6201`），不会让你对着同一档反复重试：
+助手会重新拉取该酒店的实时房型、剔除刚验价失败的那一档，并回到选房步骤——
+已填的入住人姓名会保留，只需选新房型序号；整家酒店都查不到可订房型时，自动退回酒店列表换一家。
 
 真实订单创建后不想要了：
 
@@ -269,7 +307,8 @@ orderNo + paymentUrl（通用收银台，用户自行打开支付）
 | 文件 | 关键内容 |
 |---|---|
 | `models.py` | 全部 dataclass；`Hotel` 含 `distance_m`（距 POI 直线距离米）与 `distance_to`（参照地标名）；`BookingParams.is_complete()/missing_fields()` 驱动参数追问；`Order.source` 区分 mock/rollinggo |
-| `llm.py` | `LLMClient.extract_intent_and_params()`：意图 book/search/order_query/cancel/chat + 结构化参数；默认模型 qwen3.8-flash（OpenAI 兼容接口，`DASHSCOPE_MODEL` 可覆盖）；含口语日期换算（今天/明天/后天/住三天）与裸数字日期对（回「12 15」= 12 号入住、15 号离店）；含错误日志直接打印 status/code/message |
+| `llm.py` | `LLMClient.extract_intent_and_params()`：意图 book/search/order_query/cancel/chat + 结构化参数；默认模型 deepseek-v4.1-flash（OpenAI 兼容接口，`DASHSCOPE_MODEL` 可覆盖）；含口语日期换算（今天/明天/后天/住三天）与裸数字日期对（回「12 15」= 12 号入住、15 号离店）；改口/否定/跨月日期走 `nlu_corrections` 确定性后处理；含错误日志直接打印 status/code/message |
+| `nlu_corrections.py` | 模型抽取之后的确定性修正层：`apply_text_corrections()` 处理多轮改口（"不是成都，是重庆"）与否定约束（"不要海景房"），`normalize_dates()` 处理过去日期前滚、离店早于入住时的跨月推断；真实模型与规则引擎两条路径共用，单/多 Agent 一致 |
 | `tools.py` | `search_hotels()` 三级回退；`get_hotel_detail(live=True)` 实时富化；`create_order()` 模拟单；`create_real_order()` 道旅真单；`find_order()` 本地/远端订单查找；`pre_cancel_real_order() / confirm_cancel_real_order()` 真实单两步取消；`list_history_orders()` 历史订单（远程+本地合并、状态筛选、按下单时间倒序）；运行时酒店缓存；`format_hotel_list()` 在有 POI 距离时输出距离行 |
 | `storage.py` | 订单存储抽象：SQLite/MySQL/内存自动回退；orders 表含 `created_at/paid_at/updated_at`，首次启动自动补列并把旧 `created_at` 从 UTC 转本地时区；状态变更只刷新 `updated_at`，首次支付写 `paid_at`，永不覆盖 `created_at` |
 | `rollinggo_mcp.py` | `RollingGoMCPClient`：MCP 握手、JSON/SSE 双解析；搜索参数构造（`hotelTags.maxPricePerNight` 等）；报价按「房型 + 餐食 + 退改 + 申请确认 + 床型 + 入住人数」分桶，每房型保留最多 4 档代表性报价；POI 距离透传（`distanceInMeters`）；地标识别扩展到 街/路/大道；排序策略：有 POI 距离时按"近→远"、未知沉底，否则地标词命中优先 |
@@ -278,9 +317,14 @@ orderNo + paymentUrl（通用收银台，用户自行打开支付）
 | `agent.py` | 主状态机：选店、验价确认卡编排、下单与取消（选择/解析/渲染细节走 `agent_common`） |
 | `multi_agent.py` | `AgentMessage` 消息队列 + `AgentState` 共享黑板；Supervisor 分发 Search/Booking/Service/Review 四个 Worker |
 | `agent_common.py` | 两套架构共用的纯逻辑：`merge_params / parse_hotel_selection / match_room_choice / extract_guest_name / detect_order_filter / render_hotel_results_parts / render_hotel_selection / chat_reply` 等，含同房型多档报价的分组、差价展示与 `1-2` 选择解析 |
-| `web.py` | FastAPI 入口：会话池（30 分钟 TTL）、SSE 阶段推送、结构化酒店列表 `GET /api/session/{id}/hotels` 与按 `hotel_id + revision` 选店 `POST /api/session/{id}/select`（旧列表 409）；`hotel_view` 只由服务端搜索结果生成 |
+| `web.py` | FastAPI 入口：会话池（30 分钟 TTL）、SSE 阶段推送、结构化酒店列表 `GET /api/session/{id}/hotels` 与按 `hotel_id + revision` 选店 `POST /api/session/{id}/select`（旧列表 409）；选中酒店后返回 `rooms_view`（房型 × 报价档，`plan_key` 即 `rate_plan_id`），按 `room_no + plan_no + rooms_revision` 选房 `POST /api/session/{id}/room`（不解析文本，旧房型列表 409）；`hotel_view` 只由服务端搜索结果生成 |
 | `cli_common.py` | 终端入口共用：`display_width()` 与 `print_banner(rows)`（按显示宽度生成 ASCII 横幅） |
 | `rag.py` | 模拟评价语料切块、Embedding 双模式、召回+重排+生成 |
+| `text_rules.py` | 姓名与订单状态的文本规则，`llm.py` 与 `agent_common.py` 共用，避免两处各写一套 |
+| `text_utils.py` | 名称归一与相似度打分，携程、高德、评分匹配三处共用同一套算法 |
+| `geo_data.py` | 全国地级行政区中心坐标表。道旅 POI 地理编码不可靠（实测把"大连西安路"编到西安），用城市中心坐标校验返回酒店的经纬度距离；精度约 0.1 度，足够 60~150 公里级判定 |
+| `ctrip_crawler.py` | 携程联想搜索拿 `hotelId` 与评分、详情页 SSR 拿图集，作为房型图片回退。**仅个人学习/教学演示，禁止生产或商用部署**（模块头有完整法律声明） |
+| `hotel_rating.py` | 真实住客评分富化：携程优先 → 百度其次 → 高德兜底，每条结果标注来源、绝不编造评分。7 天正缓存 + 确认无评分时的 3 天负缓存，内含 QPS 令牌桶节流 |
 | `main.py` / `main_multi.py` | 两个终端入口，仅做输入输出循环 |
 
 ## 核心数据模型
@@ -296,6 +340,19 @@ Order          # order_id, ..., status(pending/paid/cancelled),
 BookingParams  # city / check_in / check_out（必填）, min_star,
                # max_price, facilities, keyword（选填）
 ```
+
+## 测试与评测
+
+```powershell
+python tests/run_all.py          # 离线单测总入口（约 10 秒，不联网、不写 orders.db）
+python tests/test_api_smoke.py   # 接口冒烟：需先起服务（BASE_URL 可覆盖，默认 8000）
+python scripts/eval_nlu.py       # 120 条 NLU 评测，约 30 分钟（3 模型 × raw/pipeline）
+```
+
+- 单个测试文件都能直接跑：`python tests/test_cancel_unit.py`；装了 pytest 可 `pytest tests/ -v --ignore=tests/test_api_smoke.py`
+- 真实模型/供应链用例默认关闭，用 `RUN_LLM_TESTS=1` 单独开启，别塞进回归
+- 快速跑评测时用 `--limit N --out <临时文件> --json-out <临时文件>`，避免覆盖正式报告
+- 评测结果：最新看 `scripts/eval_nlu_report.md`，修复前基线看 `scripts/eval_nlu_baseline.md`，逐条明细在 `scripts/eval_nlu_results.json`
 
 ## 常见问题
 

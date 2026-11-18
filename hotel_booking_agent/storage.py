@@ -417,3 +417,18 @@ def list_all_orders() -> List[Order]:
     except Exception as e:
         print(f"[storage] list_all_orders 失败：{e}")
         return list(_mem_db.values())
+
+
+def close() -> None:
+    """关闭底层连接并重置初始化状态。
+
+    Windows 下 SQLite 文件句柄不释放时，测试临时目录 rmtree 会失败；
+    测试收尾 / 需要切换 DATABASE_URL 的场景先调它。
+    """
+    global _conn, _initialized
+    if _conn is not None:
+        try:
+            _conn.close()
+        finally:
+            _conn = None
+    _initialized = False

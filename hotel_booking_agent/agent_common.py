@@ -13,6 +13,7 @@ from typing import List, Optional
 
 from models import BookingParams, Hotel, RoomRatePlan
 from llm import shift_date
+from nlu_corrections import normalize_dates
 from geo_data import (
     find_city, find_similar_city, get_city_coord, infer_city_from_location,
 )
@@ -245,6 +246,13 @@ def merge_params(state, extracted: dict, user_input: str = "") -> None:
         p.keyword = extracted["keyword"]
     if "location" in extracted:
         p.location = extracted["location"]
+    # 本轮被否定的约束（"不要海景房"）：把之前已生效的同类条件清掉，
+    # 否则用户改主意后仍会被旧关键词过滤
+    for term in (extracted.get("_negated") or []):
+        if p.keyword and term in p.keyword:
+            p.keyword = None
+        if p.facilities:
+            p.facilities = [f for f in p.facilities if term not in str(f)]
     # 清理 LLM 误带进 location 的口语前缀（“我查询南宁…”）
     p.location = normalize_location(p.location, p.city)
     # LLM 剥离城市前缀时可能留下孤立的“市”（“大连市西安路”→“市西安路”），
@@ -256,6 +264,12 @@ def merge_params(state, extracted: dict, user_input: str = "") -> None:
     if not p.city:
         p.city = (infer_city_from_location(p.location or "")
                   or find_city(user_input))
+    # 多轮叠加后仍可能出现倒挂/过去的日期（"改成后天"+"原来的离店日"），
+    # 合并完统一修正：过去日期前滚，离店早于入住时按跨月推断，修不了才丢弃
+    merged_dates = {"check_in": p.check_in, "check_out": p.check_out}
+    normalize_dates(merged_dates, user_input)
+    p.check_in = merged_dates.get("check_in")
+    p.check_out = merged_dates.get("check_out")
 
 
 def calc_nights(check_in: str, check_out: str) -> int:
@@ -309,6 +323,7 @@ def reset_booking_state(state) -> None:
     state.params = BookingParams()
     state.search_results = []
     state.search_revision = ""
+    state.rooms_revision = ""
     state.last_view = {}
     state.selected_hotel = None
     state.current_order = None
@@ -793,12 +808,114 @@ def load_hotel_selection_detail(hotel: Hotel, params) -> Hotel:
     return detail or hotel
 
 
+def drop_rate_plan(hotel: Hotel, rate_plan_id: str) -> Hotel:
+    """把验价/下单刚失败的报价从房型列表里摘掉（就地修改并返回同一对象）。
+
+    道旅返回 6201（房型不可售）后，详情接口可能还没把这档报价摘掉；
+    继续把同一档摆给用户，只会让他再撞一次 6201。这里先本地剔除，
+    保证「回退到选房」的列表里都是还能继续尝试的报价。
+    剔除后重排房型序号/报价序号，让列表保持 1..N 连续——否则某个房型
+    整组消失会留下空号，用户回复空号会被当成无法解析。
+    """
+    if hotel is None or not rate_plan_id:
+        return hotel
+    plans = list(getattr(hotel, "rate_plans", None) or [])
+    kept = [p for p in plans if p.rate_plan_id != rate_plan_id]
+    if len(kept) == len(plans):
+        return hotel
+
+    if any(getattr(p, "room_no", 0) for p in kept):
+        renumbered = []
+        for room_no, group in enumerate(plan_groups(kept), 1):
+            for plan_no, rp in enumerate(group[1], 1):
+                rp.room_no = room_no
+                rp.plan_no = plan_no
+                rp.is_lowest = plan_no == 1
+                renumbered.append(rp)
+        kept = renumbered
+
+    hotel.rate_plans = kept
+    hotel.room_types = list(dict.fromkeys(p.room_name for p in kept))
+    if kept:
+        hotel.price_per_night = min(p.price_per_night for p in kept)
+    return hotel
+
+
+def rooms_view(hotel: Hotel, params, revision: str = "") -> Optional[dict]:
+    """选中酒店后的房型结构化视图（Web 卡片 / 结构化选房 / 后续 CLI 共用）。
+
+    编号与 render_hotel_selection 完全一致（都走 plan_groups）：
+    room_no 是展示用的房型序号（1 起），plan_no 是房型内报价序号（1 起），
+    plan_key 即 rate_plan_id（下单必需）。调用方按这两个序号选房，
+    不必再解析回复文本里的「2-1」。
+
+    没有实时报价（模拟库/高德回退）时返回 None，调用方继续走文本/模拟链路。
+    """
+    if hotel is None or not getattr(hotel, "rate_plans", None):
+        return None
+    nights = max(calc_nights(params.check_in, params.check_out), 0)
+    groups = plan_groups(hotel.rate_plans)
+    max_rooms = 8                      # 与文本渲染一致：首屏最多 8 种房型
+    shown = groups[:max_rooms]
+
+    rooms = []
+    for room_no, plans in shown:
+        head = plans[0]
+        lowest = min(p.price_per_night for p in plans)
+        rooms.append({
+            "room_no": room_no,
+            "room_name": head.room_name,
+            "bed_type": head.bed_type or "",
+            "room_size": _size_text(head.room_size),
+            "max_occupancy": int(head.max_occupancy or 0),
+            "on_request": any(bool(p.on_request) for p in plans),
+            "images": plan_group_images(plans),
+            "plans": [
+                {
+                    "plan_no": i + 1,
+                    "plan_key": p.rate_plan_id or "",
+                    "price_per_night": p.price_per_night,
+                    "total_price": round(p.price_per_night * nights, 2),
+                    "currency": "CNY",
+                    "meal": _meal_text(p),
+                    "cancelable": bool(p.cancelable),
+                    "cancel_known": bool(getattr(p, "cancel_known", True)),
+                    "cancel_policy": p.cancel_policy or "",
+                    "on_request": bool(p.on_request),
+                    "is_lowest": abs(p.price_per_night - lowest) <= 0.001,
+                }
+                for i, p in enumerate(plans)
+            ],
+        })
+
+    return {
+        "rooms_revision": revision or "",
+        "hotel_id": hotel.hotel_id,
+        "hotel_name": hotel.name,
+        "check_in": params.check_in,
+        "check_out": params.check_out,
+        "nights": nights,
+        "currency": "CNY",
+        "total_rooms": len(groups),
+        "shown_rooms": len(shown),
+        "truncated": len(groups) > max_rooms,
+        "rooms": rooms,
+    }
+
+
 def render_hotel_selection(hotel: Hotel, params,
-                           show_login_hint: bool = False) -> str:
-    """渲染选中酒店后的房型/价格展示（单 Agent / 多 Agent 共用）。"""
+                           show_login_hint: bool = False,
+                           guest_name: str = "",
+                           heading: str = "") -> str:
+    """渲染选中酒店后的房型/价格展示（单 Agent / 多 Agent 共用）。
+
+    guest_name：入住人姓名已记下时（如验价失败后回退选房），
+                收尾提示只需要用户选房型，不再重复要姓名。
+    heading：首行引导语，默认「好的，你选择了：」；刷新报价后可用别的说法。
+    """
     nights = calc_nights(params.check_in, params.check_out)
     header = (
-        f"好的，你选择了：{hotel.name}\n"
+        f"{heading or '好的，你选择了：'}{hotel.name}\n"
         f"地址：{hotel.address}\n"
         f"入住：{params.check_in} → {params.check_out}（{nights}晚）\n"
     )
@@ -858,10 +975,16 @@ def render_hotel_selection(hotel: Hotel, params,
             room_lines.append(
                 "（同一房型有多档报价时，回复「房型序号-报价序号」选择，"
                 "如 1-2；只回复 1 默认最低价）")
-        room_lines.append(
-            "\n请告诉我：选择哪个房型（回复序号或房型名）+ 入住人姓名？"
-            "\n（例如：1，入住人张三）"
-            "\n（不喜欢这家酒店？回复「返回上一级」回到酒店列表重新选）")
+        if guest_name:
+            room_lines.append(
+                "\n请告诉我：选择哪个房型（回复序号或房型名）？"
+                f"\n（入住人「{guest_name}」已记下，想换人直接说新姓名即可）"
+                "\n（不喜欢这家酒店？回复「返回上一级」回到酒店列表重新选）")
+        else:
+            room_lines.append(
+                "\n请告诉我：选择哪个房型（回复序号或房型名）+ 入住人姓名？"
+                "\n（例如：1，入住人张三）"
+                "\n（不喜欢这家酒店？回复「返回上一级」回到酒店列表重新选）")
         if show_login_hint:
             import rollinggo_book as rlg
             if rlg.is_logged_in():

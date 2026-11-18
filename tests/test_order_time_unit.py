@@ -113,6 +113,7 @@ def main():
             failed += 1
             print(f"  FAIL  {name}: {type(e).__name__}: {e}")
     print(f"\n{len(tests) - failed} passed, {failed} failed")
+    storage.close()          # 先释放 SQLite 句柄，Windows 下才能删掉临时目录
     shutil.rmtree(_TMP, ignore_errors=True)
     return 1 if failed else 0
 

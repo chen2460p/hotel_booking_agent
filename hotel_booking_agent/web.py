@@ -13,6 +13,7 @@
   - GET  /api/session/{session_id}  查询会话在服务端是否仍存活（前端恢复本地历史用）
   - GET  /api/session/{session_id}/hotels  结构化酒店列表（卡片渲染用，带 revision）
   - POST /api/session/{session_id}/select  按 hotel_id + revision 选店（不经过 LLM/序号）
+  - POST /api/session/{session_id}/room    按「房型序号 + 报价序号」选房（不经过 LLM/文本解析）
   - GET  /orders        订单列表页面
   - GET  /api/orders    订单列表 JSON
   - POST /api/orders/{id}/pay     模拟支付
@@ -124,6 +125,9 @@ class ChatResponse(BaseModel):
     # 酒店列表视图（本次回复是列表时才有）：结构化 items + revision + 文案，
     # 前端据此渲染卡片并按 hotel_id 选店，不再解析回复文本
     hotel_view: Optional[dict] = None
+    # 房型列表视图（本次回复是选房阶段时才有）：结构化 rooms + plans + rooms_revision，
+    # 前端/Agent 据此按「房型序号 + 报价序号」选房，不再解析回复文本
+    rooms_view: Optional[dict] = None
 
 
 class HotelMoreRequest(BaseModel):
@@ -137,6 +141,18 @@ class SelectHotelRequest(BaseModel):
     """结构化选店：只认稳定 hotel_id + 列表版本，序号仅用于展示。"""
     hotel_id: str
     revision: str = ""
+
+
+class SelectRoomRequest(BaseModel):
+    """结构化选房：房型序号 + 报价序号 + 房型列表版本，不解析回复文本。
+
+    guest_name 可省略（只记房型等下一轮补姓名），也可同请求直接带入入住人。
+    """
+    room_no: int
+    plan_no: int = 1
+    guest_name: str = ""
+    email: str = ""
+    rooms_revision: str = ""
 
 
 class CancelRequest(BaseModel):
@@ -221,6 +237,7 @@ def _chat_payload(agent: HotelBookingAgent, reply: str,
         "hotel_shown": shown,
         "stage": getattr(agent.state, "stage", ""),
         "hotel_view": _hotel_view(agent),
+        "rooms_view": agent.rooms_view(),
     }
 
 
@@ -331,6 +348,8 @@ async def api_session_info(session_id: str):
         "current_order": _current_order_text(agent),
         "hotel_total": len(getattr(state, "search_results", None) or []),
         "search_revision": getattr(state, "search_revision", ""),
+        "rooms_revision": getattr(state, "rooms_revision", ""),
+        "rooms_view": agent.rooms_view(),
         "last_active": entry["ts"],
     }
 
@@ -380,7 +399,7 @@ def api_select_hotel(session_id: str, req: SelectHotelRequest):
     """按 hotel_id + revision 选店：不经过 LLM，也不按序号猜。
 
     版本不一致（旧列表）→ 409；酒店已不在列表 → 404；
-    成功返回房型报价回复与最新会话状态。
+    成功返回房型报价回复与最新会话状态（含结构化 rooms_view）。
     """
     entry = _peek_agent(session_id)
     if entry is None:
@@ -391,6 +410,32 @@ def api_select_hotel(session_id: str, req: SelectHotelRequest):
     except SelectionError as e:
         # stale=旧列表（可重取最新列表）；其余=酒店不存在/无列表
         status = 409 if e.code == "stale" else 404
+        raise HTTPException(status_code=status, detail=e.message)
+    return ChatResponse(**_chat_payload(agent, reply, session_id))
+
+
+@app.post("/api/session/{session_id}/room", response_model=ChatResponse)
+def api_select_room(session_id: str, req: SelectRoomRequest):
+    """按「房型序号 + 报价序号」结构化选房：不经过 LLM，也不解析回复文本。
+
+    - rooms_revision 与当前房型列表不一致 → 409（旧列表）
+    - 已进入验价确认阶段 → 409（先放弃本次验价）
+    - 房型/报价序号不存在 → 404
+    - 带 guest_name 时直接进入验价/模拟下单；不带则只记房型，返回待补姓名提示
+    """
+    entry = _peek_agent(session_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期，请重新搜索")
+    agent = entry["agent"]
+    current_rev = getattr(agent.state, "rooms_revision", "")
+    if req.rooms_revision and current_rev and req.rooms_revision != current_rev:
+        raise HTTPException(status_code=409,
+                            detail="房型列表已更新，请按最新列表重新选择")
+    try:
+        reply = agent.select_room_by_numbers(
+            req.room_no, req.plan_no, req.guest_name, req.email)
+    except SelectionError as e:
+        status = 409 if e.code in ("stale", "busy") else 404
         raise HTTPException(status_code=status, detail=e.message)
     return ChatResponse(**_chat_payload(agent, reply, session_id))
 
@@ -467,6 +512,19 @@ async def api_orders(filter: str = "ALL"):
 
 @app.post("/api/orders/{order_id}/pay")
 async def api_pay(order_id: str):
+    """仅模拟单：把本地订单标记为已支付。
+
+    真实道旅订单必须由用户在收银台支付——本地标记会写 paid_at，
+    造成“已支付”的假象，破坏订单审计。
+    """
+    order = storage.get_order(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail=f"订单 {order_id} 不存在")
+    if order.source == "rollinggo":
+        raise HTTPException(
+            status_code=409,
+            detail="道旅真实订单请在支付链接/道旅订单中心完成支付，程序不能标记为已支付",
+        )
     ok = tools.pay_order(order_id)
     if not ok:
         raise HTTPException(status_code=404, detail=f"订单 {order_id} 不存在")

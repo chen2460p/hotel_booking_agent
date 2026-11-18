@@ -22,7 +22,8 @@ except ImportError:
     pass
 
 from text_rules import NAME_DENY_WORDS, NAME_PATTERNS, match_order_status
-from geo_data import find_city, infer_city_from_location
+from geo_data import find_city, infer_city_from_location, get_city_coord, find_similar_city
+from nlu_corrections import apply_text_corrections, normalize_dates
 
 # DashScope OpenAI 兼容接口：qwen3.8-flash 等新模型走原生 Generation.call 会报
 # "url error"，统一用 compatible-mode 更稳，也不再依赖 dashscope SDK 做对话。
@@ -30,6 +31,18 @@ _COMPAT_URL = os.environ.get(
     "DASHSCOPE_COMPAT_URL",
     "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
 )
+# 单次对话超时（连接, 读取）。读取默认 30s：超时即回退规则引擎，
+# 避免 qwen3.8 这类思考模型偶发长尾把一条消息卡到 90 秒。
+# 空值/非法值都回退 30：部署时 Secret 未配置会写成 `DASHSCOPE_TIMEOUT=`。
+def _read_timeout() -> float:
+    raw = os.environ.get("DASHSCOPE_TIMEOUT")
+    try:
+        return float(raw) if raw else 30.0
+    except (TypeError, ValueError):
+        return 30.0
+
+
+_CHAT_TIMEOUT = (8, _read_timeout())
 
 
 def shift_date(check_in: str, days: int) -> Optional[str]:
@@ -46,8 +59,10 @@ class LLMClient:
     def __init__(self):
         """初始化时检测是否有 API Key，自动选择模式"""
         self.api_key = os.environ.get("DASHSCOPE_API_KEY", "")
-        # qwen3.8-flash：DashScope 新版 Flash 模型；可用 .env 的 DASHSCOPE_MODEL 覆盖
-        self.model = os.environ.get("DASHSCOPE_MODEL", "qwen3.8-flash")
+        # 默认 deepseek-v4.1-flash：120 条评测里全对且比 qwen3.8 快约 2.5 倍；
+        # 可用 .env 的 DASHSCOPE_MODEL 覆盖（如 qwen-flash / qwen3.8-flash）。
+        # 空值回退默认（部署 Secret 未配置时会写成 `DASHSCOPE_MODEL=`）。
+        self.model = os.environ.get("DASHSCOPE_MODEL") or "deepseek-v4.1-flash"
         self.use_real_llm = bool(self.api_key)
         if self.use_real_llm:
             print(f"[系统] 检测到 DASHSCOPE_API_KEY，使用真实 LLM 模式（模型：{self.model}）")
@@ -71,7 +86,7 @@ class LLMClient:
                     "Content-Type": "application/json",
                 },
                 json=payload,
-                timeout=(8, 90),
+                timeout=_CHAT_TIMEOUT,
             )
             if resp.status_code != 200:
                 print(f"[LLM 调用失败] status={resp.status_code} "
@@ -99,11 +114,18 @@ class LLMClient:
         - order_query: 查询订单
         - cancel: 取消订单
         - chat: 闲聊/其他
+
+        真实模型与规则引擎两条路径最后都走同一层确定性后处理：
+        改口（不是A是B）、否定约束（不要海景房）、跨月/倒挂日期修正。
         """
+        today = datetime.now()
         if self.use_real_llm:
-            return self._extract_with_llm(user_input)
+            intent, params = self._extract_with_llm(user_input)
         else:
-            return self._extract_with_rules(user_input)
+            intent, params = self._extract_with_rules(user_input)
+        apply_text_corrections(user_input, params)
+        normalize_dates(params, user_input, today)
+        return intent, params
 
     def _extract_with_llm(self, user_input: str) -> Tuple[str, dict]:
         """用真实 LLM 提取意图和参数"""
@@ -111,6 +133,15 @@ class LLMClient:
         weekday_cn = "一二三四五六日"[today.weekday()]
         tomorrow = today + timedelta(days=1)
         day_after = today + timedelta(days=2)
+        # 裸数字日期对（"12 15"）的示例必须随今天滚动：
+        # 写死"11 月 12 日"在 11 月中旬就会变成过去日期，模型会照抄过去日期。
+        pair_year, pair_month = today.year, today.month
+        if today.day > 12:                 # 本月 12 号已过 → 用下个月
+            pair_month += 1
+            if pair_month > 12:
+                pair_month, pair_year = 1, pair_year + 1
+        pair_in = f"{pair_year:04d}-{pair_month:02d}-12"
+        pair_out = f"{pair_year:04d}-{pair_month:02d}-15"
         prompt = f"""你是一个酒店预订助手的意图识别模块。今天是{today:%Y-%m-%d}（周{weekday_cn}）。
 请从用户输入中提取意图和参数，严格以 JSON 格式返回，只返回 JSON 不要其他文字。
 
@@ -126,15 +157,16 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
 重要规则：
 - location 只放城市以下的位置修饰（行政区、商圈、地标、路名及"附近/周边/市中心"等），
   城市本身放 city；例如"成都市中心春熙路步行街附近"→city="成都"、location="市中心春熙路步行街附近"。
-- check_in 和 check_out 必须转换成 YYYY-MM-DD 格式的具体日期。
+- check_in 和 check_out 必须转换成 YYYY-MM-DD 格式的具体日期，且都不得早于今天。
   口语日期换算示例（今天是{today:%Y-%m-%d}周{weekday_cn}）："明天"→check_in={tomorrow:%Y-%m-%d}；"后天"→check_in={day_after:%Y-%m-%d}；"这周末"→本周六/周日；"下周末"→下周六/周日。
   用户只说"24号"这类只有日、没有月份的表达时，换算成不早于今天的最近一个24号（本月该日已过则算下月）。
   如果提供了"住N晚""住N天"（N可能是中文数字，如"三天"），用入住日期推算离店日期。
 - city 是城市中文名，例如"沈阳"→"沈阳"。
 - max_price 是数字（元/晚）。
 - 用户只回两个数字（如"12 15""12、15""12-15"，中间可有"号/日"）时，按"前一个入住日、
-  后一个离店日"理解；月份取不早于今天的最近月份（如今天是 11 月，"12 15"→11 月 12 日入住、
-  11 月 15 日离店）。只回一个数字（"15号"）时只当作入住日，离店日留空。
+  后一个离店日"理解；月份取不早于今天的最近月份。今天是{today:%Y-%m-%d}，所以"12 15"→
+  check_in={pair_in}、check_out={pair_out}（若本月 12 号已过则顺延到下个月）。
+  只回一个数字（"15号"）时只当作入住日，离店日留空。
 - 无法确定的字段不要填，不要编造。
 
 示例返回：{{"intent":"book","city":"沈阳","check_in":"{tomorrow:%Y-%m-%d}","check_out":"{day_after:%Y-%m-%d}","max_price":1000}}"""
@@ -164,12 +196,22 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
                     if rule_params.get("check_in") and rule_params.get("check_out"):
                         params["check_in"] = rule_params["check_in"]
                         params["check_out"] = rule_params["check_out"]
-                    # 日期倒挂保护：仍出现 check_out <= check_in 时，
-                    # 保留入住日、丢弃不可信的离店日（下一轮再追问），
-                    # 绝不带着倒挂日期去搜索
-                    if (params.get("check_in") and params.get("check_out")
-                            and str(params["check_out"]) <= str(params["check_in"])):
-                        params.pop("check_out", None)
+                    # 日期倒挂/过去日期统一交给 extract_intent_and_params 里的
+                    # normalize_dates 处理（能跨月推断出合法区间，而不是直接丢掉离店日）
+                    # 城市笔误纠正：LLM 常把"大年市"原样当城市名，
+                    # 用相似度匹配已知城市，并把 location 里的旧前缀一起换掉
+                    city = str(params.get("city") or "").strip()
+                    if city and not get_city_coord(city):
+                        fixed = find_similar_city(city.rstrip("市"))
+                        if fixed:
+                            old = city.rstrip("市")
+                            params["city"] = fixed
+                            loc = str(params.get("location") or "")
+                            if old and loc.startswith(old):
+                                params["location"] = fixed + loc[len(old):]
+                    # 查订单没给状态时默认全部，避免下游拿到空筛选
+                    if intent == "order_query" and not params.get("order_status"):
+                        params["order_status"] = "ALL"
                     return intent, params
             except Exception as e:
                 print(f"[LLM 返回解析失败，回退规则引擎] {e}")
@@ -338,10 +380,12 @@ ALL全部 / PENDING待支付 / FINISHED已完成已支付 / CANCELLED已取消�
         #     被追问"入住和离店日期"时最常见的简写：前一个入住、后一个离店。
         #     必须带分隔符或"号/日"，避免把"1215"这类数字串误判成日期。
         if "check_in" not in params and "check_out" not in params:
-            pair_match = re.fullmatch(
-                r'\s*(\d{1,2})\s*(?:[号日]\s*(?:[-—~到至、,，/]\s*)?'
+            # 用 search 而不是 fullmatch：真实说法常带前后缀
+            # （"帮我订成都12 15的酒店"），fullmatch 会整条漏掉
+            pair_match = re.search(
+                r'(?<!\d)(\d{1,2})\s*(?:[号日]\s*(?:[-—~到至、,，/]\s*)?'
                 r'|[-—~到至、,，/]\s*|\s+)\s*'
-                r'(\d{1,2})\s*[号日]?\s*', text)
+                r'(\d{1,2})\s*[号日]?(?!\d)', text)
             if pair_match:
                 d1 = _future_day_only(int(pair_match.group(1)))
                 d2 = _future_day_only(int(pair_match.group(2)))

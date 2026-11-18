@@ -35,6 +35,9 @@ dist/
 *.db-shm
 *.db-wal
 
+# ===== 测试临时库目录（Windows 下 SQLite 句柄未释放时 rmtree 会失败）=====
+hb_order_time_tmp_*/
+
 # ===== 运行时缓存（评分/携程图片缓存）=====
 hotel_booking_agent/cache/
 

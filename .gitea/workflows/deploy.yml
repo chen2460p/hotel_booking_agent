@@ -32,7 +32,10 @@ jobs:
           {
             echo 'DASHSCOPE_API_KEY=${{ secrets.DASHSCOPE_API_KEY }}'
             echo 'DASHSCOPE_MODEL=${{ secrets.DASHSCOPE_MODEL }}'
+            # 非密钥配置：读取超时固定 30s（代码里空值也会回退 30）
+            echo 'DASHSCOPE_TIMEOUT=30'
             echo 'AMAP_API_KEY=${{ secrets.AMAP_API_KEY }}'
+            echo 'BAIDU_MAP_AK=${{ secrets.BAIDU_MAP_AK }}'
             echo 'ROLLINGGO_API_KEY=${{ secrets.ROLLINGGO_API_KEY }}'
           } > hotel_booking_agent/.env
           chmod 600 hotel_booking_agent/.env
