@@ -98,6 +98,7 @@ python tests/run_all.py
 | 存储 | `storage.py` | SQLite / MySQL / 内存自动回退。表结构变更**只加列**，不改不删 |
 | Web 前端 | `frontend/src/`（React + TypeScript） | 只渲染 `hotel_view` 的结构化字段；请求统一走 `api/client.ts`、SSE 统一走 `api/sse.ts`，组件里不直接 fetch |
 | 入口 | `main.py`、`main_multi.py`、`web.py`、`cli_common.py` | 只做输入输出循环/终端展示，不写业务逻辑 |
+| MCP 协议层 | `mcp_server.py` | 只做协议适配（JSON-RPC / 工具契约 / 鉴权 / 审计），业务一律回调 `tools.py`、`rag.py`。**默认只读**：验价/下单/取消不许注册成工具，写操作留在带二次确认的 Host 侧 |
 
 **并发约束**：`web.py` 的会话池、SQLite 句柄都在单进程内存里，**禁止 `--workers > 1`**（Dockerfile 已注明）。多 worker = 多轮状态丢失、订单互相不可见。
 
@@ -144,6 +145,7 @@ python tests/run_all.py
 | `POST /api/orders/{id}/pre-cancel` | ⚠️ 真实交易：取消询价 | 只查罚金/拿 10 分钟凭证，**不提交取消** |
 | `POST /api/orders/{id}/cancel` | ⚠️ 真实交易：提交取消 | 必须带前置凭证，等价 `confirm_cancel` |
 | `GET /api/health` | 健康检查 | 存储后端 / 会话数 / 道旅登录态 |
+| `POST /mcp` | MCP Server（Streamable HTTP） | 只读工具；`MCP_AUTH_TOKEN` 非空时要求 `Authorization: Bearer`；**不许注册验价/下单/取消** |
 
 前端（`hotel_booking_agent/frontend/src`，构建产物由 `web.py` 托管）注意：
 
@@ -176,6 +178,7 @@ python tests/run_all.py
 | `web.py` | 起服务后 `test_api_smoke.py` + `test_selection_unit` + `test_rooms_view_unit` |
 | `tools.py` / `rollinggo_book.py` | `test_cancel_unit`、`test_order_time_unit`、`test_rate_change_recovery_unit`、`test_pay_guard_unit` |
 | `storage.py` | `test_order_time_unit`、`test_cancel_unit` |
+| `mcp_server.py` | `test_mcp_server_unit`（协议/契约/鉴权/脱敏/审计）；改工具注册表后必须补一条用例 |
 | `frontend/`（React 前端） | `npm run build`（含 `tsc --noEmit`）+ 浏览器手工验收 + `test_api_smoke.py` |
 
 ## 提交前自检

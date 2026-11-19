@@ -37,6 +37,8 @@ jobs:
             echo 'AMAP_API_KEY=${{ secrets.AMAP_API_KEY }}'
             echo 'BAIDU_MAP_AK=${{ secrets.BAIDU_MAP_AK }}'
             echo 'ROLLINGGO_API_KEY=${{ secrets.ROLLINGGO_API_KEY }}'
+            # MCP Server 的 Bearer 鉴权；不配则为空 = 不鉴权（仅内网可接受）
+            echo 'MCP_AUTH_TOKEN=${{ secrets.MCP_AUTH_TOKEN }}'
           } > hotel_booking_agent/.env
           chmod 600 hotel_booking_agent/.env
           echo "已写入 .env：$(grep -c '=.\+' hotel_booking_agent/.env) 个非空配置项"

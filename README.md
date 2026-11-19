@@ -47,6 +47,7 @@
 - **三级数据源回退**：道旅（有价格）→ 高德 POI（仅名称地址）→ 内置模拟酒店库，任何 Key 缺失都不阻断运行
 - **RAG 酒店评价**：切块 → Embedding（DashScope `text-embedding-v2` 或 TF-IDF 模拟）→ 向量召回 → 重排 → 生成回答
 - **两套架构**：单 Agent 的 ReAct+Workflow 混合状态机（`main.py`）、Supervisor-Worker 四专员多 Agent 协作（`main_multi.py`）
+- **MCP 双角色**：做 Client（`rollinggo_mcp.py` 手写 JSON-RPC 2.0：`initialize` → `tools/list` → `tools/call`，兼容 JSON/SSE 双响应），也做 Server（`mcp_server.py`：stdio + Streamable HTTP 双传输，暴露 4 个**只读**工具 + 1 个安全策略资源，带参数契约校验、Bearer 鉴权与调用审计；验价/下单/取消**故意不暴露**，写操作仍留在带二次确认的 Host 侧）
 
 ## 整体架构
 
@@ -109,7 +110,8 @@
     ├── 启动前端.bat              # Windows 一键起 Web（chcp 65001 + python web.py）
     ├── main.py                   # 入口①：ReAct + Workflow 混合版（真实下单链路在这）
     ├── main_multi.py             # 入口②：Supervisor-Worker 多 Agent 协作版
-    ├── web.py                    # 入口③：FastAPI（托管前端产物 + JSON/SSE 接口）
+    ├── web.py                    # 入口③：FastAPI（托管前端产物 + JSON/SSE 接口 + POST /mcp）
+    ├── mcp_server.py             # MCP Server：只读工具/资源，stdio + Streamable HTTP
     ├── frontend/                 # Web 前端源码（React + TypeScript + Vite，多页构建）
     │   ├── package.json          # 前端依赖与脚本（dev / build）
     │   ├── vite.config.ts        # 两个入口（index/orders）；dev 时把 /api、/orders 代理到 :8000
@@ -180,6 +182,7 @@ Copy-Item .env.example .env   # PowerShell
 | `ROLLINGGO_CLIENT_ID` | 可选 | rollinggo_book.py | 默认 `rollinggoskill`（国内版固定值） |
 | `ROLLINGGO_ACCESS_TOKEN` | 可选 | rollinggo_book.py | 直接注入 access token，优先于本地 token 文件 |
 | `ROLLINGGO_TOKEN_FILE` | 可选 | rollinggo_book.py | token 存储路径，默认 `~/.hotel-cli/token.json` |
+| `MCP_AUTH_TOKEN` | 选填 | mcp_server.py | MCP Server 的 HTTP 侧 Bearer 鉴权；留空 = 不鉴权（仅建议本地）。公网部署务必配置，线上由 Secrets 注入 |
 
 评分富化的 QPS 节流可用 `BAIDU_QPS_LIMIT` / `AMAP_QPS_LIMIT` / `CTRIP_QPS_LIMIT` 调整（默认 2 / 5 / 2），一般无需修改。
 
@@ -227,6 +230,32 @@ python web.py          # http://127.0.0.1:8000（也可双击 启动前端.bat�
 只想调界面时不用反复构建：另开一个终端跑 `npm run dev`（http://127.0.0.1:5173），它会把 `/api`、`/orders` 代理到 8000 上的 `python web.py`。
 
 > 没构建就启动 `python web.py` 不会报错：接口和订单页照常可用，首页会显示一条「前端未构建」的提示页，照着上面的命令构建即可。Docker 镜像里由构建阶段自动完成，不需要宿主装 node。
+
+### 启动 MCP Server（可选）
+
+把本项目的**只读**能力暴露给 Claude Desktop / Cursor 等 MCP 客户端：
+
+```powershell
+cd hotel_booking_agent
+python mcp_server.py                                  # stdio，给本地客户端
+python mcp_server.py --transport http --port 8010     # 单独跑 Streamable HTTP
+# 生产：随 web.py 一起起，端点就是 http://<host>:9122/mcp
+```
+
+暴露的能力（`tools/list`）：
+
+| 工具 | 作用 | 说明 |
+|---|---|---|
+| `search_hotels` | 按城市/日期/预算/星级/地标搜酒店 | 只读，返回 `hotel_id` + 展示价 |
+| `get_hotel_detail` | 查实时房型与报价档 | 只读，可带入离店日期 |
+| `search_reviews` | 评价 RAG 检索 | 只读，回答「隔音怎么样」这类问题 |
+| `get_order` | 查订单状态与金额 | 只读，**脱敏**（不含姓名/手机/邮箱） |
+
+外加一个资源 `hotel://policy/booking-safety`（资金安全红线，供 Host 侧读取）。
+
+**设计边界**：验价、下单、支付、取消**不注册为工具**——它们要二次确认、要凭证、会动真钱，属于 Host 侧的人工闸门。MCP 只承担「查」，不承担「改」。审计写到 `cache/mcp_audit.jsonl`，只记工具名/参数键/耗时/成败，**不记参数值**。
+
+HTTP 侧鉴权：`MCP_AUTH_TOKEN` 非空时要求 `Authorization: Bearer <token>`；留空则不鉴权（仅建议本地）。
 
 ## 对话下单全流程（真实链路）
 
@@ -347,7 +376,8 @@ orderNo + paymentUrl（通用收银台，用户自行打开支付）
 | `agent.py` | 主状态机：选店、验价确认卡编排、下单与取消（选择/解析/渲染细节走 `agent_common`） |
 | `multi_agent.py` | `AgentMessage` 消息队列 + `AgentState` 共享黑板；Supervisor 分发 Search/Booking/Service/Review 四个 Worker |
 | `agent_common.py` | 两套架构共用的纯逻辑：`merge_params / parse_hotel_selection / match_room_choice / extract_guest_name / detect_order_filter / render_hotel_results_parts / render_hotel_selection / chat_reply` 等，含同房型多档报价的分组、差价展示与 `1-2` 选择解析 |
-| `web.py` | FastAPI 入口：托管 `frontend/dist`（聊天页 + 订单页）；会话池（30 分钟 TTL）、SSE 阶段推送、结构化酒店列表 `GET /api/session/{id}/hotels` 与按 `hotel_id + revision` 选店 `POST /api/session/{id}/select`（旧列表 409）；选中酒店后返回 `rooms_view`（房型 × 报价档，`plan_key` 即 `rate_plan_id`），按 `room_no + plan_no + rooms_revision` 选房 `POST /api/session/{id}/room`（不解析文本，旧房型列表 409）；`hotel_view` 只由服务端搜索结果生成 |
+| `mcp_server.py` | MCP Server：4 个只读工具（`search_hotels` / `get_hotel_detail` / `search_reviews` / `get_order`）+ 1 个安全策略资源；stdio 与 Streamable HTTP（`POST /mcp`）双传输；JSON-RPC 2.0 调度、工具契约校验（类型/必填/枚举/日期格式）、Bearer 鉴权、调用审计（不记参数值）；验价/下单/取消**故意不注册**（`WITHHELD_TOOLS` 可查） |
+| `web.py` | FastAPI 入口：托管 `frontend/dist`（聊天页 + 订单页）；会话池（30 分钟 TTL）、SSE 阶段推送、结构化酒店列表 `GET /api/session/{id}/hotels` 与按 `hotel_id + revision` 选店 `POST /api/session/{id}/select`（旧列表 409）；选中酒店后返回 `rooms_view`（房型 × 报价档，`plan_key` 即 `rate_plan_id`），按 `room_no + plan_no + rooms_revision` 选房 `POST /api/session/{id}/room`（不解析文本，旧房型列表 409）；`hotel_view` 只由服务端搜索结果生成；挂载 `mcp_server` 的 `POST /mcp` |
 | `frontend/src/orders/` | 订单页：`format.ts` 是纯展示逻辑（时间/状态分桶/动作判定，可单测）；`OrdersTable` 只渲染 `/api/orders` 的结构化行；真实单取消走「询价 → 展示罚金与预计退款 → 用户确认 → 带凭证提交」两步，模拟单的「标记支付」只对 `source=mock` 出现 |
 | `frontend/` | React + TypeScript 聊天页：`api/sse.ts` 用 fetch 解 POST-SSE 帧；`lib/imgQueue.ts` 串行加载图片（道旅 CDN 并发会 403）并做可视区懒加载；`lib/sessionOps.ts` 管 localStorage 多会话栈（键仍为 `hb_sessions_v1`）；酒店卡片按 `hotel_view`、房型卡片按 `rooms_view` 渲染，能否点击由 `activeRevision` / `activeRoomsRevision` 派生；选房只提交 `room_no + plan_no + rooms_revision`（不带姓名，避免误触发验价） |
 | `cli_common.py` | 终端入口共用：`display_width()` 与 `print_banner(rows)`（按显示宽度生成 ASCII 横幅） |

@@ -20,6 +20,7 @@
   - POST /api/orders/{id}/pay     模拟支付
   - POST /api/orders/{id}/pre-cancel  真实订单取消询价（罚金 + confirmId）
   - POST /api/orders/{id}/cancel      取消订单（真实订单需带询价凭证并确认）
+  - POST /mcp           MCP Server（Streamable HTTP，只读工具；见 mcp_server.py）
 
 存储：订单走 storage 层（SQLite 自动回退内存，配 MySQL 可选），评分/酒店缓存与 CLI 版共用同一套磁盘文件。
 会话：session agent 池——前端携带 session_id，同一会话复用同一 Agent 实例（多轮对话状态保持），
@@ -45,8 +46,13 @@ import tools
 import storage
 import hotel_rating
 import rollinggo_book as rlg
+import mcp_server
 
 app = FastAPI(title="酒店预订 Agent Web 版", version="0.2.0")
+
+# MCP Server 走同一个进程：POST /mcp（只读工具，验价/下单/取消故意不暴露）。
+# 单独起 stdio 版给本地客户端用：python mcp_server.py
+app.include_router(mcp_server.build_router())
 
 # ---------- 前端构建产物（frontend/dist，由 Vite 生成）----------
 # 聊天页与订单页都是 React SPA：这里只负责托管静态文件，接口一个都不用改。
