@@ -41,6 +41,9 @@ export interface SessionsApi {
   /** undefined = 服务端状态未确认（不置灰）；null = 没有可点的列表（全灰） */
   activeRevision: string | null | undefined;
   setActiveRevision: (revision: string | null | undefined) => void;
+  /** 房型列表的当前版本；语义同上 */
+  activeRoomsRevision: string | null | undefined;
+  setActiveRoomsRevision: (revision: string | null | undefined) => void;
   bootstrap: () => void;
   remember: (
     role: Role,
@@ -67,6 +70,9 @@ export function useSessions(
   const [activeRevision, setActiveRevision] = useState<
     string | null | undefined
   >(undefined);
+  const [activeRoomsRevision, setActiveRoomsRevision] = useState<
+    string | null | undefined
+  >(undefined);
 
   const activeId = store.active;
   const activeIdRef = useRef(activeId);
@@ -88,9 +94,13 @@ export function useSessions(
   };
 
   const scrollToBottom = (): void => {
+    // 两次 rAF：第一帧等 React 把新消息提交进 DOM，第二帧等布局完成，
+    // 这时 scrollHeight 才是真实高度（只等一帧容易停在旧高度上）
     window.requestAnimationFrame(() => {
-      const el = chatboxRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
+      window.requestAnimationFrame(() => {
+        const el = chatboxRef.current;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
     });
   };
 
@@ -135,6 +145,7 @@ export function useSessions(
     commit(activate(storeRef.current, id));
     writeSid(id);
     setActiveRevision(null);
+    setActiveRoomsRevision(null);
   };
 
   const newSession = (): void => {
@@ -150,6 +161,7 @@ export function useSessions(
     commit(next);
     writeSid(next.active);
     setActiveRevision(null);
+    setActiveRoomsRevision(null);
   };
 
   const adoptSession = (newId: string): void => {
@@ -165,6 +177,8 @@ export function useSessions(
     session,
     activeRevision,
     setActiveRevision,
+    activeRoomsRevision,
+    setActiveRoomsRevision,
     bootstrap,
     remember,
     patch,

@@ -85,6 +85,25 @@ export function selectHotel(
   );
 }
 
+/**
+ * 结构化选房：只提交「房型序号 + 报价序号 + 房型列表版本」。
+ *
+ * 刻意不带 guest_name —— 选了房型不等于同意验价：
+ * 后端不带姓名时只把房型记进 pending_booking，返回「入住人写谁？」；
+ * 入住人仍由用户在对话里补充，验价/下单仍然是另一步。
+ */
+export function selectRoom(
+  sessionId: string,
+  roomNo: number,
+  planNo: number,
+  roomsRevision: string,
+): Promise<ApiResult<ChatPayload>> {
+  return request<ChatPayload>(
+    `/api/session/${encodeURIComponent(sessionId)}/room`,
+    jsonBody({ room_no: roomNo, plan_no: planNo, rooms_revision: roomsRevision }),
+  );
+}
+
 /** 展开全部：按 offset 逐段补全（后端每次补 5 家真实评分） */
 export function fetchMoreHotels(
   sessionId: string,

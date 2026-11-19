@@ -347,7 +347,7 @@ orderNo + paymentUrl（通用收银台，用户自行打开支付）
 | `multi_agent.py` | `AgentMessage` 消息队列 + `AgentState` 共享黑板；Supervisor 分发 Search/Booking/Service/Review 四个 Worker |
 | `agent_common.py` | 两套架构共用的纯逻辑：`merge_params / parse_hotel_selection / match_room_choice / extract_guest_name / detect_order_filter / render_hotel_results_parts / render_hotel_selection / chat_reply` 等，含同房型多档报价的分组、差价展示与 `1-2` 选择解析 |
 | `web.py` | FastAPI 入口：托管 `frontend/dist`（首页）/ `templates/orders.html`（订单页）；会话池（30 分钟 TTL）、SSE 阶段推送、结构化酒店列表 `GET /api/session/{id}/hotels` 与按 `hotel_id + revision` 选店 `POST /api/session/{id}/select`（旧列表 409）；选中酒店后返回 `rooms_view`（房型 × 报价档，`plan_key` 即 `rate_plan_id`），按 `room_no + plan_no + rooms_revision` 选房 `POST /api/session/{id}/room`（不解析文本，旧房型列表 409）；`hotel_view` 只由服务端搜索结果生成 |
-| `frontend/` | React + TypeScript 聊天页：`api/sse.ts` 用 fetch 解 POST-SSE 帧；`lib/imgQueue.ts` 串行加载图片（道旅 CDN 并发会 403）并做可视区懒加载；`lib/sessionOps.ts` 管 localStorage 多会话栈（键仍为 `hb_sessions_v1`）；卡片只渲染 `hotel_view` 结构化字段，能否点击由 `activeRevision` 派生 |
+| `frontend/` | React + TypeScript 聊天页：`api/sse.ts` 用 fetch 解 POST-SSE 帧；`lib/imgQueue.ts` 串行加载图片（道旅 CDN 并发会 403）并做可视区懒加载；`lib/sessionOps.ts` 管 localStorage 多会话栈（键仍为 `hb_sessions_v1`）；酒店卡片按 `hotel_view`、房型卡片按 `rooms_view` 渲染，能否点击由 `activeRevision` / `activeRoomsRevision` 派生；选房只提交 `room_no + plan_no + rooms_revision`（不带姓名，避免误触发验价） |
 | `cli_common.py` | 终端入口共用：`display_width()` 与 `print_banner(rows)`（按显示宽度生成 ASCII 横幅） |
 | `rag.py` | 模拟评价语料切块、Embedding 双模式、召回+重排+生成 |
 | `text_rules.py` | 姓名与订单状态的文本规则，`llm.py` 与 `agent_common.py` 共用，避免两处各写一套 |

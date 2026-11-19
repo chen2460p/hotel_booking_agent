@@ -7,9 +7,9 @@
 
 import { useRef, useState } from "react";
 
-import { fetchMoreHotels, fetchSessionInfo, selectHotel } from "../api/client";
+import { fetchMoreHotels, fetchSessionInfo, selectHotel, selectRoom } from "../api/client";
 import { streamChat } from "../api/sse";
-import type { HotelItem, HotelView } from "../types";
+import type { HotelItem, HotelView, RoomItem, RoomPlan, RoomsView } from "../types";
 import type { SessionsApi } from "./useSessions";
 
 export interface ChatApi {
@@ -18,6 +18,7 @@ export interface ChatApi {
   send: (text: string) => Promise<void>;
   expand: (index: number, onProgress?: (text: string) => void) => Promise<void>;
   pickHotel: (item: HotelItem, revision: string) => Promise<void>;
+  pickRoom: (index: number, room: RoomItem, plan: RoomPlan) => Promise<void>;
   checkServerSession: () => Promise<void>;
 }
 
@@ -32,6 +33,7 @@ export function useChat(
   const [status, setStatus] = useState("");
   const busyRef = useRef(false);
   const pickBusyRef = useRef(false);
+  const roomBusyRef = useRef(false);
   /** 会话存活检查序号：发新消息后，旧的检查结果作废 */
   const checkSeqRef = useRef(0);
 
@@ -51,6 +53,7 @@ export function useChat(
     let reply: string | null = null;
     let currentOrder = "";
     let hotelView: HotelView | null = null;
+    let roomsView: RoomsView | null = null;
     let hotelTotal = 0;
     let hotelShown = 0;
     let errorMessage = "";
@@ -69,6 +72,7 @@ export function useChat(
           hotelTotal = data.hotel_total || 0;
           hotelShown = data.hotel_shown || 0;
           hotelView = data.hotel_view || null;
+          roomsView = data.rooms_view || null;
           if (data.session_id && data.session_id !== sessions.activeIdRef.current) {
             sessions.adoptSession(data.session_id);
           }
@@ -101,9 +105,14 @@ export function useChat(
           hotelTotal,
           hotelShown,
           next: hotelShown,
+          roomsView,
         });
       }
       if (currentOrder) sessions.remember("sys", "📌 " + currentOrder);
+      // 房型列表只在"已选酒店、还没定房型"的窗口下发；没有就说明该收起卡片了
+      sessions.setActiveRoomsRevision(
+        roomsView ? roomsView.rooms_revision || null : null,
+      );
     } else {
       sessions.remember("bot", "(连接中断，未收到完整回复)", { rich: false });
     }
@@ -202,13 +211,80 @@ export function useChat(
         hotelTotal: 0,
         hotelShown: 0,
         next: 0,
+        // 选店接口会顺带回房型列表：落进消息里，刷新后卡片还在
+        roomsView: data.rooms_view || null,
       });
       if (data.current_order) sessions.remember("sys", "📌 " + data.current_order);
       // 已进入选房阶段，旧酒店卡片不再可点
       sessions.setActiveRevision(null);
+      sessions.setActiveRoomsRevision(
+        data.rooms_view ? data.rooms_view.rooms_revision || null : null,
+      );
       sessions.scrollToBottom();
     } finally {
       pickBusyRef.current = false;
+    }
+  };
+
+  /**
+   * 结构化选房：只提交序号 + 版本，不带入住人姓名。
+   *
+   * 不带姓名是刻意的——后端此时只把房型记进 pending_booking 并反问入住人，
+   * 不会触发验价锁价；验价/下单仍是用户补完姓名后的下一步。
+   */
+  const pickRoom = async (
+    index: number,
+    room: RoomItem,
+    plan: RoomPlan,
+  ): Promise<void> => {
+    if (roomBusyRef.current) return;
+    const view = sessions.session()?.messages[index]?.roomsView;
+    if (!view) return;
+    roomBusyRef.current = true;
+    try {
+      const result = await selectRoom(
+        sessions.activeIdRef.current ?? "",
+        room.room_no,
+        plan.plan_no,
+        view.rooms_revision,
+      );
+
+      if (result.kind === "stale") {
+        sessions.setActiveRoomsRevision(null);
+        sessions.remember("sys", "⚠️ 房型列表已更新，请按最新列表重新选择。");
+        return;
+      }
+      if (result.kind === "missing") {
+        sessions.setActiveRoomsRevision(null);
+        sessions.remember(
+          "sys",
+          result.detail || "⚠️ 会话已过期或该房型不在当前列表，请重新选择。",
+        );
+        return;
+      }
+      if (result.kind === "error") {
+        sessions.remember("sys", "❌ 选择失败：" + result.detail);
+        return;
+      }
+
+      const data = result.data;
+      // 房型已记下：收起这一组按钮，避免重复提交，也避免点第二间覆盖第一间
+      sessions.patch(index, { roomsPicked: true });
+      sessions.remember(
+        "sys",
+        `👉 已选择房型：${room.room_name}（¥${plan.price_per_night}/晚）`,
+      );
+      sessions.remember("bot", data.reply, {
+        rich: true,
+        hotelTotal: 0,
+        hotelShown: 0,
+        next: 0,
+      });
+      if (data.current_order) sessions.remember("sys", "📌 " + data.current_order);
+      sessions.setActiveRoomsRevision(null);
+      sessions.scrollToBottom();
+    } finally {
+      roomBusyRef.current = false;
     }
   };
 
@@ -227,11 +303,21 @@ export function useChat(
     if (!info.exists) {
       pushNotice(EXPIRED_NOTICE);
       sessions.setActiveRevision(null); // 会话没了：旧列表不能再点
+      sessions.setActiveRoomsRevision(null);
     } else {
       // 服务端仍有列表：版本一致的卡片保持可点，旧版本全部置灰
       sessions.setActiveRevision(info.search_revision || null);
+      sessions.setActiveRoomsRevision(info.rooms_revision || null);
     }
   };
 
-  return { busy, status, send, expand, pickHotel, checkServerSession };
+  return {
+    busy,
+    status,
+    send,
+    expand,
+    pickHotel,
+    pickRoom,
+    checkServerSession,
+  };
 }

@@ -8,7 +8,12 @@
 import type { RefObject } from "react";
 
 import { setScrollRoot } from "../lib/imgQueue";
-import type { HotelItem, MessageRecord } from "../types";
+import type {
+  HotelItem,
+  MessageRecord,
+  RoomItem,
+  RoomPlan,
+} from "../types";
 import { Message } from "./Message";
 
 const WELCOME =
@@ -23,20 +28,25 @@ interface MessageListProps {
   messages: MessageRecord[];
   /** undefined = 服务端状态未确认，卡片先保持可点 */
   activeRevision: string | null | undefined;
+  /** 房型列表的当前版本（rooms_revision），语义同上 */
+  activeRoomsRevision: string | null | undefined;
   status: string;
   notices: Notice[];
   chatboxRef: RefObject<HTMLDivElement | null>;
   onSelect: (item: HotelItem, revision: string) => Promise<void> | void;
+  onPickRoom: (index: number, room: RoomItem, plan: RoomPlan) => Promise<void> | void;
   onExpand: (index: number, onProgress?: (text: string) => void) => Promise<void>;
 }
 
 export function MessageList({
   messages,
   activeRevision,
+  activeRoomsRevision,
   status,
   notices,
   chatboxRef,
   onSelect,
+  onPickRoom,
   onExpand,
 }: MessageListProps) {
   return (
@@ -57,13 +67,19 @@ export function MessageList({
           !!record.hotelView &&
           activeRevision !== undefined &&
           activeRevision !== record.hotelView.revision;
+        const roomsStale =
+          !!record.roomsView &&
+          activeRoomsRevision !== undefined &&
+          activeRoomsRevision !== record.roomsView.rooms_revision;
         return (
           <Message
             key={index}
             record={record}
             index={index}
             stale={stale}
+            roomsStale={roomsStale}
             onSelect={onSelect}
+            onPickRoom={onPickRoom}
             onExpand={onExpand}
           />
         );

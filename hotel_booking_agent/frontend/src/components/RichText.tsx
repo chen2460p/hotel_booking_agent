@@ -14,7 +14,14 @@ function openInNewTab(url: string): void {
   window.open(url, "_blank", "noopener,noreferrer");
 }
 
-export function RichText({ text }: { text: string }) {
+export function RichText({
+  text,
+  textOnly = false,
+}: {
+  text: string;
+  /** 只把 URL 渲染成链接、不加载图片：给"查看完整文字列表"用，避免重复击穿 CDN */
+  textOnly?: boolean;
+}) {
   const parts = useMemo(() => parseRich(text), [text]);
 
   return (
@@ -33,6 +40,22 @@ export function RichText({ text }: { text: string }) {
             >
               🔗 {part.url}
             </a>
+          );
+        }
+        if (textOnly) {
+          return (
+            <Fragment key={index}>
+              {part.urls.map((url, i) => (
+                <a
+                  key={`${i}-${url}`}
+                  href={url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  🔗 {url}
+                </a>
+              ))}
+            </Fragment>
           );
         }
         if (part.urls.length === 1) {

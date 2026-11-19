@@ -1,24 +1,40 @@
 /**
  * 一条消息气泡（user / bot / sys）。
  *
- * 与旧版 append() 的 DOM 结构保持一致：.bot > span + .hotel-view + 展开按钮，
- * 这样 templates/index.html 里的样式表可以原样复用，视觉零变化。
+ * 与旧版 append() 的 DOM 结构保持一致：.bot > span + 结构化视图 + 展开按钮
+ * （样式表复用旧版类名，视觉零变化）。
+ *
+ * 回复里有 room_view 时不再把整段房型文案铺在气泡里：卡片才是主视图，
+ * 原文收进「查看完整文字列表」（只渲染链接、不加载图片，避免重复请求 CDN）。
  */
 
-import type { HotelItem, MessageRecord } from "../types";
+import type { HotelItem, MessageRecord, RoomItem, RoomPlan } from "../types";
 import { ExpandButton } from "./ExpandButton";
 import { HotelView } from "./HotelView";
 import { RichText } from "./RichText";
+import { RoomsView } from "./RoomsView";
 
 interface MessageProps {
   record: MessageRecord;
   index: number;
+  /** 酒店卡片是否因列表版本不符而置灰 */
   stale: boolean;
+  /** 房型卡片是否因列表版本不符而置灰 */
+  roomsStale: boolean;
   onSelect: (item: HotelItem, revision: string) => Promise<void> | void;
+  onPickRoom: (index: number, room: RoomItem, plan: RoomPlan) => Promise<void> | void;
   onExpand: (index: number, onProgress?: (text: string) => void) => Promise<void>;
 }
 
-export function Message({ record, index, stale, onSelect, onExpand }: MessageProps) {
+export function Message({
+  record,
+  index,
+  stale,
+  roomsStale,
+  onSelect,
+  onPickRoom,
+  onExpand,
+}: MessageProps) {
   if (record.role === "sys") {
     return <div className="sys">{record.text}</div>;
   }
@@ -32,17 +48,40 @@ export function Message({ record, index, stale, onSelect, onExpand }: MessagePro
   }
 
   const rich = record.rich !== false;
-  // 结构化列表只把 intro 放进气泡正文，卡片另外渲染
-  const body = record.hotelView ? record.hotelView.intro || "" : record.text;
+  const hasRooms = !!record.roomsView;
+  // 结构化列表只把 intro（酒店）/ 卡片（房型）当主视图，正文不再重复整段列表
+  const body = record.hotelView
+    ? record.hotelView.intro || ""
+    : hasRooms
+      ? ""
+      : record.text;
   const total = record.hotelTotal ?? 0;
   const shown = record.next ?? 0;
 
   return (
     <div className="bot">
-      <span>{rich ? <RichText text={body} /> : body}</span>
+      {hasRooms ? (
+        <RoomsView
+          view={record.roomsView!}
+          stale={roomsStale}
+          picked={!!record.roomsPicked}
+          onPick={(room, plan) => onPickRoom(index, room, plan)}
+        />
+      ) : (
+        <span>{rich ? <RichText text={body} /> : body}</span>
+      )}
+
       {record.hotelView ? (
         <HotelView view={record.hotelView} stale={stale} onSelect={onSelect} />
       ) : null}
+
+      {hasRooms ? (
+        <details className="rooms-text">
+          <summary>查看完整文字列表</summary>
+          <RichText text={record.text} textOnly />
+        </details>
+      ) : null}
+
       {!record.stale && total > shown ? (
         <ExpandButton
           total={total}

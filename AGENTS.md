@@ -153,6 +153,7 @@ python tests/run_all.py
 - `/api/chat/stream` 是 POST + SSE，`EventSource` 用不了；解帧只在 `api/sse.ts` 做（`TextDecoder` 必须 `stream: true`）
 - 聊天记录存 `localStorage`（键 `hb_sessions_v1`），字段是历史格式，**只加不改**；服务端 30 分钟无活动会丢上下文，要提示"历史仍在、上下文已重置"
 - **卡片只渲染结构化字段**，不要退回解析回复文本；选店走 `hotel_id + revision`；卡片能否点击由 `activeRevision` 派生，不手工改 DOM
+- 选房走 `rooms_view` 的 `room_no + plan_no + rooms_revision`，**提交时不要带 `guest_name`**：带了会直接进入验价锁价，那是用户补完姓名后的下一步，不是一个按钮该干的事
 
 ## 编码约定
 

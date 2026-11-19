@@ -82,10 +82,12 @@ export default function App() {
       <MessageList
         messages={active?.messages ?? []}
         activeRevision={sessions.activeRevision}
+        activeRoomsRevision={sessions.activeRoomsRevision}
         status={chat.status}
         notices={notices}
         chatboxRef={chatboxRef}
         onSelect={chat.pickHotel}
+        onPickRoom={chat.pickRoom}
         onExpand={chat.expand}
       />
       <Composer busy={chat.busy} onSend={chat.send} />

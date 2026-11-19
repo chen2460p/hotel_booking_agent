@@ -34,6 +34,53 @@ export interface HotelView {
   items: HotelItem[];
 }
 
+/** 一档报价：同一房型下的某种价格/条件组合（对应一个 rate_plan_id） */
+export interface RoomPlan {
+  plan_no: number;
+  plan_key: string;
+  price_per_night: number;
+  total_price: number;
+  currency: string;
+  meal: string;
+  cancelable: boolean;
+  cancel_known: boolean;
+  cancel_policy: string;
+  on_request: boolean;
+  is_lowest: boolean;
+}
+
+/** 一种房型（含多档报价） */
+export interface RoomItem {
+  room_no: number;
+  room_name: string;
+  bed_type: string;
+  room_size: string;
+  max_occupancy: number;
+  on_request: boolean;
+  images: string[];
+  plans: RoomPlan[];
+}
+
+/**
+ * 房型结构化视图（后端 agent_common.rooms_view）。
+ *
+ * 编号与文本渲染同源（都走 plan_groups）：room_no 是房型序号、plan_no 是
+ * 房型内报价序号；rooms_revision 用于版本校验，旧房型列表 409。
+ */
+export interface RoomsView {
+  rooms_revision: string;
+  hotel_id: string;
+  hotel_name: string;
+  check_in: string;
+  check_out: string;
+  nights: number;
+  currency: string;
+  total_rooms: number;
+  shown_rooms: number;
+  truncated: boolean;
+  rooms: RoomItem[];
+}
+
 /**
  * 一条聊天记录。
  *
@@ -50,6 +97,10 @@ export interface MessageRecord {
   /** 已展示到第几家（"展开全部"的断点） */
   next?: number;
   hotelView?: HotelView | null;
+  /** 选中酒店后下发的房型列表（结构化选房用） */
+  roomsView?: RoomsView | null;
+  /** 已经通过房型卡片选定房型：卡片收起，只留文字记录 */
+  roomsPicked?: boolean;
   /** 新一轮搜索后旧消息的"展开全部"失效 */
   stale?: boolean;
 }
@@ -80,7 +131,7 @@ export interface ChatPayload {
   hotel_shown?: number;
   stage?: string;
   hotel_view?: HotelView | null;
-  rooms_view?: unknown;
+  rooms_view?: RoomsView | null;
 }
 
 /** GET /api/session/{id} */
@@ -93,7 +144,7 @@ export interface SessionInfoPayload {
   /** 服务端当前酒店列表版本；用于决定历史卡片是否仍可点 */
   search_revision?: string;
   rooms_revision?: string;
-  rooms_view?: unknown;
+  rooms_view?: RoomsView | null;
   last_active?: number;
 }
 
