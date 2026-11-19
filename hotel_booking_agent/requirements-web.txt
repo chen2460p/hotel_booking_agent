@@ -1,7 +1,8 @@
 # Web 入口依赖（CLI 入口 main.py / main_multi.py 不需要这些）
 fastapi>=0.110
 uvicorn[standard]>=0.27
-jinja2>=3.1
+# 页面由 frontend/ 的 React 构建产物托管（见 frontend/README 与 Dockerfile），
+# Python 侧不再需要 jinja2 模板引擎。
 
 # 项目运行基础依赖（CLI + Web 通用）
 requests>=2.28

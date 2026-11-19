@@ -40,9 +40,9 @@ npm run dev              # 只调界面：:5173，自动把 /api、/orders 代�
 ```
 
 - Python 3.10+（开发环境 Windows 11 + 3.13）
-- `requirements-web.txt` 同时包含 Web 依赖（fastapi/uvicorn/jinja2）与通用依赖（requests/python-dotenv）；`main.py` / `main_multi.py` **不需要** Web 那三个
+- `requirements-web.txt` 同时包含 Web 依赖（fastapi/uvicorn）与通用依赖（requests/python-dotenv）；`main.py` / `main_multi.py` **不需要** Web 那三个
 - **node 只在前端目录用**：`hotel_booking_agent/frontend`；CLI 入口和 Docker 运行时都不需要 node（镜像里是独立的构建阶段）
-- `templates/` 现在只剩 `orders.html`（Jinja2 服务端渲染）；聊天页是构建产物，**不要再往 `templates/` 加聊天页模板**
+- `templates/` 目录已删除：聊天页和订单页**都是** `frontend/dist` 的构建产物（Vite 多页构建：`index.html` + `orders.html`），不要再加 Jinja 模板
 - 首次真实下单要授权一次：`python rollinggo_book.py login`（token 落 `~/.hotel-cli/token.json`，有效期以 `python rollinggo_book.py status` 为准）
 - **时区固定 `Asia/Shanghai`**（Docker 里靠 `TZ`）：口语日期、跨月推断都用本地 `datetime.now()`，不要改成 UTC
 - Docker：仓库根目录 `docker compose up -d --build`，先 `python scripts/preflight.py` 自检；线上宿主端口 **9122**，容器内 8000
@@ -131,7 +131,7 @@ python tests/run_all.py
 
 | 接口 | 用途 | 关键约束 |
 |---|---|---|
-| `GET /` / `GET /orders` | 聊天页 / 订单页 | 聊天页是 `frontend/dist` 静态托管；订单页仍是 Jinja2 |
+| `GET /` / `GET /orders` | 聊天页 / 订单页 | 都是 `frontend/dist` 构建产物；订单筛选 `?filter=` 由前端读 URL |
 | `POST /api/chat` | 对话（返回 `hotel_view` / `rooms_view` / `stage`） | `session_id` 复用同一 Agent 实例 |
 | `POST /api/chat/stream` | 对话 SSE | 与 `/api/chat` 同逻辑，先推 `stage` |
 | `GET /api/session/{id}` | 会话存活 / 阶段 / 房型视图 | 只读，不创建会话 |
@@ -154,6 +154,7 @@ python tests/run_all.py
 - 聊天记录存 `localStorage`（键 `hb_sessions_v1`），字段是历史格式，**只加不改**；服务端 30 分钟无活动会丢上下文，要提示"历史仍在、上下文已重置"
 - **卡片只渲染结构化字段**，不要退回解析回复文本；选店走 `hotel_id + revision`；卡片能否点击由 `activeRevision` 派生，不手工改 DOM
 - 选房走 `rooms_view` 的 `room_no + plan_no + rooms_revision`，**提交时不要带 `guest_name`**：带了会直接进入验价锁价，那是用户补完姓名后的下一步，不是一个按钮该干的事
+- 订单页（`src/orders/`）的真实单取消仍是**两步**：先 `pre-cancel` 拿罚金和 10 分钟凭证并把罚金/预计退款摆给用户看，用户点「确认取消」才 `cancel` 带凭证提交；模拟单的「标记支付」只允许对 `source=mock` 显示
 
 ## 编码约定
 
@@ -176,7 +177,6 @@ python tests/run_all.py
 | `tools.py` / `rollinggo_book.py` | `test_cancel_unit`、`test_order_time_unit`、`test_rate_change_recovery_unit`、`test_pay_guard_unit` |
 | `storage.py` | `test_order_time_unit`、`test_cancel_unit` |
 | `frontend/`（React 前端） | `npm run build`（含 `tsc --noEmit`）+ 浏览器手工验收 + `test_api_smoke.py` |
-| `templates/orders.html` | 浏览器手工验收 + `test_api_smoke.py` |
 
 ## 提交前自检
 

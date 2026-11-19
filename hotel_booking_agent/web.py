@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-酒店预订 Web 入口 —— FastAPI + Jinja2。
+酒店预订 Web 入口 —— FastAPI（托管 React 构建产物 + JSON/SSE 接口）。
 
 启动：
-  pip install fastapi 'uvicorn[standard]' jinja2 requests dotenv
+  pip install fastapi 'uvicorn[standard]' requests dotenv
   uvicorn web:app --reload --host 127.0.0.1 --port 8000
 
 功能：
@@ -34,11 +34,10 @@ PROJ = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJ))
 os.chdir(str(PROJ))
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from agent import HotelBookingAgent, SelectionError
@@ -48,10 +47,9 @@ import hotel_rating
 import rollinggo_book as rlg
 
 app = FastAPI(title="酒店预订 Agent Web 版", version="0.2.0")
-templates = Jinja2Templates(directory=str(PROJ / "templates"))
 
 # ---------- 前端构建产物（frontend/dist，由 Vite 生成）----------
-# 聊天页已经是 React SPA：这里只负责托管静态文件，接口一个都不用改。
+# 聊天页与订单页都是 React SPA：这里只负责托管静态文件，接口一个都不用改。
 # 构建：cd hotel_booking_agent/frontend && npm ci && npm run build
 DIST = PROJ / "frontend" / "dist"
 
@@ -59,7 +57,7 @@ _BUILD_HINT = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><title>前端未构建</title></head>
 <body style="font-family:'Microsoft YaHei',system-ui,sans-serif;max-width:720px;margin:60px auto;padding:0 16px">
 <h1>前端还没构建</h1>
-<p>聊天页由 <code>frontend/dist</code> 提供，当前目录不存在或缺少 <code>index.html</code>。</p>
+<p>聊天页 / 订单页都由 <code>frontend/dist</code> 提供，当前目录不存在或缺少 <code>index.html</code>、<code>orders.html</code>。</p>
 <pre style="background:#f6f8fa;padding:12px;border-radius:8px">cd hotel_booking_agent/frontend
 npm ci
 npm run build</pre>
@@ -294,7 +292,7 @@ def _chat_payload(agent: HotelBookingAgent, reply: str,
 
 
 # ---------- 页面路由 ----------
-# 首页是构建后的 React 单页（frontend/dist/index.html），页面路由一律 no-cache：
+# 两个页面都是构建后的 React 单页（frontend/dist/*.html），页面路由一律 no-cache：
 # 前端发版后浏览器立即拿到新版，避免缓存旧 JS（如旧版图片正则不认 .jpg-t）。
 @app.get("/", response_class=HTMLResponse)
 async def chat_page():
@@ -307,12 +305,14 @@ async def chat_page():
 
 
 @app.get("/orders", response_class=HTMLResponse)
-async def orders_page(request: Request, filter: str = "ALL"):
-    return templates.TemplateResponse(request, "orders.html", {
-        "current_filter": filter.upper(),
-        "storage_backend": storage.storage_backend(),
-        "storage_enabled": storage.storage_available(),
-    }, headers={"Cache-Control": "no-cache"})
+async def orders_page():
+    # 订单页也是构建产物；筛选（?filter=）由前端读 URL 决定，服务端不管
+    page = DIST / "orders.html"
+    if not page.exists():
+        return HTMLResponse(_BUILD_HINT, status_code=500,
+                            headers={"Cache-Control": "no-cache"})
+    return FileResponse(page, media_type="text/html",
+                        headers={"Cache-Control": "no-cache"})
 
 
 # ---------- API 路由 ----------

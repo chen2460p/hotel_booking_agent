@@ -1,6 +1,6 @@
 # Docker 部署说明
 
-项目是标准 Python 3.10+ Web 应用（FastAPI + Jinja2 订单页），多阶段构建里有一步前端打包（React + Vite），
+项目是标准 Python 3.10+ Web 应用（FastAPI + React 前端），镜像多阶段构建里含一步 Node/Vite 打包，
 无本地数据库服务依赖，**可以直接容器化**。仓库里提供三个文件：
 
 | 文件 | 作用 |

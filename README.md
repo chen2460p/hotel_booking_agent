@@ -109,18 +109,19 @@
     ├── 启动前端.bat              # Windows 一键起 Web（chcp 65001 + python web.py）
     ├── main.py                   # 入口①：ReAct + Workflow 混合版（真实下单链路在这）
     ├── main_multi.py             # 入口②：Supervisor-Worker 多 Agent 协作版
-    ├── web.py                    # 入口③：FastAPI（托管前端产物 + JSON/SSE 接口 + 订单页）
-    ├── templates/orders.html     # 订单页（Jinja2 服务端渲染）
-    ├── frontend/                 # Web 聊天页源码（React + TypeScript + Vite）
+    ├── web.py                    # 入口③：FastAPI（托管前端产物 + JSON/SSE 接口）
+    ├── frontend/                 # Web 前端源码（React + TypeScript + Vite，多页构建）
     │   ├── package.json          # 前端依赖与脚本（dev / build）
-    │   ├── vite.config.ts        # dev 时把 /api、/orders 代理到 :8000
-    │   ├── index.html            # 页面外壳（referrer=no-referrer 防道旅 CDN 403）
+    │   ├── vite.config.ts        # 两个入口（index/orders）；dev 时把 /api、/orders 代理到 :8000
+    │   ├── index.html            # 聊天页外壳（referrer=no-referrer 防道旅 CDN 403）
+    │   ├── orders.html           # 订单页外壳
     │   └── src/
-    │       ├── App.tsx           # 根组件：顶栏 + 聊天区 + 输入区
-    │       ├── api/              # client.ts（REST，409/404 语义）、sse.ts（POST SSE 解帧）
+    │       ├── App.tsx           # 聊天页根组件：顶栏 + 聊天区 + 输入区
+    │       ├── api/              # client.ts（会话/选店/选房）、orders.ts（订单三接口）、sse.ts（POST SSE 解帧）
     │       ├── hooks/            # useSessions（localStorage 会话栈）、useChat（对话流程）
     │       ├── lib/              # imgQueue（图片串行队列）、richText、sessionOps、format
-    │       ├── components/       # 卡片 / 消息 / 展开按钮 / 输入框等
+    │       ├── components/       # 酒店卡 / 房型卡 / 消息 / 展开按钮 / 输入框等
+    │       ├── orders/           # 订单页：列表、筛选、两步取消确认框、纯展示逻辑
     │       └── styles.css        # 与旧版同一套类名，视觉零变化
     ├── agent.py                  # 主版状态机：选店选房、验价确认编排
     ├── multi_agent.py            # 多 Agent：Supervisor/Search/Booking/Service/Review
@@ -346,7 +347,8 @@ orderNo + paymentUrl（通用收银台，用户自行打开支付）
 | `agent.py` | 主状态机：选店、验价确认卡编排、下单与取消（选择/解析/渲染细节走 `agent_common`） |
 | `multi_agent.py` | `AgentMessage` 消息队列 + `AgentState` 共享黑板；Supervisor 分发 Search/Booking/Service/Review 四个 Worker |
 | `agent_common.py` | 两套架构共用的纯逻辑：`merge_params / parse_hotel_selection / match_room_choice / extract_guest_name / detect_order_filter / render_hotel_results_parts / render_hotel_selection / chat_reply` 等，含同房型多档报价的分组、差价展示与 `1-2` 选择解析 |
-| `web.py` | FastAPI 入口：托管 `frontend/dist`（首页）/ `templates/orders.html`（订单页）；会话池（30 分钟 TTL）、SSE 阶段推送、结构化酒店列表 `GET /api/session/{id}/hotels` 与按 `hotel_id + revision` 选店 `POST /api/session/{id}/select`（旧列表 409）；选中酒店后返回 `rooms_view`（房型 × 报价档，`plan_key` 即 `rate_plan_id`），按 `room_no + plan_no + rooms_revision` 选房 `POST /api/session/{id}/room`（不解析文本，旧房型列表 409）；`hotel_view` 只由服务端搜索结果生成 |
+| `web.py` | FastAPI 入口：托管 `frontend/dist`（聊天页 + 订单页）；会话池（30 分钟 TTL）、SSE 阶段推送、结构化酒店列表 `GET /api/session/{id}/hotels` 与按 `hotel_id + revision` 选店 `POST /api/session/{id}/select`（旧列表 409）；选中酒店后返回 `rooms_view`（房型 × 报价档，`plan_key` 即 `rate_plan_id`），按 `room_no + plan_no + rooms_revision` 选房 `POST /api/session/{id}/room`（不解析文本，旧房型列表 409）；`hotel_view` 只由服务端搜索结果生成 |
+| `frontend/src/orders/` | 订单页：`format.ts` 是纯展示逻辑（时间/状态分桶/动作判定，可单测）；`OrdersTable` 只渲染 `/api/orders` 的结构化行；真实单取消走「询价 → 展示罚金与预计退款 → 用户确认 → 带凭证提交」两步，模拟单的「标记支付」只对 `source=mock` 出现 |
 | `frontend/` | React + TypeScript 聊天页：`api/sse.ts` 用 fetch 解 POST-SSE 帧；`lib/imgQueue.ts` 串行加载图片（道旅 CDN 并发会 403）并做可视区懒加载；`lib/sessionOps.ts` 管 localStorage 多会话栈（键仍为 `hb_sessions_v1`）；酒店卡片按 `hotel_view`、房型卡片按 `rooms_view` 渲染，能否点击由 `activeRevision` / `activeRoomsRevision` 派生；选房只提交 `room_no + plan_no + rooms_revision`（不带姓名，避免误触发验价） |
 | `cli_common.py` | 终端入口共用：`display_width()` 与 `print_banner(rows)`（按显示宽度生成 ASCII 横幅） |
 | `rag.py` | 模拟评价语料切块、Embedding 双模式、召回+重排+生成 |

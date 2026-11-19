@@ -123,9 +123,20 @@ def test_index_page_renders():
 
 
 def test_orders_page_renders():
+    """订单页也是 React 构建产物：外壳 #root + 订单页的 JS 包。"""
     r = http("/orders")
-    assert r.status == 200, f"/orders 期望 200，实际 {r.status}"
+    assert r.status == 200, f"/orders 期望 200，实际 {r.status}（500 多为前端未构建）"
     assert "text/html" in r.header("Content-Type")
+    assert r.header("Cache-Control") == "no-cache"
+    body = r.text
+    assert 'id="root"' in body, "订单页缺少 React 挂载点 #root"
+    match = re.search(r'/assets/[^"\']+\.js', body)
+    assert match, "订单页没有引用 JS 构建产物"
+    asset = http(match.group(0))
+    assert asset.status == 200, f"订单页构建产物无法访问：{match.group(0)}"
+    script = asset.text
+    assert "pre-cancel" in script, "订单页产物缺少真实单取消询价"
+    assert "标记支付" in script, "订单页产物缺少模拟单标记支付"
 
 
 def test_openapi_contract():

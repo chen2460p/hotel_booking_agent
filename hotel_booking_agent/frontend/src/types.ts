@@ -172,3 +172,52 @@ export interface StagePayload {
   stage: string;
   text: string;
 }
+
+/** 订单列表的一行（GET /api/orders） */
+export interface OrderRow {
+  order_no: string;
+  hotel_name: string;
+  room_name?: string | null;
+  check_in?: string | null;
+  check_out?: string | null;
+  total_price?: number | string | null;
+  currency?: string | null;
+  status?: string;
+  status_text?: string;
+  status_bucket?: "PENDING" | "FINISHED" | "CANCELLED";
+  payment_url?: string;
+  payment_deadline?: string;
+  create_time?: string;
+  paid_time?: string;
+  updated_at?: string;
+  source?: string;
+}
+
+export interface OrdersPayload {
+  rows: OrderRow[];
+  logged_in?: boolean;
+  filter?: string;
+  source?: string;
+  remote_error?: string | null;
+}
+
+/** 真实单取消询价的返回（POST /api/orders/{id}/pre-cancel） */
+export interface PreCancelPayload {
+  ok?: boolean;
+  order_id?: string;
+  reason?: string;
+  message?: string;
+  hotel_name?: string;
+  total_price?: number;
+  penalty?: number | null;
+  confirm_id?: string;
+  booking_id?: string;
+}
+
+/** 取消/支付的通用返回 */
+export interface OrdersActionResult {
+  ok?: boolean;
+  order_id?: string;
+  reason?: string;
+  message?: string;
+}

@@ -1,0 +1,54 @@
+/* 订单页样式：前半段从旧版 templates/orders.html 原样搬过来（类名不变），
+   后半段是改版新增的筛选按钮、提示条与确认弹窗。 */
+
+body { font-family: "Microsoft YaHei", system-ui, sans-serif; max-width: 1280px; margin: 0 auto; padding: 16px; }
+h1 { color: #2c3e50; }
+.topbar { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; font-size: 13px; color: #666; }
+.topbar a { color: #2980b9; text-decoration: none; }
+.tag { background: #ecf0f1; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+.tag.warn { background: #fff3cd; color: #8a6d00; }
+table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
+th, td { border-bottom: 1px solid #eee; padding: 8px 10px; text-align: left; }
+th { background: #f8f9fa; color: #555; white-space: nowrap; }
+/* 订单号/价格/状态/来源/操作不折行；酒店与房型列允许换行 */
+td:nth-child(1), td:nth-child(6), td:nth-child(7), td:nth-child(8), td:nth-child(9),
+th:nth-child(6), th:nth-child(7), th:nth-child(8), th:nth-child(9) { white-space: nowrap; }
+tr:hover td { background: #fafbfc; }
+.status-pending { color: #e67e22; }
+.status-paid    { color: #27ae60; }
+.status-cancel  { color: #95a5a6; text-decoration: line-through; }
+.btn { padding: 4px 12px; background: #2980b9; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; margin-right: 6px; }
+.btn:hover { background: #1e6fa0; }
+.btn.danger { background: #c0392b; }
+.btn.danger:hover { background: #a93226; }
+.btn.ghost { background: #fff; color: #555; border: 1px solid #ccc; }
+.btn.ghost:hover { background: #f4f6f7; }
+.btn:disabled { opacity: .55; cursor: not-allowed; }
+.pay-link { color: #e67e22; margin-right: 8px; }
+.time { white-space: nowrap; font-variant-numeric: tabular-nums; color: #34495e; }
+.detail-row td { background: #fbfdff; padding: 0 10px 10px; border-bottom: 1px solid #eee; }
+.detail-box {
+  display: flex; flex-wrap: wrap; gap: 22px; align-items: center;
+  margin-left: 10px; padding: 8px 12px; border-left: 3px solid #b7d7ee;
+  background: #f5faff; border-radius: 0 6px 6px 0; font-size: 13px; color: #52616b;
+}
+.detail-box b { color: #2c3e50; font-weight: 600; }
+.pay-badge { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 8px; background: #eaf7ef; color: #27ae60; font-size: 11px; }
+.empty { text-align: center; padding: 40px; color: #999; }
+.filter { margin-top: 12px; }
+.filter button { display: inline-block; padding: 4px 12px; margin-right: 6px; border: 1px solid #ddd; border-radius: 14px; background: #fff; color: #555; font-size: 13px; cursor: pointer; font-family: inherit; }
+.filter button:hover { border-color: #2980b9; color: #2980b9; }
+.filter button.active { background: #2980b9; color: #fff; border-color: #2980b9; }
+
+/* 操作结果提示 */
+.notice { margin-top: 10px; padding: 8px 12px; border-radius: 6px; font-size: 13px; }
+.notice.ok { background: #eaf7ef; color: #1e8449; }
+.notice.err { background: #fdecea; color: #b03a2e; }
+.notice.warn { background: #fff8e1; color: #8a6d00; }
+
+/* 确认弹窗（替代旧版的 window.confirm/alert） */
+.overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, .35); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 50; }
+.dialog { background: #fff; border-radius: 10px; padding: 18px 20px; width: 100%; max-width: 460px; box-shadow: 0 12px 40px rgba(0, 0, 0, .22); }
+.dialog h2 { margin: 0 0 10px; font-size: 16px; color: #2c3e50; }
+.dialog .lines { font-size: 13px; color: #52616b; line-height: 1.8; word-break: break-all; }
+.dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
