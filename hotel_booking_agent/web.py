@@ -7,7 +7,8 @@
   uvicorn web:app --reload --host 127.0.0.1 --port 8000
 
 功能：
-  - GET  /              聊天页面（Jinja2 模板）
+  - GET  /              聊天页面（React SPA，托管 frontend/dist；未构建时给提示页）
+  - GET  /assets/*      前端构建产物的静态文件（带 hash，长缓存）
   - POST /api/chat      对话接口（JSON 入 user_input，出 reply）
   - POST /api/chat/stream  对话接口 SSE 版（先推阶段事件，最后推完整回复）
   - GET  /api/session/{session_id}  查询会话在服务端是否仍存活（前端恢复本地历史用）
@@ -34,7 +35,9 @@ sys.path.insert(0, str(PROJ))
 os.chdir(str(PROJ))
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
@@ -46,6 +49,55 @@ import rollinggo_book as rlg
 
 app = FastAPI(title="酒店预订 Agent Web 版", version="0.2.0")
 templates = Jinja2Templates(directory=str(PROJ / "templates"))
+
+# ---------- 前端构建产物（frontend/dist，由 Vite 生成）----------
+# 聊天页已经是 React SPA：这里只负责托管静态文件，接口一个都不用改。
+# 构建：cd hotel_booking_agent/frontend && npm ci && npm run build
+DIST = PROJ / "frontend" / "dist"
+
+_BUILD_HINT = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><title>前端未构建</title></head>
+<body style="font-family:'Microsoft YaHei',system-ui,sans-serif;max-width:720px;margin:60px auto;padding:0 16px">
+<h1>前端还没构建</h1>
+<p>聊天页由 <code>frontend/dist</code> 提供，当前目录不存在或缺少 <code>index.html</code>。</p>
+<pre style="background:#f6f8fa;padding:12px;border-radius:8px">cd hotel_booking_agent/frontend
+npm ci
+npm run build</pre>
+<p>只想调界面时可以用 <code>npm run dev</code>（:5173，自动代理 /api 到 :8000），
+不必每次构建；Docker 镜像里由构建阶段自动完成。</p>
+</body></html>"""
+
+
+class _ImmutableStaticFiles(StaticFiles):
+    """Vite 产物文件名带内容 hash：内容变了名字一定变，可以长期强缓存。"""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code == 200:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
+
+
+class _AssetsGZip(GZipMiddleware):
+    """只压缩 /assets/*。
+
+    对话流是 text/event-stream，全局启用 gzip 对 SSE 有缓冲风险；
+    静态文件（几百 KB 的 JS）才是真正值得压的。
+    """
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and str(scope.get("path", "")).startswith("/assets/"):
+            await super().__call__(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+if (DIST / "assets").is_dir():
+    app.mount("/assets", _ImmutableStaticFiles(directory=str(DIST / "assets")), name="assets")
+    app.add_middleware(_AssetsGZip, minimum_size=512)
+else:
+    # 不抛异常：没有前端也要能起服务（接口、/orders 都还能用），只是首页给提示页
+    print(f"[前端未构建] {DIST} 不存在或缺少 assets/，首页将返回构建提示页")
 
 
 # ---------- 会话 agent 池（多轮对话状态保持 + 会话间隔离）----------
@@ -242,14 +294,16 @@ def _chat_payload(agent: HotelBookingAgent, reply: str,
 
 
 # ---------- 页面路由 ----------
-# HTML 页面一律 no-cache：前端模板更新后浏览器立即拿到新版，
-# 避免缓存旧 JS（如旧版图片正则不认 .jpg-t 导致图片渲染成链接）
+# 首页是构建后的 React 单页（frontend/dist/index.html），页面路由一律 no-cache：
+# 前端发版后浏览器立即拿到新版，避免缓存旧 JS（如旧版图片正则不认 .jpg-t）。
 @app.get("/", response_class=HTMLResponse)
-async def chat_page(request: Request):
-    return templates.TemplateResponse(request, "index.html", {
-        "storage_backend": storage.storage_backend(),
-        "storage_enabled": storage.storage_available(),
-    }, headers={"Cache-Control": "no-cache"})
+async def chat_page():
+    index = DIST / "index.html"
+    if not index.exists():
+        return HTMLResponse(_BUILD_HINT, status_code=500,
+                            headers={"Cache-Control": "no-cache"})
+    return FileResponse(index, media_type="text/html",
+                        headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/orders", response_class=HTMLResponse)

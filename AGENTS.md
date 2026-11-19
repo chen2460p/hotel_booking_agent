@@ -30,8 +30,19 @@ python main.py                 # 终端·单 Agent（真实下单链路在这）
 python main_multi.py           # 终端·多 Agent 协作
 ```
 
+Web 首页是 React 构建产物，`python web.py` 之前必须先构建一次（或走 `npm run dev`）：
+
+```powershell
+cd hotel_booking_agent/frontend
+npm ci
+npm run build            # 产物 frontend/dist；未构建时 GET / 返回 500 构建提示页
+npm run dev              # 只调界面：:5173，自动把 /api、/orders 代理到 :8000
+```
+
 - Python 3.10+（开发环境 Windows 11 + 3.13）
 - `requirements-web.txt` 同时包含 Web 依赖（fastapi/uvicorn/jinja2）与通用依赖（requests/python-dotenv）；`main.py` / `main_multi.py` **不需要** Web 那三个
+- **node 只在前端目录用**：`hotel_booking_agent/frontend`；CLI 入口和 Docker 运行时都不需要 node（镜像里是独立的构建阶段）
+- `templates/` 现在只剩 `orders.html`（Jinja2 服务端渲染）；聊天页是构建产物，**不要再往 `templates/` 加聊天页模板**
 - 首次真实下单要授权一次：`python rollinggo_book.py login`（token 落 `~/.hotel-cli/token.json`，有效期以 `python rollinggo_book.py status` 为准）
 - **时区固定 `Asia/Shanghai`**（Docker 里靠 `TZ`）：口语日期、跨月推断都用本地 `datetime.now()`，不要改成 UTC
 - Docker：仓库根目录 `docker compose up -d --build`，先 `python scripts/preflight.py` 自检；线上宿主端口 **9122**，容器内 8000
@@ -54,9 +65,10 @@ python tests/run_all.py
 | 命令 | 说明 |
 |---|---|
 | `python tests/run_all.py` | 离线单测总入口，不含需要服务的冒烟 |
-| `python tests/test_api_smoke.py` | **需要先起服务**（默认 `http://127.0.0.1:8000`，`BASE_URL` 可覆盖）；不是离线用例 |
+| `python tests/test_api_smoke.py` | **需要先起服务**（默认 `http://127.0.0.1:8000`，`BASE_URL` 可覆盖）；不是离线用例。**先 `npm run build`**，否则 `/` 是 500 构建提示页 |
 | `python tests/test_cancel_unit.py` | 单个文件都能直接跑；装了 pytest 可 `pytest tests/ -v --ignore=tests/test_api_smoke.py`（当前环境未必装） |
 | `RUN_LLM_TESTS=1 python tests/test_api_smoke.py` | 才跑真实模型/SSE 用例；慢且不确定，**不要塞进回归** |
+| `cd hotel_booking_agent/frontend && npm run build` | 前端类型检查（`tsc --noEmit`）+ 构建；改过 `frontend/` 必须跑通 |
 
 **测试红线**：
 
@@ -84,6 +96,7 @@ python tests/run_all.py
 | 工具层 | `tools.py`、`rag.py` | 三级回退的统一入口 / 评价检索。新增数据源改这里，别在 `agent.py` 里直接调外部 API |
 | 外部适配 | `rollinggo_mcp.py`、`rollinggo_book.py`、`amap_poi.py`、`ctrip_crawler.py`、`hotel_rating.py` | 一个文件对一个外部服务，超时/异常必须在内部消化成降级结果 |
 | 存储 | `storage.py` | SQLite / MySQL / 内存自动回退。表结构变更**只加列**，不改不删 |
+| Web 前端 | `frontend/src/`（React + TypeScript） | 只渲染 `hotel_view` 的结构化字段；请求统一走 `api/client.ts`、SSE 统一走 `api/sse.ts`，组件里不直接 fetch |
 | 入口 | `main.py`、`main_multi.py`、`web.py`、`cli_common.py` | 只做输入输出循环/终端展示，不写业务逻辑 |
 
 **并发约束**：`web.py` 的会话池、SQLite 句柄都在单进程内存里，**禁止 `--workers > 1`**（Dockerfile 已注明）。多 worker = 多轮状态丢失、订单互相不可见。
@@ -118,7 +131,7 @@ python tests/run_all.py
 
 | 接口 | 用途 | 关键约束 |
 |---|---|---|
-| `GET /` / `GET /orders` | 聊天页 / 订单页 | Jinja2 模板 |
+| `GET /` / `GET /orders` | 聊天页 / 订单页 | 聊天页是 `frontend/dist` 静态托管；订单页仍是 Jinja2 |
 | `POST /api/chat` | 对话（返回 `hotel_view` / `rooms_view` / `stage`） | `session_id` 复用同一 Agent 实例 |
 | `POST /api/chat/stream` | 对话 SSE | 与 `/api/chat` 同逻辑，先推 `stage` |
 | `GET /api/session/{id}` | 会话存活 / 阶段 / 房型视图 | 只读，不创建会话 |
@@ -132,11 +145,14 @@ python tests/run_all.py
 | `POST /api/orders/{id}/cancel` | ⚠️ 真实交易：提交取消 | 必须带前置凭证，等价 `confirm_cancel` |
 | `GET /api/health` | 健康检查 | 存储后端 / 会话数 / 道旅登录态 |
 
-前端（`templates/index.html`）注意：
+前端（`hotel_booking_agent/frontend/src`，构建产物由 `web.py` 托管）注意：
 
-- 道旅 CDN 需要 `referrer=no-referrer`，否则图片 403
-- 聊天记录存 `localStorage`；服务端 30 分钟无活动会丢上下文，要提示"历史仍在、上下文已重置"
-- **卡片只渲染结构化字段**，不要退回解析回复文本；选店/选房走上面的结构化接口
+- 道旅 CDN 需要 `referrer=no-referrer`：页面 `index.html` 的 `<meta>` + 每张 `<img>` 的 `referrerPolicy`，缺一处图片就 403
+- **图片只能走 `lib/imgQueue.ts`**：串行 + 可视区懒加载 + 失败重试一次 + 退化成链接。别直接给 `<img>` 赋 `src`，CDN 有并发风控（实测 8 张并发 5 张 403）
+- **不要开 `React.StrictMode`**：开发环境 effect 双跑会让同一张图入队两次，正好撞风控
+- `/api/chat/stream` 是 POST + SSE，`EventSource` 用不了；解帧只在 `api/sse.ts` 做（`TextDecoder` 必须 `stream: true`）
+- 聊天记录存 `localStorage`（键 `hb_sessions_v1`），字段是历史格式，**只加不改**；服务端 30 分钟无活动会丢上下文，要提示"历史仍在、上下文已重置"
+- **卡片只渲染结构化字段**，不要退回解析回复文本；选店走 `hotel_id + revision`；卡片能否点击由 `activeRevision` 派生，不手工改 DOM
 
 ## 编码约定
 
@@ -144,7 +160,7 @@ python tests/run_all.py
 - 面向 Windows 终端输出要按**显示宽度**算（中文占 2 列），别用 `len()` 直接对齐
 - 所有文件 UTF-8；`requirements-web.txt` 里区分"Web 依赖"和"通用依赖"两段，别混
 - 新增外部服务 → 新建一个适配器文件，并在 `tools.py` 里挂到回退链上
-- **不引入新依赖**，除非确有必要并同步 `requirements-web.txt` 与 Dockerfile
+- **不引入新依赖**，除非确有必要并同步 `requirements-web.txt` 与 Dockerfile。**前端例外**：node 依赖只允许出现在 `hotel_booking_agent/frontend`，`package.json` + `package-lock.json` 一起提交，锁文件不许手改
 - **PII 不进日志/回复**：`recent_guests` 含姓名/手机/邮箱，只展示必要字段；token、`.env` 值绝不回显
 - 改 `.env.example` 必须同步 `README.md` 配置表；新增模块必须同步 README 模块表与本文件分层表
 
@@ -158,15 +174,17 @@ python tests/run_all.py
 | `web.py` | 起服务后 `test_api_smoke.py` + `test_selection_unit` + `test_rooms_view_unit` |
 | `tools.py` / `rollinggo_book.py` | `test_cancel_unit`、`test_order_time_unit`、`test_rate_change_recovery_unit`、`test_pay_guard_unit` |
 | `storage.py` | `test_order_time_unit`、`test_cancel_unit` |
-| `templates/` | 浏览器手工验收 + `test_api_smoke.py` |
+| `frontend/`（React 前端） | `npm run build`（含 `tsc --noEmit`）+ 浏览器手工验收 + `test_api_smoke.py` |
+| `templates/orders.html` | 浏览器手工验收 + `test_api_smoke.py` |
 
 ## 提交前自检
 
 ```powershell
 python tests/run_all.py                                      # 离线单测（约 10 秒）
-python tests/test_api_smoke.py                               # 需先起服务
+cd hotel_booking_agent/frontend; npm run build; cd ../..      # 前端类型检查 + 构建（web.py 托管 dist）
+python tests/test_api_smoke.py                               # 需先起服务（dist 已构建，否则 / 是 500）
 Select-String -LiteralPath .gitignore -Pattern "orders.db"   # 确认仍被忽略
-git status --short                                           # 不该出现 .env / *.db / cache/
+git status --short                                           # 不该出现 .env / *.db / cache/ / node_modules/
 ```
 
 不要提交：`.env`、`orders.db` 及 `-shm`/`-wal`/`.bak`、`hotel_booking_agent/cache/`、`__pycache__/`、`个人资料/`、含真实订单的预览图。

@@ -19,6 +19,7 @@
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -95,17 +96,30 @@ def test_health_endpoint():
 
 
 def test_index_page_renders():
+    """首页是 React 构建产物：外壳 #root + 带 hash 的 assets，交互逻辑在打包后的 JS 里。
+
+    dist 未构建时 `/` 返回 500 构建提示页，所以 200 本身也验证了前端产物已就绪。
+    """
     r = http("/")
-    assert r.status == 200, f"首页期望 200，实际 {r.status}"
+    assert r.status == 200, (
+        f"首页期望 200，实际 {r.status}（500 多为前端未构建："
+        f"cd hotel_booking_agent/frontend && npm run build）"
+    )
     assert "text/html" in r.header("Content-Type"), r.headers
-    assert r.header("Cache-Control") == "no-cache", "页面应禁用缓存，否则可能拿到旧模板"
+    assert r.header("Cache-Control") == "no-cache", "页面应禁用缓存，否则可能拿到旧构建"
     body = r.text
-    assert "酒店" in body, "首页内容缺少中文文案，模板可能没加载"
-    assert len(body) > 3000, f"首页只有 {len(body)} 字节，疑似模板渲染异常"
-    # 多会话/本地历史：从订单页返回后要能恢复聊天记录，且能新建会话
-    assert 'id="session-select"' in body, "首页缺少会话切换下拉框"
-    assert 'id="new-session"' in body, "首页缺少“新建会话”按钮"
-    assert "hb_sessions_v1" in body, "首页缺少聊天记录本地持久化逻辑"
+    assert "酒店" in body, "首页内容缺少中文文案"
+
+    # 会话切换 / 新建会话 / 本地持久化都搬进了打包产物：校验外壳引用，再校验产物内容
+    assert 'id="root"' in body, "首页缺少 React 挂载点 #root，dist 可能不是 Vite 产物"
+    match = re.search(r'/assets/[^"\']+\.js', body)
+    assert match, "首页没有引用 JS 构建产物，dist 可能未构建"
+    asset = http(match.group(0))
+    assert asset.status == 200, f"构建产物无法访问：{match.group(0)}"
+    script = asset.text
+    assert "hb_sessions_v1" in script, "打包产物缺少聊天记录本地持久化逻辑"
+    assert "session-select" in script, "打包产物缺少会话切换下拉框"
+    assert "api/chat/stream" in script, "打包产物缺少 SSE 对话接口"
 
 
 def test_orders_page_renders():

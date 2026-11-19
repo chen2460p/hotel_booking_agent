@@ -109,8 +109,19 @@
     ├── 启动前端.bat              # Windows 一键起 Web（chcp 65001 + python web.py）
     ├── main.py                   # 入口①：ReAct + Workflow 混合版（真实下单链路在这）
     ├── main_multi.py             # 入口②：Supervisor-Worker 多 Agent 协作版
-    ├── web.py                    # 入口③：FastAPI + Web 聊天界面
-    ├── templates/index.html      # Web 前端（referrer=no-referrer 防道旅 CDN 403）
+    ├── web.py                    # 入口③：FastAPI（托管前端产物 + JSON/SSE 接口 + 订单页）
+    ├── templates/orders.html     # 订单页（Jinja2 服务端渲染）
+    ├── frontend/                 # Web 聊天页源码（React + TypeScript + Vite）
+    │   ├── package.json          # 前端依赖与脚本（dev / build）
+    │   ├── vite.config.ts        # dev 时把 /api、/orders 代理到 :8000
+    │   ├── index.html            # 页面外壳（referrer=no-referrer 防道旅 CDN 403）
+    │   └── src/
+    │       ├── App.tsx           # 根组件：顶栏 + 聊天区 + 输入区
+    │       ├── api/              # client.ts（REST，409/404 语义）、sse.ts（POST SSE 解帧）
+    │       ├── hooks/            # useSessions（localStorage 会话栈）、useChat（对话流程）
+    │       ├── lib/              # imgQueue（图片串行队列）、richText、sessionOps、format
+    │       ├── components/       # 卡片 / 消息 / 展开按钮 / 输入框等
+    │       └── styles.css        # 与旧版同一套类名，视觉零变化
     ├── agent.py                  # 主版状态机：选店选房、验价确认编排
     ├── multi_agent.py            # 多 Agent：Supervisor/Search/Booking/Service/Review
     ├── agent_common.py           # 单/多 Agent 共用纯逻辑：合并参数、选店选房、渲染
@@ -142,7 +153,9 @@ pip install requests python-dotenv
 pip install dashscope      # 可选：RAG 真实 Embedding 需要；不装则 RAG 用 TF-IDF 模拟
 ```
 
-> 无需 Node.js：道旅 OAuth 登录已在 `rollinggo_book.py` 中用 Python 原生实现（授权码 + PKCE，起本地回调服务），不依赖官方 `@rollinggo/hotel` CLI。
+> 道旅 OAuth 登录已在 `rollinggo_book.py` 中用 Python 原生实现（授权码 + PKCE，起本地回调服务），**不需要官方 `@rollinggo/hotel` CLI，也不需要 Node.js**。
+>
+> 只有构建 Web 聊天页（`hotel_booking_agent/frontend`）需要 **Node.js 20+**；`main.py` / `main_multi.py` 和 Docker 运行时都不需要（镜像里是独立的 node 构建阶段）。
 
 ## 配置项说明（.env）
 
@@ -197,6 +210,22 @@ python main_multi.py
 ```
 
 只配置 `ROLLINGGO_API_KEY` 而不登录 OAuth：搜索/房价/验价前的浏览全部可用，走到真实下单时程序会提示登录命令，并自动回退为本地模拟下单，不阻断体验。
+
+### 启动 Web 界面
+
+聊天页是 React 构建产物（`hotel_booking_agent/frontend/dist`），第一次用、以及改过前端之后要构建一次：
+
+```powershell
+cd hotel_booking_agent/frontend
+npm ci
+npm run build          # 类型检查（tsc --noEmit）+ 打包，产物落在 frontend/dist
+cd ..
+python web.py          # http://127.0.0.1:8000（也可双击 启动前端.bat）
+```
+
+只想调界面时不用反复构建：另开一个终端跑 `npm run dev`（http://127.0.0.1:5173），它会把 `/api`、`/orders` 代理到 8000 上的 `python web.py`。
+
+> 没构建就启动 `python web.py` 不会报错：接口和订单页照常可用，首页会显示一条「前端未构建」的提示页，照着上面的命令构建即可。Docker 镜像里由构建阶段自动完成，不需要宿主装 node。
 
 ## 对话下单全流程（真实链路）
 
@@ -317,7 +346,8 @@ orderNo + paymentUrl（通用收银台，用户自行打开支付）
 | `agent.py` | 主状态机：选店、验价确认卡编排、下单与取消（选择/解析/渲染细节走 `agent_common`） |
 | `multi_agent.py` | `AgentMessage` 消息队列 + `AgentState` 共享黑板；Supervisor 分发 Search/Booking/Service/Review 四个 Worker |
 | `agent_common.py` | 两套架构共用的纯逻辑：`merge_params / parse_hotel_selection / match_room_choice / extract_guest_name / detect_order_filter / render_hotel_results_parts / render_hotel_selection / chat_reply` 等，含同房型多档报价的分组、差价展示与 `1-2` 选择解析 |
-| `web.py` | FastAPI 入口：会话池（30 分钟 TTL）、SSE 阶段推送、结构化酒店列表 `GET /api/session/{id}/hotels` 与按 `hotel_id + revision` 选店 `POST /api/session/{id}/select`（旧列表 409）；选中酒店后返回 `rooms_view`（房型 × 报价档，`plan_key` 即 `rate_plan_id`），按 `room_no + plan_no + rooms_revision` 选房 `POST /api/session/{id}/room`（不解析文本，旧房型列表 409）；`hotel_view` 只由服务端搜索结果生成 |
+| `web.py` | FastAPI 入口：托管 `frontend/dist`（首页）/ `templates/orders.html`（订单页）；会话池（30 分钟 TTL）、SSE 阶段推送、结构化酒店列表 `GET /api/session/{id}/hotels` 与按 `hotel_id + revision` 选店 `POST /api/session/{id}/select`（旧列表 409）；选中酒店后返回 `rooms_view`（房型 × 报价档，`plan_key` 即 `rate_plan_id`），按 `room_no + plan_no + rooms_revision` 选房 `POST /api/session/{id}/room`（不解析文本，旧房型列表 409）；`hotel_view` 只由服务端搜索结果生成 |
+| `frontend/` | React + TypeScript 聊天页：`api/sse.ts` 用 fetch 解 POST-SSE 帧；`lib/imgQueue.ts` 串行加载图片（道旅 CDN 并发会 403）并做可视区懒加载；`lib/sessionOps.ts` 管 localStorage 多会话栈（键仍为 `hb_sessions_v1`）；卡片只渲染 `hotel_view` 结构化字段，能否点击由 `activeRevision` 派生 |
 | `cli_common.py` | 终端入口共用：`display_width()` 与 `print_banner(rows)`（按显示宽度生成 ASCII 横幅） |
 | `rag.py` | 模拟评价语料切块、Embedding 双模式、召回+重排+生成 |
 | `text_rules.py` | 姓名与订单状态的文本规则，`llm.py` 与 `agent_common.py` 共用，避免两处各写一套 |
@@ -350,6 +380,7 @@ python scripts/eval_nlu.py       # 120 条 NLU 评测，约 30 分钟（3 模型
 ```
 
 - 单个测试文件都能直接跑：`python tests/test_cancel_unit.py`；装了 pytest 可 `pytest tests/ -v --ignore=tests/test_api_smoke.py`
+- 跑 `test_api_smoke.py` 之前先 `cd hotel_booking_agent/frontend && npm run build`：没构建时服务照样能起，但 `GET /` 是 500 构建提示页，首页用例会失败
 - 真实模型/供应链用例默认关闭，用 `RUN_LLM_TESTS=1` 单独开启，别塞进回归
 - 快速跑评测时用 `--limit N --out <临时文件> --json-out <临时文件>`，避免覆盖正式报告
 - 评测结果：最新看 `scripts/eval_nlu_report.md`，修复前基线看 `scripts/eval_nlu_baseline.md`，逐条明细在 `scripts/eval_nlu_results.json`

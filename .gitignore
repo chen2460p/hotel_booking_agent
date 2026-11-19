@@ -62,3 +62,7 @@ desktop.ini
 # ===== 本地预览图（含真实订单信息，不上传）=====
 /订单时间列-模拟图.png
 /订单页-实际效果.png
+
+# ===== 前端（Vite + React）=====
+hotel_booking_agent/frontend/node_modules/
+hotel_booking_agent/frontend/dist/

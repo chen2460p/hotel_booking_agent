@@ -1,0 +1,56 @@
+/* 样式从旧版 templates/index.html 原样搬过来：类名不变，视觉零变化。
+   #chatbox 的滚动容器同时是图片懒加载的观察根，改高度会影响加载时机。 */
+
+body { font-family: "Microsoft YaHei", system-ui, sans-serif; max-width: 780px; margin: 0 auto; padding: 16px; }
+h1 { color: #2c3e50; }
+.topbar { display: flex; gap: 12px; margin-bottom: 12px; font-size: 13px; color: #666; flex-wrap: wrap; align-items: center; }
+.topbar .spacer { flex: 1 1 auto; }
+.topbar a { color: #2980b9; text-decoration: none; }
+.topbar a:hover { text-decoration: underline; }
+.topbar select { max-width: 230px; padding: 3px 6px; border: 1px solid #ccc; border-radius: 6px; font-size: 12px; color: #333; background: #fff; }
+.topbar .mini { padding: 3px 10px; border: 1px solid #2980b9; background: #fff; color: #2980b9; border-radius: 6px; cursor: pointer; font-size: 12px; white-space: nowrap; }
+.topbar .mini:hover { background: #eaf4fb; }
+.topbar .mini:disabled, .topbar select:disabled { opacity: .55; cursor: not-allowed; }
+.tag { background: #ecf0f1; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+.tag.mem { background: #ffeaa7; color: #b8860b; }
+.tag.sql { background: #dff0d8; color: #2d6a4f; }
+.tag.mys { background: #fce4ec; color: #c2185b; }
+#chatbox { height: 500px; overflow-y: auto; border: 1px solid #ddd; border-radius: 8px; padding: 12px; background: #fafafa; margin-bottom: 12px; white-space: pre-wrap; font-size: 14px; }
+#chatbox .user { text-align: right; margin: 6px 0; }
+#chatbox .user span { background: #3498db; color: #fff; padding: 6px 10px; border-radius: 8px; display: inline-block; max-width: 80%; }
+#chatbox .bot { margin: 6px 0; }
+#chatbox .bot span { background: #fff; border: 1px solid #e0e0e0; padding: 6px 10px; border-radius: 8px; display: inline-block; max-width: 85%; }
+#chatbox .sys { text-align: center; color: #aaa; font-size: 12px; margin: 8px 0; }
+#chatbox .sys.notice { color: #9a6a00; background: #fffbea; border: 1px dashed #e6c35c; border-radius: 6px; padding: 4px 8px; }
+#chatbox .bot.status span { background: #f8f9fa; color: #7f8c8d; font-style: italic; border-style: dashed; }
+#chatbox .bot a { color: #2980b9; word-break: break-all; }
+#chatbox .bot .chat-img { display: block; max-width: 280px; max-height: 190px; border-radius: 8px; margin: 6px 0; cursor: zoom-in; border: 1px solid #e0e0e0; min-height: 56px; background: #f5f6f7; }
+/* 房型多图：横向图组，可左右滑动，避免整条消息被几十张图拉成长条 */
+#chatbox .bot .chat-gallery { display: flex; gap: 6px; overflow-x: auto; overflow-y: hidden; max-width: 100%; padding: 2px 0 4px; white-space: normal; }
+#chatbox .bot .chat-gallery .chat-img { flex: 0 0 auto; width: 170px; height: 115px; margin: 0; object-fit: cover; }
+#chatbox .bot .chat-gallery > a { flex: 0 0 auto; max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+#chatbox .bot .chat-gallery::-webkit-scrollbar { height: 6px; }
+#chatbox .bot .chat-gallery::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
+/* “展开全部”：逐段补真实评分后追加展示 */
+#chatbox .bot .expand-hotels { display: block; margin: 8px 0 0; padding: 4px 12px; font-size: 12px; color: #2980b9; background: #fff; border: 1px dashed #2980b9; border-radius: 12px; cursor: pointer; }
+#chatbox .bot .expand-hotels:disabled { color: #95a5a6; border-color: #ccc; cursor: default; }
+/* 结构化酒店卡片：数据来自后端 JSON（hotel_view.items），不解析回复文本 */
+#chatbox .bot .hotel-view { white-space: normal; max-width: 85%; margin-top: 6px; }
+#chatbox .bot .hotel-card { display: flex; gap: 10px; border: 1px solid #e3e7ea; border-radius: 10px; padding: 8px; margin: 8px 0; background: #fff; }
+#chatbox .bot .hotel-card .hc-thumb { width: 92px; height: 92px; flex: 0 0 auto; border-radius: 8px; object-fit: cover; background: #eef1f3; cursor: zoom-in; border: 1px solid #e0e0e0; }
+#chatbox .bot .hotel-card .hc-main { flex: 1 1 auto; min-width: 0; }
+#chatbox .bot .hotel-card .hc-name { font-weight: 600; font-size: 14px; margin-bottom: 2px; }
+#chatbox .bot .hotel-card .hc-meta { color: #555; font-size: 12px; line-height: 1.65; word-break: break-all; white-space: pre-line; }
+#chatbox .bot .hotel-card .hc-price { color: #c0392b; font-weight: 600; }
+#chatbox .bot .hotel-card .hc-actions { margin-top: 6px; display: flex; gap: 8px; align-items: center; }
+#chatbox .bot .hotel-card .hc-actions button { padding: 3px 14px; font-size: 12px; color: #fff; background: #2980b9; border: none; border-radius: 12px; cursor: pointer; }
+#chatbox .bot .hotel-card .hc-actions button:disabled { background: #bdc3c7; cursor: default; }
+#chatbox .bot .hotel-card .hc-rev { color: #aaa; font-size: 11px; }
+#chatbox .bot .hotel-card.stale { opacity: .55; }
+#chatbox .bot .hotel-card.stale .hc-actions button { background: #bdc3c7; }
+#chatbox .bot .hv-outro { white-space: pre-wrap; color: #555; font-size: 13px; margin-top: 8px; }
+#inputrow { display: flex; gap: 8px; }
+#inputrow textarea { flex: 1; height: 64px; padding: 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; resize: none; }
+#inputrow button { padding: 0 20px; background: #2980b9; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+#inputrow button:disabled { background: #95a5a6; cursor: not-allowed; }
+.example { font-size: 12px; color: #888; margin-top: 8px; }

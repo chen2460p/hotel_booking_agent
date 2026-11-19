@@ -28,3 +28,7 @@ hotel_booking_agent/cache/
 README.md
 DOCKER.md
 docker-compose.yml
+
+# 前端依赖与构建产物（镜像内由 node 阶段重新构建，宿主产物不进镜像）
+hotel_booking_agent/frontend/node_modules/
+hotel_booking_agent/frontend/dist/
